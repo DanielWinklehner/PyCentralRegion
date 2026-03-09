@@ -1,48 +1,32 @@
 """
-accelerated_orbit_finder.py - Accelerated Orbit Optimization
+accelerated_orbit_finder.py - Unified Accelerated Orbit Optimizer
 
-Finds optimal RF parameters for acceleration in cyclotrons.
-Optimizes bunch phase, RF frequency, and optionally initial conditions.
+Single class handles both single-particle (n=1) and multi-particle optimization.
+Uses TrackingEngine and centralized diagnostics.
 
 Part of: PyCentralRegion module
-Dependencies: PyPATools, scipy, numpy
-
-Usage:
-    from accelerated_orbit_finder import AcceleratedOrbitFinder
-
-    finder = AcceleratedOrbitFinder(design, target_energy_mev=5.0)
-    result = finder.optimize(initial_seo, max_turns=500)
 """
 
 import numpy as np
 from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass, field
 from scipy.optimize import differential_evolution, minimize
-from PyPATools.pusher import Pusher
-from PyPATools.field import Field
-import warnings
-import csv
-from pathlib import Path
 import time
-import matplotlib.pyplot as plt
+import csv
 
-
-@dataclass
-class PoincarePoint:
-    """Single Poincaré crossing during acceleration."""
-    turn: int
-    r: float  # m
-    vr: float  # m/s
-    energy_mev: float
-    phase_deg: float  # RF phase at crossing
-    time: float  # s
+from .tracking import TrackingEngine
+from .diagnostics import (PoincareAnalyzer, calculate_turn_metrics,
+                          BeamStatisticsCollector, TurnStatistics)
+from PyPATools.particles import ParticleDistribution
+from PyPATools.global_variables import CLIGHT
 
 
 @dataclass
 class RFCrossingData:
-    """Data from single RF cavity crossing."""
+    """Single RF crossing data."""
     turn: int
     cavity_id: int
+    particle_id: int
     energy_before_kev: float
     energy_after_kev: float
     energy_gain_kev: float
@@ -53,541 +37,479 @@ class RFCrossingData:
 @dataclass
 class OptimizedOrbit:
     """
-    Result from accelerated orbit optimization.
+    Result from acceleration optimization (single or multi-particle).
 
-    Attributes
-    ----------
-    success : bool
-        Whether optimization succeeded
-    final_energy_mev : float
-        Final particle energy [MeV]
-    n_turns : int
-        Number of turns completed
-    bunch_phase_deg : float
-        Optimal bunch phase [degrees]
-    rf_frequency_mhz : float
-        Optimal RF frequency [MHz]
-    initial_r_mm : float
-        Initial radius [mm]
-    initial_vr_m_s : float
-        Initial radial velocity [m/s]
-    trajectory : np.ndarray
-        Full trajectory (N x 3) [m]
-    poincare_points : list
-        List of PoincarePoint objects
-    rf_crossings : list
-        List of RFCrossingData objects
-    turn_metrics : dict
-        Turn-by-turn analysis
-    cost : float
-        Final objective function value
-    metadata : dict
-        Additional information
+    For single particle: turn_statistics has 1 particle stats
+    For multi-particle: turn_statistics has beam ensemble stats
     """
     success: bool
     final_energy_mev: float
     n_turns: int
+    n_particles: int
     bunch_phase_deg: float
     rf_frequency_mhz: float
     initial_r_mm: float
     initial_vr_m_s: float
-    initial_vtheta_m_s: float
-    trajectory: np.ndarray
-    poincare_points: List[PoincarePoint]
+    trajectory_reference: np.ndarray  # Reference particle or centroid
+    poincare_points_all: List[List]  # Per-particle Poincaré points
     rf_crossings: List[RFCrossingData]
-    turn_metrics: dict
+    turn_statistics: List[TurnStatistics]  # Beam stats per turn
+    turn_metrics: dict  # Reference trajectory metrics
+    std_r_per_step: np.ndarray  # Radial spread at each step (multi-particle only)
     cost: float
     metadata: dict = field(default_factory=dict)
 
 
 class AcceleratedOrbitFinder:
     """
-    Optimizer for accelerated cyclotron orbits.
+    Unified optimizer for accelerated orbits (single or multi-particle).
+
+    Automatically adapts cost function based on n_particles:
+    - n=1: Optimize energy, centering, turn smoothness
+    - n>1: Also optimize beam envelope and spread
 
     Parameters
     ----------
     design : CentralRegion
-        Cyclotron design with fields and RF cavities
+        Design with fields and RF cavities
     target_energy_mev : float
         Target final energy [MeV]
-    max_radius_m : float, optional
-        Maximum allowed radius [m] (default: 0.4)
+    n_particles : int
+        Number of particles (default: 1 for single-particle)
+    max_radius_m : float
+        Maximum radius [m]
     algorithm : str
-        Pusher algorithm (default: 'RK4')
+        Pusher algorithm
     steps_per_turn : int
-        Time steps per turn (default: 500)
+        Steps per turn
     verbose : bool
-        Print progress (default: True)
+        Print progress
     checkpoint_file : str, optional
-        CSV file for checkpointing
+        CSV checkpoint file
     """
 
     def __init__(self,
                  design,
                  target_energy_mev: float,
+                 n_particles: int = 1,
                  max_radius_m: float = 0.4,
-                 algorithm: str = 'RK4',
+                 algorithm: str = 'rk4_rel',
                  steps_per_turn: int = 500,
                  verbose: bool = True,
                  checkpoint_file: Optional[str] = None):
 
         self.design = design
         self.target_energy_mev = target_energy_mev
-        self.target_energy_j = target_energy_mev * 1.602176634e-13
+        self.n_particles = n_particles
         self.r_max = max_radius_m
         self.algorithm = algorithm
         self.steps_per_turn = steps_per_turn
         self.verbose = verbose
         self.checkpoint_file = checkpoint_file
 
-        # Validate design
+        # Validate
         if not design.is_valid(verbose=False):
             raise ValueError("Design must have bfield, species, and RF cavities")
 
         if len(design.rf_cavities) == 0:
             raise ValueError("Design must have at least one RF cavity")
 
-        # Create pusher
-        self.pusher = Pusher(design.species, algorithm=algorithm)
+        # Determine if this is multi-particle mode
+        self.is_multiparticle = (n_particles > 1)
 
-        # Cache
-        self._zero_efield = Field.zero()
+        # Create tracking engine
+        self.engine = TrackingEngine(
+            design,
+            algorithm=algorithm,
+            dimensionality='2D',
+            use_rf=True,
+            max_radius_m=max_radius_m,
+            verbose=False
+        )
 
         # Optimization tracking
         self.iteration = 0
         self.best_cost = np.inf
         self.best_params = None
 
-        # Initialize checkpoint file
         if self.checkpoint_file:
             self._init_checkpoint_file()
 
+        if self.verbose:
+            mode = "multi-particle" if self.is_multiparticle else "single-particle"
+            print(f"Initialized AcceleratedOrbitFinder in {mode} mode (n={n_particles})")
+
     def _init_checkpoint_file(self):
-        """Initialize CSV checkpoint file with headers."""
+        """Initialize CSV checkpoint file."""
         with open(self.checkpoint_file, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([
+            header = [
                 'iteration', 'bunch_phase_deg', 'rf_freq_mhz', 'r0_mm', 'vr0_m_s',
                 'final_energy_mev', 'n_turns', 'cost', 'success', 'timestamp'
-            ])
+            ]
 
-    def _write_checkpoint(self, params, cost, energy, n_turns, success):
-        """Append iteration to checkpoint file."""
+            # Add multi-particle specific columns
+            if self.is_multiparticle:
+                header.extend(['final_std_r_mm', 'envelope_oscillation_mm'])
+
+            writer.writerow(header)
+
+    def _write_checkpoint(self, params, cost, energy, n_turns, success,
+                          std_r_mm=None, envelope_osc_mm=None):
+        """Append to checkpoint file."""
         if not self.checkpoint_file:
             return
 
         with open(self.checkpoint_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([
+            row = [
                 self.iteration,
                 params[0],  # bunch_phase
                 params[1],  # rf_freq
-                params[2] * 1000 if len(params) > 2 else 0,  # r0
-                params[3] if len(params) > 3 else 0,  # vr0
+                params[2] * 1000 if len(params) > 2 else 0,
+                params[3] if len(params) > 3 else 0,
                 energy,
                 n_turns,
                 cost,
                 success,
                 time.time()
-            ])
+            ]
 
-    def calculate_expected_trajectory(self,
-                                      e_inject_mev: float,
-                                      de_per_turn_mev: float,
-                                      n_turns: int) -> np.ndarray:
+            if self.is_multiparticle:
+                row.extend([std_r_mm or 0.0, envelope_osc_mm or 0.0])
+
+            writer.writerow(row)
+
+    def _estimate_timestep(self, frequency_hz: float) -> float:
+        """Estimate timestep from RF frequency."""
+        period = 1.0 / frequency_hz
+        return period / self.steps_per_turn
+
+    def create_initial_distribution(self,
+                                    r_mean: float,
+                                    v_tangential: float,
+                                    v_perp: float = 0.0,
+                                    r_spread: float = 0.0,
+                                    vr_spread: float = 0.0) -> ParticleDistribution:
         """
-        Calculate expected radius vs turn for isochronous cyclotron.
+        Create initial particle distribution.
 
-        Uses p = q*B(r)*r to find r(E) from field map.
+        For single particle (n=1): spreads are ignored
+        For multi-particle: uses Gaussian distribution
 
-        Returns
-        -------
-        r_expected : np.ndarray
-            Expected radius per turn [m]
+        Parameters
+        ----------
+        r_mean : float
+            Mean radius [m]
+        v_tangential : float
+            Tangential velocity [m/s]
+        v_perp : float
+            Perpendicular velocity [m/s]
+        r_spread : float
+            Radial spread (1σ) [m]
+        vr_spread : float
+            Radial velocity spread (1σ) [m/s]
         """
-        energies = e_inject_mev + de_per_turn_mev * np.arange(n_turns)
-        radii = np.zeros(n_turns)
 
-        q = abs(self.design.species.charge)
-        mass_mev = self.design.species.mass_mev
+        if self.n_particles == 1:
+            # Single particle - no spread
+            pd = ParticleDistribution(species=self.design.species)
+            pd.x_vec = np.array([[r_mean, 0.0, 0.0]])
 
-        for i, E in enumerate(energies):
-            # Calculate momentum
-            gamma = E / mass_mev + 1.0
-            p = np.sqrt(gamma ** 2 - 1.0) * mass_mev * 1.602176634e-13 / 299792458.0  # kg*m/s
+            p_tang = v_tangential / np.sqrt(CLIGHT ** 2 - v_tangential ** 2)
+            p_perp = v_perp / np.sqrt(CLIGHT ** 2 - v_perp ** 2) if v_perp != 0 else 0.0
+            pd.p_vec = np.array([[p_perp, p_tang, 0.0]])
 
-            # Find radius where p = q*B*r (iterative)
-            # Start with previous radius (or reasonable guess)
-            r_guess = radii[i - 1] if i > 0 else 0.1
+        else:
+            # Multi-particle - Gaussian distribution
+            corr_matrix = np.eye(6)
+            pd = ParticleDistribution.generate_distribution(
+                self.design.species,
+                type=['gaussian', 'gaussian', 'gaussian'],
+                s_direction='z',
+                n_particles=self.n_particles,
+                correlation_matrix=corr_matrix,
+                sigma_x=r_spread,
+                sigma_px=vr_spread / np.sqrt(CLIGHT ** 2 - vr_spread ** 2),
+                sigma_y=1e-20,
+                sigma_py=1e-20,
+                sigma_z=1e-20,
+                sigma_pz=1e-20,
+                cutoff_x=3,
+                cutoff_px=3
+            )
 
-            for _ in range(10):  # Newton iteration
-                pts = np.array([[r_guess, 0.0, 0.0]])
-                bz = self.design.bfield(pts)[0, 2]
+            pd.set_centroid(r_mean, 0.0, 0.0)
+            pd.add_mean_momentum(
+                v_perp / np.sqrt(CLIGHT ** 2 - v_perp ** 2) if v_perp != 0 else 0.0,
+                v_tangential / np.sqrt(CLIGHT ** 2 - v_tangential ** 2),
+                0.0
+            )
 
-                r_new = p / (q * bz) if bz > 0 else r_guess
-                if abs(r_new - r_guess) < 1e-6:
-                    break
-                r_guess = r_new
-
-            radii[i] = r_guess
-
-        return radii
+        return pd
 
     def track_with_rf(self,
-                      r0: np.ndarray,
-                      v0: np.ndarray,
+                      pd_init: ParticleDistribution,
                       dt: float,
-                      max_turns: int) -> Tuple[bool, List, List, np.ndarray, np.ndarray, List]:
+                      max_turns: int,
+                      save_full_beam: bool = False) -> Tuple:
         """
-        Track particle with RF cavities and record data.
+        Track particle(s) with RF and collect diagnostics.
+
+        Works for both single-particle (n=1) and multi-particle (n>1).
 
         Returns
         -------
         success : bool
-            True if reached target or max turns without loss
-        poincare_points : list
-            Poincaré crossings
+        turn_statistics : list of TurnStatistics
         rf_crossings : list
-            RF cavity crossings
-        trajectory : np.ndarray
-            Full position trajectory
+        trajectory_ref : np.ndarray
+        poincare_all : list of lists
+        std_r_per_step : np.ndarray
+        turn_ids : list
+        full_beam : np.ndarray or None
         """
-        nsteps = max_turns * self.steps_per_turn
 
-        # Storage
-        r_traj = np.zeros((nsteps, 3))
-        v_traj = np.zeros((nsteps, 3))
-        poincare_points = []
+        # Data collectors
+        poincare_analyzers = [PoincareAnalyzer(section_angle=0.0)
+                              for _ in range(self.n_particles)]
+        beam_stats_collector = BeamStatisticsCollector(
+            self.design.species,
+            save_frequency=1
+        )
+
         rf_crossings = []
-
-        # Initialize
-        r = r0.copy()
-        v = v0.copy()
-        t = 0.0
-        turn = 0
-
-        mass = self.design.species.mass_kg
-        charge = self.design.species.charge
-
-        # Boris half-step initialization
-        if self.pusher.algorithm == 'boris':
-            ef = self._zero_efield(r.reshape(1, 3))
-            bf = self.design.bfield(r.reshape(1, 3))
-            _, v = self.pusher.push(r, v, ef, bf, -0.5 * dt)
-
-        # Track
+        trajectory_storage = []
+        std_r_storage = []
         turn_ids = []
+        turn_counter = [0]
+        energy_reached = [False]
 
-        for step in range(nsteps):
-            # print(r, v)
-            r_prev = r.copy()
-            v_prev = v.copy()
+        if save_full_beam:
+            n_steps = max_turns * self.steps_per_turn
+            full_beam = np.full((n_steps, self.n_particles, 6), np.nan)
+        else:
+            full_beam = None
 
-            # Get fields
-            # ef = self.pusher._ensure_field_array(self._zero_efield(r.reshape(1, 3)))
-            # bf = self.pusher._ensure_field_array(self.design.bfield(r.reshape(1, 3)))
+        def callback(step, r_array, v_array, active, t):
+            """Collect all diagnostics."""
 
-            # Push
-            r, v = self.pusher.push(r, v, self._zero_efield, self.design.bfield, dt)
-            t += dt
+            if not np.any(active):
+                return False
 
-            # Check RF cavities
-            for cav_id, cavity in enumerate(self.design.rf_cavities):
-                v, r, crossed, de_mev, phase = cavity.apply_kick_if_crossing(
-                    r_prev, r, v, t, dt, self.design, self.pusher
-                )
+            # Store reference trajectory (centroid or particle 0)
+            if self.is_multiparticle:
+                trajectory_storage.append(np.mean(r_array[active], axis=0))
+            else:
+                trajectory_storage.append(r_array[0].copy())
+
+            # Calculate radial spread (multi-particle only)
+            if self.is_multiparticle:
+                radii = np.sqrt(r_array[active, 0] ** 2 + r_array[active, 1] ** 2)
+                std_r_storage.append(np.std(radii))
+            else:
+                std_r_storage.append(0.0)
+
+            # Save full beam state if requested
+            if save_full_beam and full_beam is not None:
+                full_beam[step, :, :3] = r_array
+                full_beam[step, :, 3:] = v_array
+
+            # Check Poincaré crossings for reference particle (particle 0)
+            if active[0]:
+                if step == 0:
+                    r_prev = r_array[0]
+                else:
+                    r_prev = callback.r_prev
+
+                crossed, t_frac = poincare_analyzers[0].check_crossing(r_prev, r_array[0])
 
                 if crossed:
-                    # TODO: FIXME needs to be relativistic or remove?
-                    E_before = 0.5 * mass * np.dot(v_prev, v_prev) / 1.602176634e-16  # keV
-                    E_after = 0.5 * mass * np.dot(v, v) / 1.602176634e-16
+                    turn_ids.append(step)
 
-                    rf_crossings.append(RFCrossingData(
-                        turn=turn,
-                        cavity_id=cav_id,
-                        energy_before_kev=E_before,
-                        energy_after_kev=E_after,
-                        energy_gain_kev=de_mev * 1000.0,
-                        phase_deg=phase,
-                        time=t
-                    ))
+                    # Record crossing for particle 0
+                    r_cross = r_prev + t_frac * (r_array[0] - r_prev) if t_frac else r_array[0]
+                    v_cross = v_array[0]
 
-            # Store
-            r_traj[step] = r
-            v_traj[step] = v
+                    cav = self.design.rf_cavities[0]
+                    phase_rad = np.fmod(cav.omega * t + cav.get_total_phase_rad(), 2.0 * np.pi)
+                    phase_deg = np.rad2deg(phase_rad)
 
-            # Check Poincaré crossing (y=0, moving upward)
-            if r_prev[1] <= 0.0 < r[1]:
-                # TODO: FIXME needs to be relativistic
-                E_mev = 0.5 * mass * np.dot(v, v) / 1.602176634e-13
-                turn_ids.append(step)  # Record step number
-                # Get RF phase at crossing
-                cav = self.design.rf_cavities[0]  # Reference cavity
-                phase_rad = np.fmod(cav.omega * t + cav.get_total_phase_rad(), 2.0 * np.pi)
-                phase_deg = np.rad2deg(phase_rad)
+                    poincare_analyzers[0].record_crossing(
+                        turn=turn_counter[0],
+                        r=r_cross,
+                        v=v_cross,
+                        time=t,
+                        species=self.design.species,
+                        phase_deg=phase_deg
+                    )
 
-                poincare_points.append(PoincarePoint(
-                    turn=turn,
-                    r=r[0],
-                    vr=v[0],
-                    energy_mev=E_mev,
-                    phase_deg=phase_deg,
-                    time=t
-                ))
+                    # Collect beam statistics at this crossing
+                    beam_stats_collector.record(step, r_array[active], v_array[active], t)
+                    beam_stats_collector.increment_turn()
 
-                turn += 1
+                    turn_counter[0] += 1
 
-                # Check termination conditions
-                if E_mev >= self.target_energy_mev:
-                    if self.verbose:
-                        print(f"    Reached target energy: {E_mev:.3f} MeV at turn {turn}")
-                    r_traj = r_traj[:step + 1]
-                    return True, poincare_points, rf_crossings, r_traj, v_traj, turn_ids
+                    # Check termination
+                    if poincare_analyzers[0].crossings[-1].energy_mev >= self.target_energy_mev:
+                        energy_reached[0] = True
+                        if self.verbose:
+                            print(f"    Reached target energy at turn {turn_counter[0]}")
+                        return True
 
-                if turn >= max_turns:
-                    if self.verbose:
-                        print(f"    Reached max turns: {turn}")
-                    r_traj = r_traj[:step + 1]
-                    return True, poincare_points, rf_crossings, r_traj, v_traj, turn_ids
+                    if turn_counter[0] >= max_turns:
+                        if self.verbose:
+                            print(f"    Reached max turns: {turn_counter[0]}")
+                        return True
 
-                # Check boundaries
-                radius = np.sqrt(r[0] ** 2 + r[1] ** 2)
-                if radius > self.r_max:
-                    if self.verbose:
-                        print(
-                            f"    Particle lost: r={radius * 1000:.1f} mm > r_max={self.r_max * 1000:.1f} mm at turn {turn}")
-                    r_traj = r_traj[:step + 1]
-                    return False, poincare_points, rf_crossings, r_traj, v_traj, turn_ids
+                callback.r_prev = r_array[0].copy()
 
-            # Boris final half-step
-            if self.pusher.algorithm == 'boris':
-                ef = self._zero_efield(r.reshape(1, 3))
-                bf = self.design.bfield(r.reshape(1, 3))
-                _, v = self.pusher.push(r, v, ef, bf, 0.5 * dt)
-                v_traj[-1] = v
+            return False
 
-        return True, poincare_points, rf_crossings, r_traj, v_traj, turn_ids
+        callback.r_prev = pd_init.x_vec[0].copy()
 
-    def calculate_turn_metrics(self,
-                               traj: np.ndarray,
-                               v_traj: np.ndarray,
-                               turn_ids: List[int]) -> dict:
+        # Track
+        n_steps = max_turns * self.steps_per_turn
+
+        try:
+            result = self.engine.track_multiparticle(
+                pd_init,
+                dt=dt,
+                n_steps=n_steps,
+                callback=callback,
+                callback_frequency=1,
+                show_progress=False
+            )
+        except Exception as e:
+            if self.verbose:
+                print(f"    Tracking exception: {e}")
+            return (False, [], [], np.array([]), [[] for _ in range(self.n_particles)],
+                    np.array([]), [], None)
+
+        # Collect results
+        trajectory_ref = np.array(trajectory_storage) if trajectory_storage else np.array([])
+        std_r_per_step = np.array(std_r_storage)
+        turn_statistics = beam_stats_collector.get_statistics()
+
+        # For single particle, also need to populate poincare_all with just particle 0
+        poincare_all = [[p for p in poincare_analyzers[0].crossings]]
+
+        success = result.success or energy_reached[0]
+
+        return (success, turn_statistics, rf_crossings, trajectory_ref,
+                poincare_all, std_r_per_step, turn_ids, full_beam)
+
+    def objective_function(self, params, initial_seo, dt, max_turns,
+                           r_spread, vr_spread, weights):
         """
-        Calculate turn-by-turn orbit quality metrics from full trajectory.
+        Unified objective function for single and multi-particle.
 
-        Parameters
-        ----------
-        traj : np.ndarray
-            Position trajectory (nsteps x 3) [m]
-        v_traj : np.ndarray
-            Velocity trajectory (nsteps x 3) [m/s]
-        turn_ids : list of int
-            Step indices where positive x-axis was crossed (length = n_turns)
-
-        Returns
-        -------
-        metrics : dict
-            'r_center' : mean orbit center radius per turn [m]
-            'r_spread' : std dev of radius per turn [m]
-            'dr' : turn separation [m]
-            'energy' : energy at end of turn [MeV]
-            'x_center' : mean x position per turn [m]
-            'y_center' : mean y position per turn [m]
+        Automatically adapts based on self.n_particles.
         """
-        if len(turn_ids) == 0:
-            return {
-                'r_center': np.array([]),
-                'r_spread': np.array([]),
-                'dr': np.array([]),
-                'energy': np.array([]),
-                'x_center': np.array([]),
-                'y_center': np.array([])
-            }
 
-        n_turns = len(turn_ids)
-
-        r_center = np.zeros(n_turns)
-        r_spread = np.zeros(n_turns)
-        energy_turn = np.zeros(n_turns)
-        x_center = np.zeros(n_turns)
-        y_center = np.zeros(n_turns)
-        r_avg = np.zeros(n_turns)
-
-        mass = self.design.species.mass_kg
-
-        for i in range(n_turns):
-            # Get trajectory segment for this turn
-            if i == 0:
-                start_idx = 0
-            else:
-                start_idx = turn_ids[i - 1]
-
-            end_idx = turn_ids[i]
-            # end_idx = turn_ids[i] if i < n_turns - 1 else len(traj)
-
-            # Extract segment
-            traj_segment = traj[start_idx:end_idx]
-
-            if len(traj_segment) < 2:
-                continue
-
-            # Calculate orbit center: mean(x), mean(y)
-            x_mean = np.mean(traj_segment[:, 0])
-            y_mean = np.mean(traj_segment[:, 1])
-
-            x_center[i] = x_mean
-            y_center[i] = y_mean
-
-            # Center radius
-            r_center[i] = np.sqrt(x_mean ** 2 + y_mean ** 2)
-
-            # Calculate radii of all points in segment
-            radii = np.sqrt(traj_segment[:, 0] ** 2 + traj_segment[:, 1] ** 2)
-
-            # Radial spread (betatron amplitude)
-            r_spread[i] = np.std(radii)
-            r_avg[i] = np.mean(radii)
-
-            # Energy at end of turn TODO: redundant (calculated outside alrady)
-            v_end = v_traj[end_idx - 1] if end_idx <= len(v_traj) else v_traj[-1]
-            v_mag_sq = np.dot(v_end, v_end)
-            ekin = 0.5 * mass * v_mag_sq
-            energy_turn[i] = ekin / 1.602176634e-13  # Convert to MeV
-
-        # Turn separation
-        dr = np.diff(r_avg)
-
-        return {
-            'r_center': r_center,
-            'r_spread': r_spread,
-            'r_avg': r_avg,
-            'dr': dr,
-            'energy': energy_turn,
-            'x_center': x_center,
-            'y_center': y_center
-        }
-
-    def objective_function(self, params, r0_seo, v0_seo, dt, max_turns, r_expected):
-        """
-        Objective function for optimization.
-
-        Parameters
-        ----------
-        params : list
-            [bunch_phase_deg, rf_freq_hz] or
-            [bunch_phase_deg, rf_freq_hz, r0, vr0]
-        r0_seo : np.ndarray
-            Initial position from SEO
-        v0_seo : np.ndarray
-            Initial velocity from SEO
-        dt : float
-            Timestep
-        max_turns : int
-            Maximum turns
-        r_expected : np.ndarray
-            Expected radius trajectory
-
-        Returns
-        -------
-        cost : float
-            Objective function value (lower is better)
-        """
         self.iteration += 1
 
         # Extract parameters
         bunch_phase_deg = params[0]
         rf_freq_hz = params[1]
 
-        if len(params) > 2:
-            r0 = np.array([params[2], 0.0, 0.0])
-            v_mag = np.linalg.norm(v0_seo)
-            vr = params[3]
-            vtheta = np.sqrt(v_mag ** 2.0 - vr ** 2.0) if v_mag ** 2.0 > vr ** 2.0 else 0.0
-            v0 = np.array([vr, vtheta, 0.0])
-        else:
-            r0 = r0_seo
-            v0 = v0_seo
+        r_mean = params[2] if len(params) > 2 else initial_seo.r0[0]
+        vr_mean = params[3] if len(params) > 3 else 0.0
 
-        # Set design parameters
+        # Set RF parameters
         self.design.set_bunch_phase(bunch_phase_deg)
         self.design.set_rf_frequency(rf_freq_hz)
 
-        # Track
+        # Create distribution
+        v_tangential = np.linalg.norm(initial_seo.v0)
+
         try:
-            success, poincare, rf_crossings, r_traj, v_traj, turn_ids = self.track_with_rf(
-                r0, v0, dt, max_turns
+            pd_init = self.create_initial_distribution(
+                r_mean=r_mean,
+                v_tangential=v_tangential,
+                v_perp=vr_mean,
+                r_spread=r_spread,
+                vr_spread=vr_spread
             )
+
         except Exception as e:
             if self.verbose:
-                print(f"    Iteration {self.iteration}: Tracking failed: {e}")
+                print(f"    Iter {self.iteration}: Distribution creation failed: {e}")
+            self._write_checkpoint(params, 1e10, 0.0, 0, False)
             return 1e10
 
-        # Check for loss
-        if not success:
+        # Track
+        try:
+            result = self.track_with_rf(pd_init, dt, max_turns, save_full_beam=False)
+            (success, turn_stats, rf_cross, traj_ref, poincare_all,
+             std_r_steps, turn_ids, _) = result
+        except Exception as e:
+            if self.verbose:
+                print(f"    Iter {self.iteration}: Tracking failed: {e}")
+            self._write_checkpoint(params, 1e10, 0.0, 0, False)
+            return 1e10
+
+        # Check for failure
+        if not success or len(turn_stats) == 0:
             cost = 1e8
             if self.verbose:
-                print(f"    Iteration {self.iteration}: Particle lost, cost={cost:.2e}")
+                print(f"    Iter {self.iteration}: Failed, cost={cost:.2e}")
             self._write_checkpoint(params, cost, 0.0, 0, False)
             return cost
 
         # Calculate metrics
-        if len(poincare) == 0:
-            cost = 1e9
-            if self.verbose:
-                print(f"    Iteration {self.iteration}: No Poincare points, cost={cost:.2e}")
-            self._write_checkpoint(params, cost, 0.0, 0, False)
-            return cost
+        metrics = calculate_turn_metrics(traj_ref, turn_ids)
+        final_energy = turn_stats[-1].mean_energy_mev
+        n_turns = len(turn_stats)
 
-        metrics = self.calculate_turn_metrics(r_traj, v_traj, turn_ids)
-
-        n_turns = len(metrics['r_center'])
-        final_energy = poincare[-1].energy_mev
-
-        # Cost function components
+        # Cost function - adapts automatically
         cost = 0.0
 
-        # 1. Energy target penalty
-        w_energy = 5.0
-        cost -= w_energy * final_energy
+        # Universal terms (single and multi-particle)
+        w_energy = weights.get('energy', 5.0)
+        cost -= w_energy * final_energy  # Maximize energy
 
-        # 2. Orbit centering penalty (compare to expected trajectory)
-        if n_turns > 0 and len(r_expected) > 0:
-            centering_error = np.mean(metrics['r_center'])
-            w_centering = 1000.0
-            cost += w_centering * centering_error
+        w_center = weights.get('center', 1000.0)
+        if len(metrics['r_center']) > 0:
+            cost += w_center * np.mean(metrics['r_center'])  # Minimize centering
 
-        # # 3. Breathing penalty (radial oscillation amplitude)
-        # r_spread_max = np.max(metrics['r_spread']) if len(metrics['r_spread']) > 0 else 0.0
-        # breathing_threshold = 0.005  # 5 mm
-        # if r_spread_max > breathing_threshold:
-        #     w_breathing = 5000.0
-        #     cost += w_breathing * (r_spread_max - breathing_threshold) ** 2
-
-        # 4. Turn separation smoothness penalty
+        w_smooth = weights.get('smooth', 1000.0)
         if len(metrics['dr']) > 1:
-            dr_variation = np.std(metrics['dr'])
-            w_smooth = 1000.0
-            cost += w_smooth * dr_variation ** 2
+            cost += w_smooth * np.std(metrics['dr']) ** 2  # Smooth turns
 
-        # # 5. Penalty for not reaching enough turns
-        # if n_turns < max_turns * 0.5 and final_energy < self.target_energy_mev * 0.9:
-        #     w_turns = 100.0
-        #     cost += w_turns * (max_turns * 0.5 - n_turns)
+        # Multi-particle specific terms
+        if self.is_multiparticle:
+            # Envelope oscillation
+            envelope_osc = np.std(std_r_steps)
+            w_envelope = weights.get('spread', 100.0)
+            cost += w_envelope * envelope_osc
+
+            # Final beam spread
+            final_std_r = turn_stats[-1].std_r
+        else:
+            envelope_osc = 0.0
+            final_std_r = 0.0
 
         # Checkpoint
-        self._write_checkpoint(params, cost, final_energy, n_turns, True)
+        self._write_checkpoint(
+            params, cost, final_energy, n_turns, True,
+            final_std_r * 1000, envelope_osc * 1000
+        )
 
         # Track best
         if cost < self.best_cost:
             self.best_cost = cost
             self.best_params = params.copy()
+            msg = (f"    Iter {self.iteration}: NEW BEST - cost={cost:.2e}, "
+                   f"E={final_energy:.3f} MeV, turns={n_turns}, "
+                   f"phase={bunch_phase_deg:.1f}°, f={rf_freq_hz / 1e6:.3f} MHz")
+            if self.is_multiparticle:
+                msg += f", env_osc={envelope_osc * 1000:.2f} mm"
             if self.verbose:
-                print(f"    Iteration {self.iteration}: NEW BEST - cost={cost:.2e}, "
-                      f"E={final_energy:.3f} MeV, turns={n_turns}, "
-                      f"phase={bunch_phase_deg:.1f}deg, f={rf_freq_hz / 1e6:.3f} MHz")
+                print(msg)
         else:
             if self.verbose and self.iteration % 10 == 0:
-                print(f"    Iteration {self.iteration}: cost={cost:.2e}, "
+                print(f"    Iter {self.iteration}: cost={cost:.2e}, "
                       f"E={final_energy:.3f} MeV, turns={n_turns}")
 
         return cost
@@ -595,67 +517,83 @@ class AcceleratedOrbitFinder:
     def optimize(self,
                  initial_seo,
                  max_turns: int = 500,
+                 r_spread_mm: float = 2.0,
+                 vr_spread_m_s: float = 1e4,
                  optimize_params: List[str] = ['bunch_phase', 'rf_freq'],
                  method: str = 'differential_evolution',
                  bounds: Optional[dict] = None,
+                 weights: Optional[dict] = None,
                  maxiter: int = 100) -> OptimizedOrbit:
         """
-        Optimize accelerated orbit parameters.
+        Optimize RF parameters for acceleration.
+
+        Works for both single-particle (n=1) and multi-particle (n>1).
+        For single particle, spread parameters are ignored.
 
         Parameters
         ----------
         initial_seo : StaticOrbit
-            Starting point from SEO finder
+            Starting point
         max_turns : int
-            Maximum turns to track
+            Maximum turns
+        r_spread_mm : float
+            Initial radial spread [mm] (multi-particle only)
+        vr_spread_m_s : float
+            Radial velocity spread [m/s] (multi-particle only)
         optimize_params : list
-            Parameters to optimize: 'bunch_phase', 'rf_freq', 'r0', 'vr0'
+            Parameters to optimize
         method : str
-            'differential_evolution' or 'nelder_mead'
+            Optimization method
         bounds : dict, optional
-            Custom bounds for parameters
+            Custom bounds
+        weights : dict, optional
+            Cost function weights
         maxiter : int
-            Maximum optimization iterations
+            Maximum iterations
 
         Returns
         -------
         result : OptimizedOrbit
-            Optimization result
         """
+
         if self.verbose:
             print("\n" + "=" * 70)
-            print("ACCELERATED ORBIT OPTIMIZATION")
+            mode_str = f"MULTI-PARTICLE ({self.n_particles})" if self.is_multiparticle else "SINGLE-PARTICLE"
+            print(f"{mode_str} ACCELERATED ORBIT OPTIMIZATION")
             print("=" * 70)
             print(f"Target energy: {self.target_energy_mev} MeV")
             print(f"Initial energy: {initial_seo.energy_kev / 1000:.3f} MeV")
             print(f"Max turns: {max_turns}")
+            if self.is_multiparticle:
+                print(f"Particles: {self.n_particles}")
+                print(f"Spreads: r={r_spread_mm} mm, vr={vr_spread_m_s / 1e3:.1f} km/s")
             print(f"Optimizing: {optimize_params}")
             print(f"Method: {method}")
 
-        # Setup initial conditions from SEO
-        r0_seo = initial_seo.r0
-        v0_seo = initial_seo.v0
-
-        # Estimate energy gain per turn
-        total_voltage = sum(cav.voltage for cav in self.design.rf_cavities)
-        charge = abs(self.design.species.charge)
-        de_per_turn = total_voltage * charge / 1.602176634e-13  # MeV
-
-        if self.verbose:
-            print(f"Estimated dE/turn: {de_per_turn:.3f} MeV")
-
-        # Calculate expected trajectory
-        r_expected = self.calculate_expected_trajectory(
-            initial_seo.energy_kev / 1000.0,
-            de_per_turn,
-            max_turns
-        )
+        # Default weights
+        if weights is None:
+            if self.is_multiparticle:
+                weights = {
+                    'energy': 5.0,
+                    'spread': 100.0,
+                    'center': 1000.0,
+                    'smooth': 1000.0
+                }
+            else:
+                weights = {
+                    'energy': 5.0,
+                    'center': 1000.0,
+                    'smooth': 1000.0
+                }
 
         # Timestep
         dt = self._estimate_timestep(initial_seo.frequency_hz)
 
         if self.verbose:
             print(f"Timestep: {dt * 1e12:.2f} ps")
+            print(f"\nCost function weights:")
+            for key, val in weights.items():
+                print(f"  {key}: {val}")
 
         # Setup parameter bounds
         if bounds is None:
@@ -665,27 +603,23 @@ class AcceleratedOrbitFinder:
         param_names = []
         x0 = []
 
-        # Bunch phase
         if 'bunch_phase' in optimize_params:
             param_names.append('bunch_phase')
             param_bounds.append(bounds.get('bunch_phase', (-180, 180)))
-            x0.append(20.0)  # Typical initial guess
+            x0.append(20.0)
 
-        # RF frequency
         if 'rf_freq' in optimize_params:
             param_names.append('rf_freq')
             f_seo = initial_seo.frequency_hz
             param_bounds.append(bounds.get('rf_freq', (f_seo * 0.95, f_seo * 1.05)))
             x0.append(f_seo)
 
-        # Initial radius
         if 'r0' in optimize_params:
             param_names.append('r0')
-            r_seo = np.linalg.norm(r0_seo[:2])
-            param_bounds.append(bounds.get('r0', (r_seo - 0.005, r_seo + 0.005)))
+            r_seo = initial_seo.r0[0]
+            param_bounds.append(bounds.get('r0', (r_seo - 0.010, r_seo + 0.010)))
             x0.append(r_seo)
 
-        # Initial radial velocity
         if 'vr0' in optimize_params:
             param_names.append('vr0')
             param_bounds.append(bounds.get('vr0', (-5e5, 5e5)))
@@ -697,10 +631,14 @@ class AcceleratedOrbitFinder:
                 print(f"  {name}: bounds={bnd}, initial={x}")
             print()
 
-        # Reset iteration counter
+        # Reset
         self.iteration = 0
         self.best_cost = np.inf
         self.best_params = None
+
+        # Convert spreads to SI
+        r_spread = r_spread_mm / 1000.0 if self.is_multiparticle else 0.0
+        vr_spread = vr_spread_m_s if self.is_multiparticle else 0.0
 
         # Optimize
         start_time = time.time()
@@ -709,9 +647,9 @@ class AcceleratedOrbitFinder:
             result = differential_evolution(
                 self.objective_function,
                 param_bounds,
-                args=(r0_seo, v0_seo, dt, max_turns, r_expected),
+                args=(initial_seo, dt, max_turns, r_spread, vr_spread, weights),
                 maxiter=maxiter,
-                workers=1,  # Can increase for parallelization
+                workers=1,
                 updating='deferred',
                 disp=False
             )
@@ -722,7 +660,7 @@ class AcceleratedOrbitFinder:
             result = minimize(
                 self.objective_function,
                 x0,
-                args=(r0_seo, v0_seo, dt, max_turns, r_expected),
+                args=(initial_seo, dt, max_turns, r_spread, vr_spread, weights),
                 method='Nelder-Mead',
                 options={'maxiter': maxiter, 'disp': False}
             )
@@ -751,43 +689,50 @@ class AcceleratedOrbitFinder:
                     print(f"  {name}: {val * 1000:.3f} mm")
                 elif name == 'vr0':
                     print(f"  {name}: {val:.1f} m/s")
-                else:
-                    print(f"  {name}: {val:.3f}")
 
         # Final tracking with optimal parameters
         self.design.set_bunch_phase(optimal_params[0])
         self.design.set_rf_frequency(optimal_params[1])
 
-        if len(optimal_params) > 2:
-            r0_final = np.array([optimal_params[2], 0.0, 0.0])
-            v_mag = np.linalg.norm(v0_seo)
-            vr = optimal_params[3]
-            vtheta = np.sqrt(v_mag ** 2 - vr ** 2) if v_mag ** 2 > vr ** 2 else 0.0
-            v0_final = np.array([vr, vtheta, 0.0])
-        else:
-            r0_final = r0_seo
-            v0_final = v0_seo
+        r_mean_final = optimal_params[2] if len(optimal_params) > 2 else initial_seo.r0[0]
+        vr_mean_final = optimal_params[3] if len(optimal_params) > 3 else 0.0
+        v_tangential = np.linalg.norm(initial_seo.v0)
 
-        success, poincare, rf_crossings, r_traj, v_traj, turn_ids = self.track_with_rf(
-            r0_final, v0_final, dt, max_turns
+        pd_init_final = self.create_initial_distribution(
+            r_mean=r_mean_final,
+            v_tangential=v_tangential,
+            v_perp=vr_mean_final,
+            r_spread=r_spread,
+            vr_spread=vr_spread
         )
 
-        metrics = self.calculate_turn_metrics(r_traj, v_traj, turn_ids)
+        if self.verbose:
+            print("\nFinal tracking with optimal parameters...")
+
+        result_tracking = self.track_with_rf(
+            pd_init_final, dt, max_turns, save_full_beam=True
+        )
+        (success, turn_stats, rf_cross, traj_ref, poincare_all,
+         std_r_steps, turn_ids, full_beam) = result_tracking
+
+        metrics = calculate_turn_metrics(traj_ref, turn_ids)
 
         # Create result object
         optimized_orbit = OptimizedOrbit(
             success=success,
-            final_energy_mev=poincare[-1].energy_mev if len(poincare) > 0 else 0.0,
-            n_turns=len(metrics['r_center']),
+            final_energy_mev=turn_stats[-1].mean_energy_mev if len(turn_stats) > 0 else 0.0,
+            n_turns=len(turn_stats),
+            n_particles=self.n_particles,
             bunch_phase_deg=optimal_params[0],
             rf_frequency_mhz=optimal_params[1] / 1e6,
-            initial_r_mm=r0_final[0] * 1000,
-            initial_vr_m_s=v0_final[0],
-            initial_vtheta_m_s=v0_final[1],
-            trajectory=r_traj,
-            poincare_points=poincare,
-            rf_crossings=rf_crossings,
+            initial_r_mm=r_mean_final * 1000,
+            initial_vr_m_s=vr_mean_final,
+            trajectory_reference=traj_ref,
+            poincare_points_all=poincare_all,
+            rf_crossings=rf_cross,
+            turn_statistics=turn_stats,
             turn_metrics=metrics,
+            std_r_per_step=std_r_steps,
             cost=final_cost,
             metadata={
                 'initial_seo': initial_seo,
@@ -795,20 +740,153 @@ class AcceleratedOrbitFinder:
                 'optimization_time_s': elapsed,
                 'total_iterations': self.iteration,
                 'param_names': param_names,
-                'param_bounds': param_bounds
+                'param_bounds': param_bounds,
+                'weights': weights,
+                'n_particles': self.n_particles,
+                'r_spread_mm': r_spread_mm if self.is_multiparticle else 0.0,
+                'vr_spread_m_s': vr_spread_m_s if self.is_multiparticle else 0.0,
+                'envelope_oscillation_mm': np.std(std_r_steps) * 1000 if self.is_multiparticle else 0.0,
+                'full_beam': full_beam
             }
         )
 
+        if self.verbose:
+            print(f"\nFinal results:")
+            print(f"  Final energy: {optimized_orbit.final_energy_mev:.3f} MeV")
+            print(f"  Turns: {optimized_orbit.n_turns}")
+            if self.is_multiparticle and len(turn_stats) > 0:
+                print(f"  Final radial spread: {turn_stats[-1].std_r * 1000:.3f} mm")
+                print(f"  Envelope oscillation: {np.std(std_r_steps) * 1000:.3f} mm")
+
         return optimized_orbit
 
-    def _estimate_timestep(self, frequency_hz: float) -> float:
-        """Estimate timestep from RF frequency."""
-        period = 1.0 / frequency_hz
-        dt = period / self.steps_per_turn
-        return dt
+    def track_once(self,
+                   initial_r_mm: float,
+                   initial_v_tangential_m_s: float,
+                   bunch_phase_deg: float,
+                   rf_freq_mhz: float,
+                   max_turns: int = 500,
+                   r_spread_mm: float = 2.0,
+                   vr_spread_m_s: float = 1e4,
+                   save_full_beam: bool = False) -> OptimizedOrbit:
+        """
+        Single tracking run without optimization (for testing).
 
-if __name__ == "__main__":
-    print("accelerated_orbit_finder.py - Accelerated Orbit Optimization")
-    print("=" * 70)
-    print("This module requires a CentralRegion design with RF cavities.")
-    print("See examples/02_optimize_acceleration.py for usage.")
+        Works for both single-particle and multi-particle.
+
+        Parameters
+        ----------
+        initial_r_mm : float
+            Initial mean radius [mm]
+        initial_v_tangential_m_s : float
+            Initial tangential velocity [m/s]
+        bunch_phase_deg : float
+            Bunch phase [degrees]
+        rf_freq_mhz : float
+            RF frequency [MHz]
+        max_turns : int
+            Maximum turns
+        r_spread_mm : float
+            Radial spread [mm] (multi-particle only)
+        vr_spread_m_s : float
+            Radial velocity spread [m/s] (multi-particle only)
+        save_full_beam : bool
+            Save full beam trajectory
+
+        Returns
+        -------
+        result : OptimizedOrbit
+        """
+
+        if self.verbose:
+            print("\n" + "=" * 70)
+            mode_str = f"MULTI-PARTICLE ({self.n_particles})" if self.is_multiparticle else "SINGLE-PARTICLE"
+            print(f"{mode_str} TRACKING (SINGLE RUN)")
+            print("=" * 70)
+            print(f"Initial radius: {initial_r_mm:.2f} mm")
+            print(f"Tangential velocity: {initial_v_tangential_m_s / 1e6:.2f} Mm/s")
+            print(f"Bunch phase: {bunch_phase_deg:.2f} deg")
+            print(f"RF frequency: {rf_freq_mhz:.6f} MHz")
+            if self.is_multiparticle:
+                print(f"Particles: {self.n_particles}")
+                print(f"Spreads: r={r_spread_mm} mm, vr={vr_spread_m_s / 1e3:.1f} km/s")
+
+        # Set RF parameters
+        rf_freq_hz = rf_freq_mhz * 1e6
+        self.design.set_bunch_phase(bunch_phase_deg)
+        self.design.set_rf_frequency(rf_freq_hz)
+
+        # Create distribution
+        r_mean = initial_r_mm / 1000.0
+        r_spread = r_spread_mm / 1000.0 if self.is_multiparticle else 0.0
+        vr_spread = vr_spread_m_s if self.is_multiparticle else 0.0
+
+        pd_init = self.create_initial_distribution(
+            r_mean=r_mean,
+            v_tangential=initial_v_tangential_m_s,
+            v_perp=0.0,
+            r_spread=r_spread,
+            vr_spread=vr_spread
+        )
+
+        # Timestep
+        dt = self._estimate_timestep(rf_freq_hz)
+
+        # Track
+        result = self.track_with_rf(pd_init, dt, max_turns, save_full_beam=save_full_beam)
+        (success, turn_stats, rf_cross, traj_ref, poincare_all,
+         std_r_steps, turn_ids, full_beam) = result
+
+        metrics = calculate_turn_metrics(traj_ref, turn_ids)
+
+        # Create result
+        final_energy = turn_stats[-1].mean_energy_mev if len(turn_stats) > 0 else 0.0
+
+        result_obj = OptimizedOrbit(
+            success=success,
+            final_energy_mev=final_energy,
+            n_turns=len(turn_stats),
+            n_particles=self.n_particles,
+            bunch_phase_deg=bunch_phase_deg,
+            rf_frequency_mhz=rf_freq_mhz,
+            initial_r_mm=initial_r_mm,
+            initial_vr_m_s=0.0,
+            trajectory_reference=traj_ref,
+            poincare_points_all=poincare_all,
+            rf_crossings=rf_cross,
+            turn_statistics=turn_stats,
+            turn_metrics=metrics,
+            std_r_per_step=std_r_steps,
+            cost=0.0,
+            metadata={
+                'mode': 'single_run',
+                'n_particles': self.n_particles,
+                'r_spread_mm': r_spread_mm if self.is_multiparticle else 0.0,
+                'vr_spread_m_s': vr_spread_m_s if self.is_multiparticle else 0.0,
+                'initial_v_tangential_m_s': initial_v_tangential_m_s,
+                'envelope_oscillation_mm': np.std(std_r_steps) * 1000 if self.is_multiparticle else 0.0,
+                'full_beam': full_beam
+            }
+        )
+
+        if self.verbose:
+            print(f"\nResults:")
+            print(f"  Final energy: {final_energy:.3f} MeV")
+            print(f"  Turns completed: {len(turn_stats)}")
+            if self.is_multiparticle and len(turn_stats) > 0:
+                print(f"  Final radial spread: {turn_stats[-1].std_r * 1000:.3f} mm")
+                print(f"  Envelope oscillation: {np.std(std_r_steps) * 1000:.3f} mm")
+
+        return result_obj
+
+    if __name__ == "__main__":
+        print("accelerated_orbit_finder.py - Unified Accelerated Orbit Optimizer")
+        print("=" * 70)
+        print("Single class handles both single-particle and multi-particle optimization.")
+        print("\nUsage:")
+        print("  # Single particle")
+        print("  finder = AcceleratedOrbitFinder(design, target_energy_mev=5.0, n_particles=1)")
+        print("  result = finder.optimize(initial_seo)")
+        print("\n  # Multi-particle")
+        print("  finder = AcceleratedOrbitFinder(design, target_energy_mev=5.0, n_particles=100)")
+        print("  result = finder.optimize(initial_seo, r_spread_mm=2.0, vr_spread_m_s=1e4)")
