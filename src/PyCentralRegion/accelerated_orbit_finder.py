@@ -469,11 +469,11 @@ class AcceleratedOrbitFinder:
         w_energy = weights.get('energy', 5.0)
         cost -= w_energy * final_energy  # Maximize energy
 
-        w_center = weights.get('center', 1000.0)
+        w_center = weights.get('center', 5000.0)
         if len(metrics['r_center']) > 0:
             cost += w_center * np.mean(metrics['r_center'])  # Minimize centering
 
-        w_smooth = weights.get('smooth', 1000.0)
+        w_smooth = weights.get('smooth', 5000.0)
         if len(metrics['dr']) > 1:
             cost += w_smooth * np.std(metrics['dr']) ** 2  # Smooth turns
 
