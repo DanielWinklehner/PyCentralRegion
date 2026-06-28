@@ -60,6 +60,7 @@ class PoincarePoint:
     z: float
     vz: float
     time: float
+    bz_avg: float
 
 
 @dataclass
@@ -167,6 +168,8 @@ class SEOFinder:
                  poincare_angle: float = 0.0,
                  closure_tol_mm: float = 1.0,
                  algorithm: str = 'boris',
+                 solver: str = 'newton',
+                 symmetry_half_angle_deg: float = 45.0,
                  verbose: bool = True):
 
         self.design = design
@@ -176,6 +179,11 @@ class SEOFinder:
         self.poincare_angle = np.deg2rad(poincare_angle)
         self.closure_tol_mm = closure_tol_mm
         self.algorithm = algorithm
+        # SEO solver: 'newton' (full-turn 2D Newton fixed point), 'symmetric'
+        # (mirror-plane shooting; assumes the tracked field is symmetric about
+        # theta=0 and theta=symmetry_half_angle), or 'centroid' (legacy averaging).
+        self.solver = solver
+        self.symmetry_half_angle = np.deg2rad(symmetry_half_angle_deg)
         self.verbose = verbose
         self.pd = ParticleDistribution(species=design.species)
 
@@ -268,22 +276,8 @@ class SEOFinder:
         energy_kev : float
             Kinetic energy [keV]
         """
-        # q = abs(self.design.species.charge)
-        # m = self.design.species.mass_kg
-        #
-        # # Momentum
-        # p = q * B_field * radius_m  # kg*m/s
-        #
-        # # Relativistic energy: E^2 = (pc)^2 + (mc^2)^2
-        # E_total = np.sqrt((p * self.c) ** 2 + (m * CLIGHT ** 2) ** 2)
-        #
-        # # Kinetic energy
-        # E_kinetic = E_total - m * CLIGHT ** 2  # J
-        #
-        # # Convert to keV
-        # energy_kev = E_kinetic / 1.602176634e-16
 
-        return 1000.0 * self.pd.set_z_momentum_from_b_rho(B_field * radius_m)
+        return 1000.0 * self.pd.set_z_momentum_from_b_rho(abs(B_field) * radius_m)
 
     def _calculate_velocity_from_energy(self, energy_kev: float) -> float:
         """Calculate particle speed from kinetic energy (relativistic)."""
@@ -305,7 +299,7 @@ class SEOFinder:
         q = abs(self.design.species.charge)
         m = self.design.species.mass_kg
 
-        if B_field < 1e-6:
+        if abs(B_field) < 1e-6:
             return 1e-10
 
         # Cyclotron frequency
@@ -315,7 +309,7 @@ class SEOFinder:
         # Timestep
         dt = T / self.steps_per_turn
 
-        return dt
+        return abs(dt)
 
     def _check_poincare_crossing(self,
                                  r_old: np.ndarray,
@@ -373,7 +367,11 @@ class SEOFinder:
         t_frac : float or None
             Fractional timestep where crossing occurred (0-1)
         """
-        if r_old[1] <= 0.0 < r_new[1]:
+        # Strict '< 0' on the old point: the orbit is launched exactly on the section
+        # (y = 0), so a '<= 0' test would register a spurious crossing on the very first
+        # step. Excluding it makes poincare[1] the first *real* turn, so its bz_avg is a
+        # true path average over one revolution (not a single-azimuth sample).
+        if r_old[1] < 0.0 < r_new[1]:
             t_frac = r_old[1] / (r_old[1] - r_new[1])
             return True, t_frac
 
@@ -420,28 +418,31 @@ class SEOFinder:
         t = 0.0
         turn = 0
 
+        # Record first Poincare point (starting point is on the x-axis)
+        poincare_points.append(PoincarePoint(
+            turn=turn,
+            r=r[0],
+            vr=v[0],
+            z=r[2],
+            vz=v[2],
+            time=t,
+            bz_avg=0.0
+        ))
+
         # Boris: half-step back initialization
         if self.pusher.algorithm == 'boris':
-            ef = self.pusher._ensure_field_array(
-                self._zero_efield(r.reshape(1, 3))
-            )
-            bf = self.pusher._ensure_field_array(
-                self.design.bfield(r.reshape(1, 3))
-            )
-            _, v = self.pusher.push(r, v, ef, bf, -0.5 * dt)
+            _, v = self.pusher.push(r, v, self._zero_efield, self.design.bfield, -0.5 * dt)
+
+        bz_accum = 0.0
+        steps_taken = 0
 
         # Track
         for step in range(nsteps):
+
+            steps_taken += 1
+
             r_prev = r.copy()
             v_prev = v.copy()
-
-            # Get fields
-            # ef = self.pusher._ensure_field_array(
-            #     self._zero_efield(r.reshape(1, 3))
-            # )
-            # bf = self.pusher._ensure_field_array(
-            #     self.design.bfield(r.reshape(1, 3))
-            # )
 
             # Push
             r, v = self.pusher.push(r, v, self._zero_efield, self.design.bfield, dt)
@@ -463,6 +464,8 @@ class SEOFinder:
                     r_cross = r
                     v_cross = v
 
+                bz_accum += self.design.bfield(r_cross.copy().reshape(1, 3))[0][2]
+
                 # Record Poincare point
                 poincare_points.append(PoincarePoint(
                     turn=turn,
@@ -470,27 +473,254 @@ class SEOFinder:
                     vr=v_cross[0],  # Since our crossing point is the x-axis
                     z=r_cross[2],
                     vz=v_cross[2],
-                    time=t - dt + t_frac * dt if t_frac else t
+                    time=t - dt + t_frac * dt if t_frac else t,
+                    bz_avg=bz_accum / steps_taken
                 ))
 
-                # print(f"Crossed 'x-axis' at y = {1000.0 * r_cross[1]} mm")
-
                 turn += 1
+                bz_accum = 0.0
+                steps_taken = 0
+
+            else:
+                bz_accum += self.design.bfield(r.copy().reshape(1, 3))[0][2]
 
         # Boris: final half-step
         if self.pusher.algorithm == 'boris':
-            ef = self.pusher._ensure_field_array(
-                self._zero_efield(r.reshape(1, 3))
-            )
-            bf = self.pusher._ensure_field_array(
-                self.design.bfield(r.reshape(1, 3))
-            )
-            _, v = self.pusher.push(r, v, ef, bf, 0.5 * dt)
+            _, v = self.pusher.push(r, v, self._zero_efield, self.design.bfield, 0.5 * dt)
             v_traj[-1] = v
 
         return poincare_points, r_traj, v_traj
 
-    def find_seo_at_radius(self, radius_mm: float, n_iterations: int = 3) -> StaticOrbit:
+    # ==================================================================
+    # Gordon-seeded fixed-point (Newton) equilibrium-orbit solver.
+    # All tracking goes through the PyPATools pusher (self.pusher); this
+    # finds the EXACT closed orbit (the fixed point of the one-turn map),
+    # so there is no residual betatron oscillation -- unlike the legacy
+    # centroid-averaging finder in find_seo_at_radius.
+    # ==================================================================
+    def _v_from_energy_kev(self, energy_kev: float) -> float:
+        """Particle speed [m/s] from kinetic energy [keV] (relativistic)."""
+        gamma = energy_kev / 1000.0 / self.design.species.mass_mev + 1.0
+        beta = np.sqrt(1.0 - 1.0 / gamma ** 2)
+        return beta * CLIGHT
+
+    @staticmethod
+    def _launch_state(r: float, vr: float, v_total: float):
+        """Tracker (lab) (pos, vel) at theta=0 (on +x axis) with radial velocity vr."""
+        v_az = np.sqrt(max(v_total ** 2 - vr ** 2, 0.0))
+        return np.array([r, 0.0, 0.0]), np.array([vr, v_az, 0.0])
+
+    @staticmethod
+    def _radial_velocity(r_vec, v_vec) -> float:
+        """Radial velocity component v . r_hat in the median plane."""
+        rho = np.hypot(r_vec[0], r_vec[1])
+        return 0.0 if rho == 0.0 else (v_vec[0] * r_vec[0] + v_vec[1] * r_vec[1]) / rho
+
+    def _track_to_angle(self, pos, vel, dt, theta_target, max_steps):
+        """Track (PyPATools pusher) to the next increasing crossing of polar angle theta_target.
+
+        Returns (r_cross, v_cross, t_cross) in the tracker (lab) frame, or None.
+        """
+        bfield = self.design.bfield
+        ef = self._zero_efield
+        r = pos.copy()
+        v = vel.copy()
+        t = 0.0
+        boris = (self.pusher.algorithm == 'boris')
+        if boris:  # staggered velocity init
+            _, v = self.pusher.push(r, v, ef, bfield, -0.5 * dt)
+
+        def offset(rr):
+            d = np.arctan2(rr[1], rr[0]) - theta_target
+            return np.arctan2(np.sin(d), np.cos(d))  # wrap to (-pi, pi]
+
+        for _ in range(int(max_steps)):
+            r_prev, v_prev = r.copy(), v.copy()
+            r, v = self.pusher.push(r, v, ef, bfield, dt)
+            t += dt
+            d_prev, d_new = offset(r_prev), offset(r)
+            if d_prev < 0.0 <= d_new and (d_new - d_prev) < np.pi:
+                t_frac = -d_prev / (d_new - d_prev) if d_new != d_prev else 1.0
+                r_c, v_c = self.pusher.push(r_prev, v_prev, ef, bfield, t_frac * dt)
+                if boris:  # de-stagger velocity at the crossing
+                    _, v_c = self.pusher.push(r_c, v_c, ef, bfield, 0.5 * dt)
+                return r_c, v_c, t - dt + t_frac * dt
+        return None
+
+    def _one_turn(self, r, vr, v_total, dt, max_steps):
+        """One-turn map at theta=0: (r, vr) -> (r', vr', turn_time). None if it fails."""
+        pos, vel = self._launch_state(r, vr, v_total)
+        res = self._track_to_angle(pos, vel, dt, 0.0, max_steps)
+        if res is None:
+            return None
+        r_c, v_c, t = res
+        return r_c[0], v_c[0], t   # at theta=0: radial = x, vr = vx
+
+    def _one_turn_jacobian(self, r, vr, v_total, dt, max_steps):
+        """2x2 finite-difference Jacobian of the one-turn map d(r1,vr1)/d(r0,vr0)."""
+        base = self._one_turn(r, vr, v_total, dt, max_steps)
+        if base is None:
+            return None
+        r1, vr1, t_turn = base
+        d_r = 1.0e-5                          # 10 um
+        d_vr = max(1.0e-3 * v_total, 1.0)
+        pr = self._one_turn(r + d_r, vr, v_total, dt, max_steps)
+        pv = self._one_turn(r, vr + d_vr, v_total, dt, max_steps)
+        if pr is None or pv is None:
+            return None
+        col_r = np.array([pr[0] - r1, pr[1] - vr1]) / d_r
+        col_v = np.array([pv[0] - r1, pv[1] - vr1]) / d_vr
+        return np.column_stack([col_r, col_v]), r1, vr1, t_turn
+
+    def _newton_full_turn(self, r0, v_total, dt, max_steps, max_iter=15):
+        """2D Newton on (r, vr) for the one-turn fixed point.
+
+        Returns (r, vr, t_turn, M, residual_m) or None.
+        """
+        x = np.array([r0, 0.0])               # seed vr = 0 (symmetry-plane crossing)
+        M = r1 = vr1 = t_turn = None
+        for _ in range(max_iter):
+            jac = self._one_turn_jacobian(x[0], x[1], v_total, dt, max_steps)
+            if jac is None:
+                return None
+            M, r1, vr1, t_turn = jac
+            F = np.array([r1 - x[0], vr1 - x[1]])
+            if np.hypot(F[0], F[1] * t_turn) < 1.0e-7:   # length-scaled closure
+                break
+            try:
+                x = x - np.linalg.solve(M - np.eye(2), F)
+            except np.linalg.LinAlgError:
+                break
+        residual = np.hypot(r1 - x[0], (vr1 - x[1]) * t_turn) if r1 is not None else np.inf
+        return x[0], x[1], t_turn, M, residual
+
+    def _shoot_symmetric(self, r0, v_total, dt, theta_mirror, max_steps, max_iter=40):
+        """1D secant on r: launch vr=0 at theta=0, find r so vr=0 at theta_mirror.
+
+        Returns (r, t_segment) -- t_segment is the time to reach theta_mirror -- or None.
+        """
+        def vr_at_mirror(r):
+            pos, vel = self._launch_state(r, 0.0, v_total)
+            res = self._track_to_angle(pos, vel, dt, theta_mirror, max_steps)
+            if res is None:
+                return None
+            r_c, v_c, t = res
+            return self._radial_velocity(r_c, v_c), t
+
+        ra, rb = r0 - 1.0e-4, r0 + 1.0e-4
+        fa, fb = vr_at_mirror(ra), vr_at_mirror(rb)
+        if fa is None or fb is None:
+            return None
+        fa, fb = fa[0], fb[0]
+        t_seg = None
+        for _ in range(max_iter):
+            if fb == fa:
+                break
+            rc = rb - fb * (rb - ra) / (fb - fa)
+            res = vr_at_mirror(rc)
+            if res is None:
+                return None
+            fc, t_seg = res
+            ra, fa, rb, fb = rb, fb, rc, fc
+            if abs(fc) < 1.0e-3 and abs(rb - ra) < 1.0e-8:
+                break
+        return rb, t_seg
+
+    def find_seo_newton(self, radius_mm: float, energy_seed_kev: Optional[float] = None,
+                        solver: Optional[str] = None, do_final_tracking: bool = True) -> StaticOrbit:
+        """Find the SEO at a radius via fixed-point (Newton) solving.
+
+        Parameters
+        ----------
+        radius_mm : float
+            Target radius [mm].
+        energy_seed_kev : float, optional
+            Seed kinetic energy [keV] (e.g. from the Gordon method). If None, the
+            energy is seeded from the rigidity p = q*<B>*R at this radius.
+        solver : str, optional
+            'newton' or 'symmetric' (defaults to self.solver).
+        do_final_tracking : bool
+            Track 25 turns from the converged state for the stored trajectory.
+        """
+        solver = solver or self.solver
+        radius_m = radius_mm / 1000.0
+
+        field_info = self.calculate_avg_field(radius_m)
+        B_avg = field_info['B_avg']
+        energy_kev = (energy_seed_kev if energy_seed_kev is not None
+                      else self.calculate_ideal_energy(radius_m, B_avg))
+        v_total = self._v_from_energy_kev(energy_kev)
+        dt = self._estimate_timestep(radius_m, B_avg)
+
+        if self.verbose:
+            print(f"\n{'=' * 70}")
+            print(f"Newton SEO at R={radius_mm:.1f} mm (solver={solver}), seed E={energy_kev:.2f} keV"
+                  + ("  [Gordon-seeded]" if energy_seed_kev is not None else ""))
+            print(f"{'=' * 70}")
+
+        if solver == 'symmetric':
+            n_seg = max(1, int(round(2.0 * np.pi / self.symmetry_half_angle)))
+            max_steps = int(self.steps_per_turn / n_seg * 2 + 20)
+            sol = self._shoot_symmetric(radius_m, v_total, dt, self.symmetry_half_angle, max_steps)
+            if sol is None:
+                raise RuntimeError(f"Symmetric SEO shoot failed at R={radius_mm:.1f} mm")
+            r_star, t_seg = sol
+            vr_star = 0.0
+            t_turn = n_seg * t_seg
+            jac = self._one_turn_jacobian(r_star, vr_star, v_total, dt, int(self.steps_per_turn * 1.5))
+            M = jac[0] if jac is not None else None
+        else:  # 'newton'
+            max_steps = int(self.steps_per_turn * 1.5)
+            sol = self._newton_full_turn(radius_m, v_total, dt, max_steps)
+            if sol is None:
+                raise RuntimeError(f"Newton SEO solve failed at R={radius_mm:.1f} mm")
+            r_star, vr_star, t_turn, M, _ = sol
+
+        tune = (np.arccos(np.clip(np.trace(M) / 2.0, -1.0, 1.0)) / (2.0 * np.pi)
+                if M is not None else 0.0)
+        frequency = 1.0 / t_turn if t_turn else 0.0
+
+        # Final tracking from the converged state (clean closed orbit -> tiny std).
+        n_final = 25 if do_final_tracking else max(self.n_turns, 2)
+        pos, vel = self._launch_state(r_star, vr_star, v_total)
+        poincare, r_traj, v_traj = self.track_with_poincare(pos, vel, dt, n_final)
+
+        all_radii = [p.r for p in poincare]
+        closure_error_mm = float(np.std(all_radii) * 1000.0)
+        is_closed = closure_error_mm < self.closure_tol_mm
+
+        if self.verbose:
+            print(f"  r* = {r_star * 1000:.4f} mm, vr* = {vr_star:.3e} m/s")
+            print(f"  f = {frequency / 1e6:.4f} MHz, nu_r = {tune:.4f}, "
+                  f"closure(std) = {closure_error_mm:.4e} mm, closed = {is_closed}")
+
+        return StaticOrbit(
+            radius_mm=radius_mm,
+            energy_kev=energy_kev,
+            # Path-averaged field over the first full turn (poincare[1] is now the first
+            # real theta=0 crossing, not the launch point).
+            b_field_avg=poincare[1].bz_avg if len(poincare) > 1 else B_avg,
+            r0=pos.copy(),
+            v0=vel.copy(),
+            poincare_points=poincare,
+            trajectory=r_traj,
+            is_closed=is_closed,
+            closure_error_mm=closure_error_mm,
+            frequency_hz=frequency,
+            tune=tune,
+            metadata={
+                'solver': solver,
+                'field_info': field_info,
+                'timestep_s': dt,
+                'turn_time_s': t_turn,
+                'transfer_matrix': M,
+                'energy_seeded': energy_seed_kev is not None,
+                'refined_radius_m': r_star,
+                'refined_vr_m_s': vr_star,
+            },
+        )
+
+    def find_seo_at_radius(self, radius_mm: float, n_iterations: int = 3, do_final_tracking=True) -> StaticOrbit:
         """
         Find static equilibrium orbit at given radius using iterative refinement.
 
@@ -500,7 +730,8 @@ class SEOFinder:
             Radius [mm]
         n_iterations : int
             Number of refinement iterations (default: 3)
-
+        do_final_tracking : bool
+            Whether to perform a final 25 turn tracking for refined orbit analysis
         Returns
         -------
         orbit : StaticOrbit
@@ -598,16 +829,17 @@ class SEOFinder:
                     print(f"Converged! (closure_error < {self.closure_tol_mm} mm)")
                 break
 
-        # Final tracking with best parameters (25 turns for full contour)
-        if self.verbose:
-            print(f"\nFinal tracking with 25 turns for full contour mapping...")
+        if do_final_tracking:
+            # Final tracking with best parameters (25 turns for full contour)
+            if self.verbose:
+                print(f"\nFinal tracking with 25 turns for full contour mapping...")
 
-        # Coordinate system: PyPATools uses z as longitudinal (linac convention)
-        # but cyclotrons use y as azimuthal direction. Swap y<->z here.
-        poincare, r_traj, v_traj = self.track_with_poincare(
-            np.array([self.pd.x[0], self.pd.y[0], self.pd.z[0]]),
-            np.array([self.pd.vx[0], self.pd.vz[0], self.pd.vy[0]]),  # Need to switch from linac coords to cyclotron coords
-            dt, 25)
+            # Coordinate system: PyPATools uses z as longitudinal (linac convention)
+            # but cyclotrons use y as azimuthal direction. Swap y<->z here.
+            poincare, r_traj, v_traj = self.track_with_poincare(
+                np.array([self.pd.x[0], self.pd.y[0], self.pd.z[0]]),
+                np.array([self.pd.vx[0], self.pd.vz[0], self.pd.vy[0]]),  # Need to switch from linac coords to cyclotron coords
+                dt, 25)
 
         best_poincare = poincare
         best_traj_r, best_traj_v = r_traj, v_traj
@@ -648,7 +880,11 @@ class SEOFinder:
                 betatron_periods = len(best_poincare) / (len(crossings) / 2.0)
                 tune = 1.0 / betatron_periods
 
-        if self.verbose:
+        if self.verbose and do_final_tracking:
+            # Calculate centroid (fixed point of Poincare map)
+            r_center = np.mean(all_radii)
+            vr_center = np.mean(all_vr)
+
             print(f"\nFinal Results:")
             print(f"  Refined radius: {self.pd.x[0] * 1000:.3f} mm")
             print(f"  Refined energy: {self.pd.mean_energy_mev * 1000:.2f} keV")
@@ -663,7 +899,7 @@ class SEOFinder:
         orbit = StaticOrbit(
             radius_mm=radius_mm,  # Keep nominal radius
             energy_kev=self.pd.mean_energy_mev * 1000,  # Use refined energy
-            b_field_avg=B_avg,
+            b_field_avg=best_poincare[1].bz_avg,
             r0=np.array([self.pd.x[0], self.pd.y[0], self.pd.z[0]]),
             v0=np.array([self.pd.vx[0], self.pd.vz[0], self.pd.vy[0]]),
             poincare_points=best_poincare,
@@ -685,7 +921,9 @@ class SEOFinder:
 
         return orbit
 
-    def find_seos_at_radii(self, radii_mm: List[float], n_iterations: int = 5) -> List[StaticOrbit]:
+    def find_seos_at_radii(self, radii_mm: List[float], n_iterations: int = 5, do_final_tracking=True,
+                           solver: Optional[str] = None,
+                           energy_seeds_kev: Optional[List[float]] = None) -> List[StaticOrbit]:
         """
         Find SEOs at multiple radii with iterative refinement.
 
@@ -695,7 +933,8 @@ class SEOFinder:
             List of radii [mm]
         n_iterations : int
             Number of refinement iterations per radius (default: 3)
-
+        do_final_tracking : bool
+            Whether to perform a final 25 turn tracking for refined orbit analysis
         Returns
         -------
         orbits : list
@@ -708,11 +947,19 @@ class SEOFinder:
             print(f"SCANNING {len(radii_mm)} RADII with {n_iterations} iterations each")
             print(f"{'=' * 70}")
 
+        solver = solver or self.solver
+
         for i, radius in enumerate(radii_mm):
             if self.verbose:
                 print(f"\n[{i + 1}/{len(radii_mm)}]", end=" ")
 
-            orbit = self.find_seo_at_radius(radius, n_iterations=n_iterations)
+            if solver == 'centroid':
+                orbit = self.find_seo_at_radius(radius, n_iterations=n_iterations,
+                                                do_final_tracking=do_final_tracking)
+            else:
+                seed = energy_seeds_kev[i] if energy_seeds_kev is not None else None
+                orbit = self.find_seo_newton(radius, energy_seed_kev=seed, solver=solver,
+                                             do_final_tracking=do_final_tracking)
             orbits.append(orbit)
 
         if self.verbose:
