@@ -1,72 +1,183 @@
 """
-cavity_optimizer.py - RF Cavity Geometry Optimization
+cavity_optimizer.py - RF Cavity Geometry Optimization (user-beam entry point)
 
-Optimizes cavity segment geometry (angles and radii) along with RF parameters
-(bunch phase, frequency) for improved acceleration efficiency.
+Optimizes cavity segment geometry INDEPENDENTLY PER GAP (each gap's segment
+angles and node radii are separate optimization parameters) together with RF
+parameters (bunch phase, frequency, and optional r0/pr0) to steer a
+USER-SUPPLIED initial beam (e.g. a spiral-inflector output) onto a good
+accelerated orbit. Cavity base angles stay fixed.
 
-Part of: PyCentralRegion module
-Dependencies: accelerated_orbit_finder, tracking
+Parameter vector layout:
+    [gap0: a_0..a_{n-1}, r_0..r_{n-1}] [gap1: ...] ... [gapG-1: ...] [RF params]
+with n = n_segments and G = number of gaps (len(design.rf_cavities)).
 
-Usage:
-    from cavity_optimizer import CavityGeometryOptimizer
+Part of: PyCentralRegion module. Dependencies: accelerated_orbit_finder, tracking.
 
-    # Create orbit finder
-    finder = AcceleratedOrbitFinder(design, target_energy_mev=5.0, n_particles=1)
+Usage
+-----
+    from PyCentralRegion import (AcceleratedOrbitFinder, CavityGeometryOptimizer,
+                                 make_single_particle_beam)
 
-    # Create geometry optimizer
-    geo_optimizer = CavityGeometryOptimizer(
-        orbit_finder=finder,
-        n_segments=2,
-        max_angle_variable=15.0,  # degrees
-        max_r_variable=0.25,      # m
-        r_min_cavity=0.05         # m
-    )
-
-    # Optimize geometry + RF parameters
-    result = geo_optimizer.optimize(
-        initial_seo=seo,
-        rf_optimize_params=['bunch_phase', 'rf_freq'],
-        maxiter=50
-    )
+    beam = make_single_particle_beam(design.species, r=0.03, vr=0.0, v_total=v0)
+    finder = AcceleratedOrbitFinder(design, target_energy_mev=5.0)
+    geo = CavityGeometryOptimizer(finder, n_segments=2, max_angle_variable=10.0,
+                                  max_r_variable=0.20, r_min_cavity=0.005)
+    result = geo.optimize(beam, rf_optimize_params=['bunch_phase', 'rf_freq'])
 """
 
+import os
+import time
+import csv
 import numpy as np
 from typing import List, Optional, Dict, Tuple
 from scipy.optimize import differential_evolution, minimize
-import time
-import csv
-from pathlib import Path
 
-from .accelerated_orbit_finder import AcceleratedOrbitFinder, OptimizedOrbit
+from .accelerated_orbit_finder import (AcceleratedOrbitFinder, OptimizedOrbit,
+                                       DEFAULT_LS_WEIGHTS, DEFAULT_SKIP_TURNS)
+
+
+# ============================================================================
+# Multiprocessing workers (module-level so they pickle under Windows 'spawn').
+#
+# Each pool worker builds its OWN full system (field load included) exactly
+# once via the user-supplied builder, then evaluates many tasks against it.
+# The builder must be a module-level function returning a configured
+# CavityGeometryOptimizer; it is pickled by reference, so it must be
+# importable from the worker process (define it at the top level of your
+# script and keep the `if __name__ == "__main__":` guard).
+# ============================================================================
+_WORKER_GEO = None
+
+
+def _pool_init(builder, builder_args, checkpoint_base):
+    global _WORKER_GEO
+    geo = builder(*builder_args)
+    geo.verbose = False
+    geo.orbit_finder.verbose = False
+    geo.orbit_finder.design.verbose = False   # silence per-eval RF-setting prints
+    geo.orbit_finder.checkpoint_file = None
+    if checkpoint_base:
+        geo.checkpoint_file = f"{checkpoint_base}.worker-{os.getpid()}.csv"
+        geo._checkpoint_inited = False
+        geo._init_checkpoint_file()
+    else:
+        geo.checkpoint_file = None
+    _WORKER_GEO = geo
+
+
+def _pool_track_once(task):
+    """Stage-A grid point: (phase, freq) with the given frozen geometry."""
+    try:
+        (phase_deg, freq_hz, x_vec, p_vec, spt, max_turns, r0_mode,
+         angles_per_gap, radii_per_gap) = task
+        from PyPATools.particles import ParticleDistribution
+        geo = _WORKER_GEO
+        of = geo.orbit_finder
+        of.steps_per_turn = int(spt)
+        for g, cavity in enumerate(of.design.rf_cavities):
+            cavity.update_geometry(segment_angles=list(angles_per_gap[g]),
+                                   segment_radii=list(radii_per_gap[g]))
+        # bem2d: stage-A geometry is identical for every task, so the
+        # geometry-keyed attach solves once per worker and then no-ops.
+        if geo._is_bem and not geo._attach_bem_for_current_geometry():
+            return None
+        beam = ParticleDistribution(species=of.design.species,
+                                    x_vec=np.asarray(x_vec), p_vec=np.asarray(p_vec))
+        res = of.track_once(beam, bunch_phase_deg=float(phase_deg),
+                            rf_freq_mhz=float(freq_hz) / 1e6,
+                            max_turns=int(max_turns), r0_mode=r0_mode)
+        return float(res.final_energy_mev), float(phase_deg), float(freq_hz)
+    except Exception:
+        return None
+
+
+def _pool_verify(task):
+    """Stage-C pre-selection: evaluate ONE solution at final resolution.
+
+    The winner must be chosen by the VERIFIED objective - a start can win at
+    search resolution on a marginal synchrotron-capture basin that simply does
+    not exist at full resolution (observed: search ||r||^2 best-of-12 gave
+    0.028 MeV / 1 turn at 500 spt).
+    """
+    try:
+        (x, x_vec, p_vec, spt, max_turns, ls_weights, rf_optimize_params,
+         r0_mode, skip_turns, f0_hz) = task
+        from PyPATools.particles import ParticleDistribution
+        geo = _WORKER_GEO
+        of = geo.orbit_finder
+        of.steps_per_turn = int(spt)
+        beam = ParticleDistribution(species=of.design.species,
+                                    x_vec=np.asarray(x_vec), p_vec=np.asarray(p_vec))
+        dt = of._estimate_timestep(float(f0_hz))
+        resid = geo.residuals_with_geometry(
+            np.asarray(x, dtype=float), beam, dt, int(max_turns),
+            dict(ls_weights), list(rf_optimize_params), r0_mode,
+            skip_turns=int(skip_turns))
+        return {'obj': float(np.sum(resid ** 2)),
+                'energy': float(of.last_energy_mev),
+                'turns': int(of.last_n_turns)}
+    except Exception as e:
+        return {'error': repr(e)}
+
+
+def _pool_dfols(task):
+    """Stage-B multi-start: one full DFO-LS run; returns a compact result."""
+    try:
+        import dfols
+        from PyPATools.particles import ParticleDistribution
+        (seed_x0, lower, upper, x_vec, p_vec, spt, max_turns, ls_weights,
+         rf_optimize_params, r0_mode, skip_turns, maxfun, f0_hz) = task
+        geo = _WORKER_GEO
+        of = geo.orbit_finder
+        of.steps_per_turn = int(spt)
+        of.iteration = 0
+        of.best_cost = np.inf
+        geo.best_cost = np.inf
+        beam = ParticleDistribution(species=of.design.species,
+                                    x_vec=np.asarray(x_vec), p_vec=np.asarray(p_vec))
+        lower = np.asarray(lower, dtype=float)
+        upper = np.asarray(upper, dtype=float)
+        margin = 1e-6 * (upper - lower)
+        x0 = np.clip(np.asarray(seed_x0, dtype=float), lower + margin, upper - margin)
+        # dt from the EXPLICIT base frequency, not the worker's mutable cavity
+        # state (stage-A tasks leave the last-evaluated frequency behind, and
+        # task->worker scheduling varies run to run -> nondeterministic dt).
+        dt = of._estimate_timestep(float(f0_hz))
+
+        def objfun(x):
+            return geo.residuals_with_geometry(x, beam, dt, int(max_turns),
+                                               dict(ls_weights),
+                                               list(rf_optimize_params), r0_mode,
+                                               skip_turns=int(skip_turns))
+
+        soln = dfols.solve(objfun, x0, bounds=(lower, upper), maxfun=int(maxfun),
+                           objfun_has_noise=True, scaling_within_bounds=True,
+                           do_logging=False)
+        return {'x': np.asarray(soln.x, dtype=float).tolist(),
+                'obj': float(soln.obj), 'nf': int(soln.nf), 'msg': str(soln.msg)}
+    except Exception as e:
+        return {'error': repr(e)}
 
 
 class CavityGeometryOptimizer:
-    """
-    Optimize RF cavity geometry along with RF parameters.
+    """Optimize RF cavity geometry + RF parameters for a supplied initial beam.
 
-    Optimizes:
-    - Angular excursions of variable segments [degrees]
-    - Radial positions of segment nodes [m]
-    - Bunch phase [degrees]
-    - RF frequency [Hz]
-    - Initial conditions (r0, vr0) if requested
+    Parameter vector layout:
+        [per-gap geometry blocks] [opening_delta (if enabled)] [RF params]
 
-    Parameters
-    ----------
-    orbit_finder : AcceleratedOrbitFinder
-        Configured orbit finder (single or multi-particle)
-    n_segments : int
-        Number of variable segments per cavity
-    max_angle_variable : float
-        Maximum angular excursion [degrees]
-    max_r_variable : float
-        Maximum radial extent for variable segments [m]
-    r_min_cavity : float
-        Minimum cavity radius [m]
-    verbose : bool
-        Print progress
-    checkpoint_file : str, optional
-        CSV file for checkpointing
+    ``optimize_opening_angle`` adds ONE shared parameter: a delta [deg] on the
+    dee opening angle applied to ALL dees (requires ``dee_system``, the
+    descriptor returned by ``create_dee_system``). In parallel mode, the worker
+    builder must construct the optimizer with the SAME dee_system and flag.
+
+    With a ``gap_model='bem2d'`` finder, the solved BEM gap field is
+    re-attached before every tracking run whose geometry changed (skipped for
+    RF-only moves - the engine re-syncs omega/phase without a re-solve). This
+    is EXPENSIVE (one electrode build + Laplace solve + field gridding per
+    geometry change); use coarse ``bem_build_kwargs``/``bem_field_kwargs`` for
+    the search and verify winners at full resolution (example 07). Unbuildable
+    candidates (mesh/solve failure, ``max_r_inner`` guard) get a graded
+    penalty, not a crash.
     """
 
     def __init__(self,
@@ -76,476 +187,1106 @@ class CavityGeometryOptimizer:
                  max_r_variable: float,
                  r_min_cavity: float,
                  verbose: bool = True,
-                 checkpoint_file: Optional[str] = None):
-
+                 checkpoint_file: Optional[str] = None,
+                 dee_system=None,
+                 optimize_opening_angle: bool = False,
+                 opening_delta_max: float = 10.0,
+                 rotatable_segments: bool = False,
+                 rotation_max: float = 15.0,
+                 bem_build_kwargs: Optional[Dict] = None,
+                 bem_solve_kwargs: Optional[Dict] = None,
+                 bem_field_kwargs: Optional[Dict] = None):
+        if getattr(orbit_finder, 'gap_model', 'thin') not in ('thin', 'bem2d'):
+            raise ValueError(f"unsupported gap_model "
+                             f"'{getattr(orbit_finder, 'gap_model', 'thin')}'")
         self.orbit_finder = orbit_finder
         self.n_segments = n_segments
+        self.n_gaps = len(orbit_finder.design.rf_cavities)
         self.max_angle = max_angle_variable
         self.max_r = max_r_variable
         self.r_min = r_min_cavity
         self.verbose = verbose
         self.checkpoint_file = checkpoint_file
 
-        self.iteration = 0
+        self.dee_system = dee_system
+        self.optimize_opening_angle = bool(optimize_opening_angle)
+        self.opening_delta_max = opening_delta_max
+        if self.optimize_opening_angle and dee_system is None:
+            raise ValueError("optimize_opening_angle=True requires dee_system "
+                             "(from create_dee_system)")
+
+        # Rotatable segments: each variable segment gets a per-segment rotation
+        # about its midpoint (need not point at the origin) - decouples the
+        # crossing azimuth (RF phase) from the kick direction (segment normal).
+        self.rotatable_segments = bool(rotatable_segments)
+        self.rotation_max = rotation_max
+
+        # Arc clearance between azimuthally adjacent gap CENTERLINES (and
+        # minimum radial-band ordering within a gap). Violations are penalized
+        # smoothly, like the radii-monotonicity projection. The requirement is
+        # gap-width aware: the gaps are channels of finite width, so adjacent
+        # centerlines must clear (gap_width_i + gap_width_j)/2 plus
+        # min_metal_width_m so a metal dummy-dee sliver always fits between the
+        # channels (min_metal_width_m matches gap_fields.build_gap_electrodes;
+        # min_clearance_m is an absolute floor for very narrow gaps). The gap
+        # adjacency ORDER, nominal spacings, and pair half-width sums are
+        # captured here, at construction - candidates must not redefine their
+        # own baseline.
+        self.min_clearance_m = 0.005
+        self.min_metal_width_m = 0.004
+        cavs = orbit_finder.design.rf_cavities
+        self._clearance_order = sorted(range(len(cavs)),
+                                       key=lambda k: cavs[k].base_angle % 360.0)
+        _sorted_angles = [cavs[k].base_angle % 360.0 for k in self._clearance_order]
+        self._nominal_dphi = [np.deg2rad((_sorted_angles[(i + 1) % len(_sorted_angles)]
+                                          - _sorted_angles[i]) % 360.0)
+                              for i in range(len(_sorted_angles))]
+        # Per-gap width parameters (nominal, taper) in clearance order; the
+        # local width at a sample radius comes from _frozen_width_at. Widths
+        # and taper are never touched by update_geometry, so freezing them is
+        # exact.
+        self._gap_width_params = [
+            (cavs[k].gap_width, getattr(cavs[k], 'gap_width_inner', None),
+             getattr(cavs[k], 'gap_taper_radius', None), cavs[k].r_min)
+            for k in self._clearance_order]
+
+        # BEM-in-the-loop state (gap_model='bem2d' finders only).
+        self.bem_build_kwargs = bem_build_kwargs
+        self.bem_solve_kwargs = bem_solve_kwargs
+        self.bem_field_kwargs = bem_field_kwargs
+        self._bem_geom_key = None
+        self._bem_last_error = None
+        self._n_resid = None
+
         self.best_cost = np.inf
         self.best_geometry = None
+        self._checkpoint_inited = False
 
-        if self.checkpoint_file:
-            self._init_checkpoint_file()
-
+    # ------------------------------------------------------------- checkpoint
     def _init_checkpoint_file(self):
-        """Initialize CSV checkpoint file with geometry columns."""
+        if not self.checkpoint_file or self._checkpoint_inited:
+            return
         with open(self.checkpoint_file, 'w', newline='') as f:
             writer = csv.writer(f)
-
-            # Build header
             header = ['iteration']
-
-            # Geometry parameters
-            for i in range(self.n_segments):
-                header.append(f'seg{i}_angle_deg')
-            for i in range(self.n_segments):
-                header.append(f'seg{i}_radius_mm')
-
-            # RF parameters
-            header.extend(['bunch_phase_deg', 'rf_freq_mhz', 'r0_mm', 'vr0_m_s'])
-
-            # Results
-            header.extend(['final_energy_mev', 'n_turns', 'cost', 'success', 'timestamp'])
-
-            # Multi-particle specific
-            if self.orbit_finder.is_multiparticle:
-                header.extend(['final_std_r_mm', 'envelope_oscillation_mm'])
-
+            for g in range(self.n_gaps):
+                header += [f'gap{g}_seg{i}_angle_deg' for i in range(self.n_segments)]
+                header += [f'gap{g}_seg{i}_radius_mm' for i in range(self.n_segments)]
+                if self.rotatable_segments:
+                    header += [f'gap{g}_seg{i}_rotation_deg' for i in range(self.n_segments)]
+            if self.optimize_opening_angle:
+                header += ['opening_angle_deg']
+            header += ['bunch_phase_deg', 'rf_freq_mhz', 'r0', 'vr0',
+                       'final_energy_mev', 'n_turns', 'cost', 'success', 'timestamp']
             writer.writerow(header)
+        self._checkpoint_inited = True
 
-    def _write_checkpoint(self, geometry_params, rf_params, cost, energy, n_turns, success,
-                          std_r_mm=None, envelope_osc_mm=None):
-        """Append iteration to checkpoint file."""
+    def _write_checkpoint(self, angles_per_gap, radii_per_gap, rf_vals, cost,
+                          energy, n_turns, success, opening_delta=None,
+                          rotations_per_gap=None):
         if not self.checkpoint_file:
             return
-
         with open(self.checkpoint_file, 'a', newline='') as f:
             writer = csv.writer(f)
-
-            row = [self.iteration]
-
-            # Geometry (angles and radii)
-            segment_angles, segment_radii = geometry_params
-            row.extend(segment_angles)
-            row.extend([r * 1000 for r in segment_radii])  # Convert to mm
-
-            # RF parameters
-            bunch_phase = rf_params[0]
-            rf_freq = rf_params[1]
-            r0 = rf_params[2] * 1000 if len(rf_params) > 2 else 0
-            vr0 = rf_params[3] if len(rf_params) > 3 else 0
-
-            row.extend([bunch_phase, rf_freq / 1e6, r0, vr0])
-
-            # Results
-            row.extend([energy, n_turns, cost, success, time.time()])
-
-            # Multi-particle
-            if self.orbit_finder.is_multiparticle:
-                row.extend([std_r_mm or 0.0, envelope_osc_mm or 0.0])
-
+            row = [self.orbit_finder.iteration]
+            for g in range(self.n_gaps):
+                row += list(angles_per_gap[g])
+                row += [r * 1000 for r in radii_per_gap[g]]
+                if self.rotatable_segments:
+                    row += list(rotations_per_gap[g]) if rotations_per_gap else \
+                           [0.0] * self.n_segments
+            if self.optimize_opening_angle:
+                base = self.dee_system.opening_angle if self.dee_system else 0.0
+                row += [base + (opening_delta or 0.0)]
+            row += [rf_vals.get('bunch_phase', 0.0), rf_vals.get('rf_freq', 0.0) / 1e6,
+                    rf_vals.get('r0', 0.0), rf_vals.get('vr0', 0.0),
+                    energy, n_turns, cost, success, time.time()]
             writer.writerow(row)
 
-    def _unpack_params(self, params: np.ndarray, rf_param_names: List[str]) -> Tuple:
+    # --------------------------------------------------------------- geometry
+    @property
+    def _blk(self) -> int:
+        """Per-gap geometry block size: [angles, radii(, rotations)]."""
+        return (3 if self.rotatable_segments else 2) * self.n_segments
+
+    @property
+    def _n_geo(self) -> int:
+        return self.n_gaps * self._blk
+
+    @property
+    def _rf_offset(self) -> int:
+        """Index where RF params start (after geometry [+ opening delta])."""
+        return self._n_geo + (1 if self.optimize_opening_angle else 0)
+
+    def _unpack_params(self, params) -> Tuple[List[List[float]], List[List[float]],
+                                              Optional[List[List[float]]],
+                                              Optional[float], np.ndarray]:
+        """Split the parameter vector into its blocks.
+
+        Returns (angles_per_gap, radii_per_gap, rotations_per_gap,
+        opening_delta, rf_params); rotations_per_gap is None unless
+        rotatable_segments is enabled, opening_delta is None unless
+        optimize_opening_angle is enabled.
         """
-        Unpack optimization parameters into geometry and RF components.
+        n = self.n_segments
+        blk = self._blk
+        angles_per_gap, radii_per_gap = [], []
+        rotations_per_gap = [] if self.rotatable_segments else None
+        for g in range(self.n_gaps):
+            base = g * blk
+            angles_per_gap.append(list(params[base:base + n]))
+            radii_per_gap.append(list(params[base + n:base + 2 * n]))
+            if self.rotatable_segments:
+                rotations_per_gap.append(list(params[base + 2 * n:base + 3 * n]))
+        opening_delta = (float(params[self._n_geo])
+                         if self.optimize_opening_angle else None)
+        rf_params = np.asarray(params[self._rf_offset:], dtype=float)
+        return angles_per_gap, radii_per_gap, rotations_per_gap, opening_delta, rf_params
 
-        Parameters
-        ----------
-        params : array
-            [angle_0, ..., angle_N, r_0, ..., r_N, bunch_phase, rf_freq, ...]
-        rf_param_names : list
-            Names of RF parameters being optimized
+    def _rotations_for_gap(self, rotations_per_gap, g):
+        return rotations_per_gap[g] if rotations_per_gap is not None else None
 
-        Returns
-        -------
-        segment_angles : list [degrees]
-        segment_radii : list [m]
-        rf_params : array
+    def _gap_base_angles(self, opening_delta: Optional[float]) -> List[Optional[float]]:
+        """Per-gap base angles for the given opening delta (None -> unchanged)."""
+        if opening_delta is None or self.dee_system is None:
+            return [None] * self.n_gaps
+        return self.dee_system.gap_angles(self.dee_system.opening_angle + opening_delta)
+
+    def _geometry_violation(self, radii_per_gap) -> float:
+        """Total monotonicity violation [m] over all gaps (0 if all valid).
+
+        Per gap: r_min < r0 < ... < r_max. Graded (not a flat penalty) so the
+        optimizer sees a gradient out of the invalid region instead of a plateau
+        that collapses Nelder-Mead.
         """
+        violation = 0.0
+        for g, radii in enumerate(radii_per_gap):
+            r_max = self.orbit_finder.design.rf_cavities[g].r_max
+            all_radii = [self.r_min] + list(radii) + [r_max]
+            for i in range(len(all_radii) - 1):
+                gap = all_radii[i + 1] - all_radii[i]
+                if gap <= 0.0:
+                    violation += -gap + 1e-6
+        return violation
 
-        n_seg = self.n_segments
+    def _project_radii(self, radii_per_gap, eps: float = 0.002):
+        """Project per-gap node radii onto the nearest feasible monotone config.
 
-        # Geometry parameters
-        segment_angles = params[:n_seg].tolist()
-        segment_radii = params[n_seg:2 * n_seg].tolist()
-
-        # RF parameters (rest of params array)
-        rf_params = params[2 * n_seg:]
-
-        return segment_angles, segment_radii, rf_params
-
-    def _validate_geometry(self, segment_radii: List[float]) -> bool:
+        Sequential forward clip with ``eps`` spacing inside (r_min, r_max).
+        Returns (projected_radii_per_gap, total_projection_distance_m). The
+        distance is 0 for already-valid configurations; least-squares paths use
+        it as a smooth constraint residual instead of a cost cliff.
         """
-        Check if geometry is valid (monotonic radii).
+        proj, viol = [], 0.0
+        for g, radii in enumerate(radii_per_gap):
+            r_max = self.orbit_finder.design.rf_cavities[g].r_max
+            lo = self.r_min + eps
+            out = []
+            for k, r in enumerate(radii):
+                hi = r_max - eps * (len(radii) - k)
+                r_new = min(max(r, lo), hi)
+                viol += abs(r_new - r)
+                out.append(r_new)
+                lo = r_new + eps
+            proj.append(out)
+        return proj, viol
 
-        Returns
-        -------
-        valid : bool
+    @staticmethod
+    def _frozen_width_at(params, r: float) -> float:
+        """Local gap width [m] at radius r from frozen (nominal, taper) params."""
+        w_nom, w_inner, taper_r, r_min = params
+        if w_inner is None:
+            return w_nom
+        frac = min(max((r - r_min) / (taper_r - r_min), 0.0), 1.0)
+        return w_inner + frac * (w_nom - w_inner)
+
+    def _clearance_violation(self, n_samples: int = 17) -> float:
+        """Total overlap violation [m] of the ACTUAL (possibly rotated) gap lines.
+
+        (a) intra-gap: consecutive segments' radial bands must stay ordered
+            (rotation moves endpoint radii; overlapping bands cause spurious
+            double kicks);
+        (b) inter-gap: the arc clearance between azimuthally adjacent gap
+            CENTERLINES, sampled at n_samples radii, must exceed the pair's
+            channel half-widths plus min_metal_width_m (worst case: the two
+            gaps of the same dee).
+
+        Smooth near the feasible boundary; call AFTER the candidate geometry
+        has been applied to the cavities.
         """
+        cavs = self.orbit_finder.design.rf_cavities
+        viol = 0.0
 
-        # Check monotonicity: r_min < r0 < r1 < ... < r_max
-        r_max = self.orbit_finder.design.rf_cavities[0].r_max
-        all_radii = [self.r_min] + segment_radii + [r_max]
+        # (a) intra-gap radial-band ordering from actual endpoints
+        for cav in cavs:
+            segs = cav.segments
+            for i in range(len(segs) - 1):
+                r_hi = max(np.hypot(*segs[i]['p1'][:2]), np.hypot(*segs[i]['p2'][:2]))
+                r_lo = min(np.hypot(*segs[i + 1]['p1'][:2]), np.hypot(*segs[i + 1]['p2'][:2]))
+                viol += max(0.0, r_hi - r_lo)
 
-        for i in range(len(all_radii) - 1):
-            if all_radii[i] >= all_radii[i + 1]:
-                return False
+        # (b) inter-gap azimuthal arc clearance
+        def azimuth_at_radius(segments, r):
+            for seg in segments:
+                p1 = seg['p1'][:2]
+                d = seg['p2'][:2] - p1
+                a = d @ d
+                if a < 1e-18:
+                    continue
+                b = 2.0 * (p1 @ d)
+                c = (p1 @ p1) - r * r
+                disc = b * b - 4.0 * a * c
+                if disc < 0.0:
+                    continue
+                sq = np.sqrt(disc)
+                for t in ((-b - sq) / (2 * a), (-b + sq) / (2 * a)):
+                    if 0.0 <= t <= 1.0:
+                        p = p1 + t * d
+                        return float(np.arctan2(p[1], p[0]))
+            return None
 
+        # Required clearance per pair: the full gap-width-aware value wherever
+        # the AS-CONSTRUCTED nominal arc at that radius could fit it, so a
+        # metal sliver of min_metal_width_m always fits between the two gap
+        # channels. Below that radius the nominal (radial) lines legitimately
+        # converge and no candidate can satisfy the full requirement either,
+        # so fall back to 50% of the nominal arc - a pure crossing guard that
+        # never flags the constructed geometry. Requirements depend only on
+        # the sample radius and the frozen baseline (__init__), never on the
+        # candidate, so the penalty stays smooth in the parameters. Sampling
+        # is geometric: the clearance bites at small radii, which a coarse
+        # linspace over [r_min, r_max] never visits.
+        r_lo = 1.05 * max(c.r_min for c in cavs)
+        r_hi = 0.98 * min(c.r_max for c in cavs)
+        radii = np.geomspace(r_lo, r_hi, n_samples)
+        order = self._clearance_order
+        for j, r in enumerate(radii):
+            phis = [azimuth_at_radius(cavs[k].segments, r) for k in order]
+            for a_idx in range(len(order)):
+                p1 = phis[a_idx]
+                p2 = phis[(a_idx + 1) % len(order)]
+                if p1 is None or p2 is None:
+                    continue
+                halfw = 0.5 * (
+                    self._frozen_width_at(self._gap_width_params[a_idx], r)
+                    + self._frozen_width_at(
+                        self._gap_width_params[(a_idx + 1) % len(order)], r))
+                full_req = max(self.min_clearance_m,
+                               halfw + self.min_metal_width_m)
+                nominal_arc = self._nominal_dphi[a_idx] * r
+                required = full_req if nominal_arc >= full_req else 0.5 * nominal_arc
+                dphi = (p2 - p1) % (2.0 * np.pi)
+                arc = dphi * r
+                if dphi <= np.pi:
+                    viol += max(0.0, required - arc)
+                else:
+                    # neighbor appears on the wrong side: lines crossed
+                    viol += required + (dphi - np.pi) * r
+        return viol
+
+    # ------------------------------------------------------------------- BEM
+    @property
+    def _is_bem(self) -> bool:
+        return getattr(self.orbit_finder, 'gap_model', 'thin') == 'bem2d'
+
+    def _attach_bem_for_current_geometry(self) -> bool:
+        """(Re-)solve the BEM gap field for the cavities' CURRENT geometry.
+
+        Skips the solve when the geometry is unchanged since the last attach
+        (RF-only moves: the engine re-syncs omega/phase without a re-solve).
+        Returns False if the electrode build or solve failed (unbuildable
+        candidate); the error is kept on ``self._bem_last_error``.
+        """
+        of = self.orbit_finder
+        key = tuple((tuple(c.segment_angles), tuple(c.segment_radii),
+                     tuple(c.segment_rotations), float(c.base_angle))
+                    for c in of.design.rf_cavities)
+        if key == self._bem_geom_key and of.bem_solution is not None:
+            return True
+        try:
+            of.attach_bem_field(build_kwargs=self.bem_build_kwargs,
+                                solve_kwargs=self.bem_solve_kwargs,
+                                field_kwargs=self.bem_field_kwargs)
+        except Exception as e:
+            self._bem_geom_key = None
+            self._bem_last_error = repr(e)
+            return False
+        self._bem_geom_key = key
         return True
 
-    def objective_function_with_geometry(self, params, initial_seo, dt, max_turns,
-                                         r_spread, vr_spread, weights, rf_param_names):
+    def residuals_with_geometry(self, params, initial_beam, dt, max_turns,
+                                ls_weights, rf_param_names, r0_mode,
+                                skip_turns: int = DEFAULT_SKIP_TURNS,
+                                w_violation: float = 100.0):
+        """Residual vector (DFO-LS objective): per-gap geometry + RF params.
+
+        Non-monotone radii are PROJECTED to the nearest feasible configuration
+        (tracking still happens) and the projection distance is appended as one
+        extra residual, keeping the landscape smooth for the model-based solver.
+        ``skip_turns`` exempts the first n turns from centering/smoothness.
         """
-        Objective function that updates cavity geometry then tracks.
+        (angles_per_gap, radii_per_gap, rotations_per_gap,
+         opening_delta, rf_params) = self._unpack_params(params)
+        rf_vals = self.orbit_finder._unpack(rf_params, rf_param_names)
+        radii_proj, violation = self._project_radii(radii_per_gap)
+        base_angles = self._gap_base_angles(opening_delta)
 
-        Wraps AcceleratedOrbitFinder.objective_function with geometry updates.
-        """
+        for g, cavity in enumerate(self.orbit_finder.design.rf_cavities):
+            cavity.update_geometry(segment_angles=angles_per_gap[g],
+                                   segment_radii=radii_proj[g],
+                                   base_angle=base_angles[g],
+                                   segment_rotations=self._rotations_for_gap(
+                                       rotations_per_gap, g))
+        violation += self._clearance_violation()
 
-        self.iteration += 1
+        if self._is_bem and not self._attach_bem_for_current_geometry():
+            # Unbuildable candidate (electrode build/solve failure or the
+            # max_r_inner guard): graded fallback, worse than any tracked
+            # geometry, keeping the clearance term for a slope back toward
+            # feasibility. Sized from the last successful evaluation.
+            if self._n_resid is None:
+                raise RuntimeError(
+                    "BEM attach failed on the FIRST evaluation (cannot size "
+                    f"the penalty residual): {self._bem_last_error}")
+            self.orbit_finder.iteration += 1
+            resid = np.full(self._n_resid, 10.0)
+            resid[-1] = max(w_violation * violation, 10.0)
+            self._write_checkpoint(angles_per_gap, radii_proj, rf_vals,
+                                   float(np.sum(resid ** 2)), 0.0, 0, False,
+                                   opening_delta=opening_delta,
+                                   rotations_per_gap=rotations_per_gap)
+            return resid
 
-        # Unpack parameters
-        segment_angles, segment_radii, rf_params = self._unpack_params(params, rf_param_names)
+        resid = self.orbit_finder.objective_residuals(
+            rf_params, initial_beam, dt, max_turns, ls_weights, rf_param_names,
+            r0_mode, skip_turns=skip_turns)
+        resid = np.append(resid, w_violation * violation)
+        self._n_resid = len(resid)
 
-        # Validate geometry
-        if not self._validate_geometry(segment_radii):
-            if self.verbose:
-                print(f"    Iter {self.iteration}: Invalid geometry (non-monotonic radii)")
-            self._write_checkpoint(
-                (segment_angles, segment_radii), rf_params,
-                1e10, 0.0, 0, False
-            )
-            return 1e10
-
-        # Update all cavity geometries
-        try:
-            for cavity in self.orbit_finder.design.rf_cavities:
-                cavity.update_geometry(
-                    segment_angles=segment_angles,
-                    segment_radii=segment_radii
-                )
-        except Exception as e:
-            if self.verbose:
-                print(f"    Iter {self.iteration}: Geometry update failed: {e}")
-            self._write_checkpoint(
-                (segment_angles, segment_radii), rf_params,
-                1e10, 0.0, 0, False
-            )
-            return 1e10
-
-        # Call underlying orbit finder's objective function
-        cost = self.orbit_finder.objective_function(
-            rf_params, initial_seo, dt, max_turns,
-            r_spread, vr_spread, weights
-        )
-
-        # Extract results for checkpoint
-        # (Note: orbit_finder already writes its own checkpoint, but we want geometry too)
-        # We'll extract from the last tracking result if available
-
-        # Track best geometry
+        cost = float(np.sum(resid ** 2))
+        self._write_checkpoint(angles_per_gap, radii_proj, rf_vals, cost,
+                               self.orbit_finder.last_energy_mev,
+                               self.orbit_finder.last_n_turns,
+                               self.orbit_finder.last_n_turns > 0,
+                               opening_delta=opening_delta,
+                               rotations_per_gap=rotations_per_gap)
         if cost < self.best_cost:
             self.best_cost = cost
             self.best_geometry = {
-                'segment_angles': segment_angles.copy(),
-                'segment_radii': segment_radii.copy(),
-                'rf_params': rf_params.copy()
+                'segment_angles_per_gap': [list(a) for a in angles_per_gap],
+                'segment_radii_per_gap': [list(r) for r in radii_proj],
+                'opening_delta': opening_delta,
+                'rf_params': rf_params.copy(),
             }
-
             if self.verbose:
-                print(f"    Iter {self.iteration}: NEW BEST GEOMETRY - cost={cost:.2e}")
-                print(f"      Angles: {[f'{a:.2f}' for a in segment_angles]} deg")
-                print(f"      Radii:  {[f'{r * 1000:.1f}' for r in segment_radii]} mm")
+                print(f"    eval {self.orbit_finder.iteration}: NEW BEST "
+                      f"||r||^2={cost:.3e}, E={self.orbit_finder.last_energy_mev:.3f} MeV, "
+                      f"turns={self.orbit_finder.last_n_turns}")
+        elif self.verbose and self.orbit_finder.iteration % 25 == 0:
+            print(f"    eval {self.orbit_finder.iteration}: ||r||^2={cost:.3e} "
+                  f"(best {self.best_cost:.3e})")
+        return resid
 
+    def objective_function_with_geometry(self, params, initial_beam, dt, max_turns,
+                                         weights, rf_param_names, r0_mode):
+        (angles_per_gap, radii_per_gap, rotations_per_gap,
+         opening_delta, rf_params) = self._unpack_params(params)
+        rf_vals = self.orbit_finder._unpack(rf_params, rf_param_names)
+
+        violation = self._geometry_violation(radii_per_gap)
+        if violation > 0.0:
+            cost = 1e10 + 1e6 * violation
+            if self.verbose:
+                print(f"    Iter {self.orbit_finder.iteration + 1}: invalid geometry "
+                      f"(violation={violation * 1000:.2f} mm)")
+            # iteration is incremented inside the orbit finder; emulate for the row
+            self.orbit_finder.iteration += 1
+            self._write_checkpoint(angles_per_gap, radii_per_gap, rf_vals, cost, 0.0, 0, False,
+                                   opening_delta=opening_delta,
+                               rotations_per_gap=rotations_per_gap)
+            return cost
+
+        try:
+            base_angles = self._gap_base_angles(opening_delta)
+            for g, cavity in enumerate(self.orbit_finder.design.rf_cavities):
+                cavity.update_geometry(segment_angles=angles_per_gap[g],
+                                       segment_radii=radii_per_gap[g],
+                                       base_angle=base_angles[g],
+                                       segment_rotations=self._rotations_for_gap(
+                                           rotations_per_gap, g))
+        except Exception as e:
+            if self.verbose:
+                print(f"    Iter {self.orbit_finder.iteration + 1}: geometry update failed: {e}")
+            self.orbit_finder.iteration += 1
+            self._write_checkpoint(angles_per_gap, radii_per_gap, rf_vals, 1e10, 0.0, 0, False,
+                                   opening_delta=opening_delta,
+                               rotations_per_gap=rotations_per_gap)
+            return 1e10
+
+        # Clearance violation (rotated/tilted lines must not overlap): graded.
+        clear_viol = self._clearance_violation()
+        cost_penalty = 1e6 * clear_viol
+
+        if self._is_bem and not self._attach_bem_for_current_geometry():
+            if self.verbose:
+                print(f"    Iter {self.orbit_finder.iteration + 1}: BEM attach "
+                      f"failed: {self._bem_last_error}")
+            self.orbit_finder.iteration += 1
+            cost = 1e10 + cost_penalty
+            self._write_checkpoint(angles_per_gap, radii_per_gap, rf_vals, cost,
+                                   0.0, 0, False, opening_delta=opening_delta,
+                                   rotations_per_gap=rotations_per_gap)
+            return cost
+
+        cost = self.orbit_finder.objective_function(
+            rf_params, initial_beam, dt, max_turns, weights, rf_param_names, r0_mode)
+        cost += cost_penalty
+
+        # Success-path checkpoint with the REAL energy/turns from the orbit finder.
+        self._write_checkpoint(angles_per_gap, radii_per_gap, rf_vals, cost,
+                               self.orbit_finder.last_energy_mev,
+                               self.orbit_finder.last_n_turns, True,
+                               opening_delta=opening_delta,
+                               rotations_per_gap=rotations_per_gap)
+
+        if cost < self.best_cost:
+            self.best_cost = cost
+            self.best_geometry = {
+                'segment_angles_per_gap': [list(a) for a in angles_per_gap],
+                'segment_radii_per_gap': [list(r) for r in radii_per_gap],
+                'opening_delta': opening_delta,
+                'rf_params': rf_params.copy(),
+            }
+            if self.verbose:
+                a_all = np.concatenate(angles_per_gap)
+                print(f"    Iter {self.orbit_finder.iteration}: NEW BEST cost={cost:.3e}, "
+                      f"E={self.orbit_finder.last_energy_mev:.3f} MeV  "
+                      f"angle range=[{a_all.min():+.2f},{a_all.max():+.2f}] deg")
         return cost
 
+    # --------------------------------------------------------------- optimize
+    def _build_full_param_space(self, initial_beam, rf_optimize_params, rf_bounds, r0_mode):
+        """Full parameter space: per-gap geometry blocks (base angles fixed) + RF."""
+        of = self.orbit_finder
+        r_spacing = (self.max_r - self.r_min) / (self.n_segments + 1)
+        geo_bounds, geo_x0, geo_names = [], [], []
+        for g in range(self.n_gaps):
+            r_max_cav = of.design.rf_cavities[g].r_max
+            for i in range(self.n_segments):
+                geo_names.append(f'gap{g}_seg{i}_angle')
+                geo_bounds.append((-self.max_angle, self.max_angle))
+                geo_x0.append(0.0)
+            for i in range(self.n_segments):
+                geo_names.append(f'gap{g}_seg{i}_radius')
+                geo_bounds.append((self.r_min + 0.01, min(self.max_r, r_max_cav - 0.01)))
+                geo_x0.append(self.r_min + (i + 1) * r_spacing)
+            if self.rotatable_segments:
+                for i in range(self.n_segments):
+                    geo_names.append(f'gap{g}_seg{i}_rotation')
+                    geo_bounds.append((-self.rotation_max, self.rotation_max))
+                    geo_x0.append(0.0)
+
+        if self.optimize_opening_angle:
+            geo_names.append('opening_delta')
+            geo_bounds.append((-self.opening_delta_max, self.opening_delta_max))
+            geo_x0.append(0.0)
+
+        rf_bnds, rf_names, rf_x0 = of._build_param_space(
+            initial_beam, rf_optimize_params, rf_bounds or {}, r0_mode)
+
+        return geo_bounds + rf_bnds, geo_names + rf_names, geo_x0 + rf_x0
+
     def optimize(self,
-                 initial_seo,
+                 initial_beam,
                  max_turns: int = 500,
-                 r_spread_mm: float = 2.0,
-                 vr_spread_m_s: float = 1e4,
                  rf_optimize_params: List[str] = ['bunch_phase', 'rf_freq'],
                  rf_bounds: Optional[Dict] = None,
                  method: str = 'differential_evolution',
                  maxiter: int = 100,
-                 weights: Optional[Dict] = None) -> OptimizedOrbit:
-        """
-        Optimize cavity geometry and RF parameters.
-
-        Parameters
-        ----------
-        initial_seo : StaticOrbit
-            Starting orbit
-        max_turns : int
-            Maximum turns to track
-        r_spread_mm : float
-            Radial spread [mm] (multi-particle only)
-        vr_spread_m_s : float
-            Radial velocity spread [m/s] (multi-particle only)
-        rf_optimize_params : list
-            RF parameters to optimize: 'bunch_phase', 'rf_freq', 'r0', 'vr0'
-        rf_bounds : dict, optional
-            Custom bounds for RF parameters
-        method : str
-            'differential_evolution' or 'nelder_mead'
-        maxiter : int
-            Maximum iterations
-        weights : dict, optional
-            Cost function weights
-
-        Returns
-        -------
-        result : OptimizedOrbit
-            Optimized orbit with best geometry
-        """
+                 weights: Optional[Dict] = None,
+                 r0_mode: str = 'offset') -> OptimizedOrbit:
+        of = self.orbit_finder
+        of._set_beam_meta(initial_beam)
+        effective_multi = of.is_multiparticle and r0_mode != 'absolute'
 
         if self.verbose:
             print("\n" + "=" * 70)
-            print("CAVITY GEOMETRY + RF PARAMETER OPTIMIZATION")
+            print("CAVITY GEOMETRY + RF PARAMETER OPTIMIZATION (per-gap geometry)")
             print("=" * 70)
-            print(f"Target energy: {self.orbit_finder.target_energy_mev} MeV")
-            print(f"Particles: {self.orbit_finder.n_particles}")
-            print(f"Variable segments: {self.n_segments}")
-            print(f"RF parameters: {rf_optimize_params}")
+            print(f"Target energy: {of.target_energy_mev} MeV, beam numpart={of.n_particles}")
+            print(f"Gaps: {self.n_gaps}, variable segments/gap: {self.n_segments} "
+                  f"-> {self._n_geo} geometry params"
+                  + (" + shared opening angle" if self.optimize_opening_angle else "")
+                  + f"; RF params: {rf_optimize_params}")
+            print(f"r0_mode={r0_mode}, method={method}")
 
-        # Setup bounds
+        if weights is None:
+            weights = of._default_weights(effective_multi)
         if rf_bounds is None:
             rf_bounds = {}
 
-        param_bounds = []
-        param_names = []
-        x0 = []
+        param_bounds, param_names, x0 = self._build_full_param_space(
+            initial_beam, rf_optimize_params, rf_bounds, r0_mode)
 
-        # Geometry parameters
-        # Angular excursions
-        for i in range(self.n_segments):
-            param_names.append(f'seg{i}_angle')
-            param_bounds.append((-self.max_angle, self.max_angle))
-            x0.append(0.0)  # Start with straight cavities
-
-        # Radial positions
-        r_max = self.orbit_finder.design.rf_cavities[0].r_max
-        r_spacing = (self.max_r - self.r_min) / (self.n_segments + 1)
-
-        for i in range(self.n_segments):
-            param_names.append(f'seg{i}_radius')
-            r_nominal = self.r_min + (i + 1) * r_spacing
-            param_bounds.append((self.r_min + 0.01, min(self.max_r, r_max - 0.01)))
-            x0.append(r_nominal)
-
-        # RF parameters
-        if 'bunch_phase' in rf_optimize_params:
-            param_names.append('bunch_phase')
-            param_bounds.append(rf_bounds.get('bunch_phase', (-180, 180)))
-            x0.append(20.0)
-
-        if 'rf_freq' in rf_optimize_params:
-            param_names.append('rf_freq')
-            f_seo = initial_seo.frequency_hz
-            param_bounds.append(rf_bounds.get('rf_freq', (f_seo * 0.9, f_seo * 1.1)))
-            x0.append(f_seo)
-
-        if 'r0' in rf_optimize_params:
-            param_names.append('r0')
-            r_seo = initial_seo.r0[0]
-            param_bounds.append(rf_bounds.get('r0', (r_seo - 0.010, r_seo + 0.010)))
-            x0.append(r_seo)
-
-        if 'vr0' in rf_optimize_params:
-            param_names.append('vr0')
-            param_bounds.append(rf_bounds.get('vr0', (-5e5, 5e5)))
-            x0.append(0.0)
-
-        if self.verbose:
-            print(f"\nOptimization parameters ({len(param_names)} total):")
-            for name, bnd, x in zip(param_names, param_bounds, x0):
-                print(f"  {name}: bounds={bnd}, initial={x}")
-            print()
-
-        # Setup
-        self.iteration = 0
+        of.iteration = 0
+        of.best_cost = np.inf
         self.best_cost = np.inf
         self.best_geometry = None
+        self._init_checkpoint_file()
 
-        dt = self.orbit_finder._estimate_timestep(initial_seo.frequency_hz)
-        r_spread = r_spread_mm / 1000.0 if self.orbit_finder.is_multiparticle else 0.0
-        vr_spread = vr_spread_m_s if self.orbit_finder.is_multiparticle else 0.0
+        dt = of._estimate_timestep(of._rf_base_frequency())
+        args = (initial_beam, dt, max_turns, weights, rf_optimize_params, r0_mode)
 
-        # Default weights
-        if weights is None:
-            if self.orbit_finder.is_multiparticle:
-                weights = {
-                    'energy': 5.0,
-                    'spread': 100.0,
-                    'center': 1000.0,
-                    'smooth': 1000.0
-                }
-            else:
-                weights = {
-                    'energy': 5.0,
-                    'center': 1000.0,
-                    'smooth': 1000.0
-                }
-
-        # Optimize
-        start_time = time.time()
-
+        start = time.time()
         if method == 'differential_evolution':
-            result = differential_evolution(
-                self.objective_function_with_geometry,
-                param_bounds,
-                args=(initial_seo, dt, max_turns, r_spread, vr_spread, weights, rf_optimize_params),
-                maxiter=maxiter,
-                workers=1,
-                updating='deferred',
-                disp=False
-            )
-            optimal_params = result.x
-            final_cost = result.fun
-
+            res = differential_evolution(self.objective_function_with_geometry, param_bounds,
+                                         args=args, maxiter=maxiter, workers=1,
+                                         updating='deferred', disp=False)
+            optimal = res.x
+            final_cost = res.fun
         elif method == 'nelder_mead':
-            result = minimize(
-                self.objective_function_with_geometry,
-                x0,
-                args=(initial_seo, dt, max_turns, r_spread, vr_spread, weights, rf_optimize_params),
-                method='Nelder-Mead',
-                options={'maxiter': maxiter, 'disp': False}
-            )
-            optimal_params = result.x
-            final_cost = result.fun
-
+            res = minimize(self.objective_function_with_geometry, x0, args=args,
+                           method='Nelder-Mead', options={'maxiter': maxiter, 'disp': False})
+            optimal = res.x
+            final_cost = res.fun
         else:
             raise ValueError(f"Unknown method: {method}")
+        elapsed = time.time() - start
 
-        elapsed = time.time() - start_time
-
-        if self.verbose:
-            print(f"\n{'=' * 70}")
-            print(f"OPTIMIZATION COMPLETE")
-            print(f"{'=' * 70}")
-            print(f"Time elapsed: {elapsed:.1f} s")
-            print(f"Iterations: {self.iteration}")
-            print(f"Final cost: {final_cost:.2e}")
-
-        # Unpack optimal parameters
-        segment_angles, segment_radii, rf_params = self._unpack_params(
-            optimal_params, rf_optimize_params
-        )
+        optimized = self._finalize(optimal, rf_optimize_params, initial_beam, max_turns,
+                                   r0_mode, param_names, param_bounds, weights,
+                                   method, elapsed, final_cost)
 
         if self.verbose:
-            print(f"\nOptimal geometry:")
-            for i, (ang, rad) in enumerate(zip(segment_angles, segment_radii)):
-                print(f"  Segment {i}: angle={ang:.2f}°, radius={rad * 1000:.1f} mm")
+            print(f"Final energy: {optimized.final_energy_mev:.3f} MeV, "
+                  f"turns: {optimized.n_turns}")
+        return optimized
 
-            print(f"\nOptimal RF parameters:")
-            for i, name in enumerate(rf_optimize_params):
-                val = rf_params[i]
-                if name == 'rf_freq':
-                    print(f"  {name}: {val / 1e6:.6f} MHz")
-                elif name == 'bunch_phase':
-                    print(f"  {name}: {val:.2f} deg")
-                elif name == 'r0':
-                    print(f"  {name}: {val * 1000:.3f} mm")
-                elif name == 'vr0':
-                    print(f"  {name}: {val:.1f} m/s")
+    def _finalize(self, optimal, rf_optimize_params, initial_beam, max_turns, r0_mode,
+                  param_names, param_bounds, weights, method, elapsed, final_cost,
+                  extra_meta=None) -> OptimizedOrbit:
+        """Apply the optimal geometry + RF and do the final tracking run.
 
-        # Final tracking with optimal geometry
-        for cavity in self.orbit_finder.design.rf_cavities:
-            cavity.update_geometry(
-                segment_angles=segment_angles,
-                segment_radii=segment_radii
-            )
-
-        # Set RF parameters
-        self.orbit_finder.design.set_bunch_phase(rf_params[0])
-        self.orbit_finder.design.set_rf_frequency(rf_params[1])
-
-        # Create initial distribution
-        r_mean = rf_params[2] if len(rf_params) > 2 else initial_seo.r0[0]
-        vr_mean = rf_params[3] if len(rf_params) > 3 else 0.0
-        v_tangential = np.linalg.norm(initial_seo.v0)
-
-        pd_init_final = self.orbit_finder.create_initial_distribution(
-            r_mean=r_mean,
-            v_tangential=v_tangential,
-            v_perp=vr_mean,
-            r_spread=r_spread,
-            vr_spread=vr_spread
-        )
+        Uses the orbit finder's CURRENT steps_per_turn, so staged optimization can
+        raise the resolution before calling this. Radii are projected to the
+        nearest feasible (monotone) configuration as a guard.
+        """
+        of = self.orbit_finder
+        (angles_per_gap, radii_per_gap, rotations_per_gap,
+         opening_delta, rf_params) = self._unpack_params(optimal)
+        radii_per_gap, _ = self._project_radii(radii_per_gap)
+        rf_vals = of._unpack(rf_params, rf_optimize_params)
+        base_angles = self._gap_base_angles(opening_delta)
 
         if self.verbose:
-            print("\nFinal tracking with optimal parameters...")
+            print(f"\nOptimization complete in {elapsed:.1f}s, {of.iteration} evals, "
+                  f"final cost {final_cost:.3e}")
+            if opening_delta is not None:
+                print(f"  dee opening angle: "
+                      f"{self.dee_system.opening_angle + opening_delta:.3f} deg "
+                      f"(delta {opening_delta:+.3f})")
+            for g in range(self.n_gaps):
+                rot_str = (f", rot={[f'{r:+.2f}' for r in rotations_per_gap[g]]} deg"
+                           if rotations_per_gap is not None else "")
+                print(f"  gap {g}: angles={[f'{a:+.2f}' for a in angles_per_gap[g]]} deg, "
+                      f"radii={[f'{r*1000:.1f}' for r in radii_per_gap[g]]} mm{rot_str}")
 
-        # Track
-        result_tracking = self.orbit_finder.track_with_rf(
-            pd_init_final, dt, max_turns, save_full_beam=True
-        )
-        (success, turn_stats, rf_cross, traj_ref, poincare_all,
-         std_r_steps, turn_ids, full_beam) = result_tracking
+        for g, cavity in enumerate(of.design.rf_cavities):
+            cavity.update_geometry(segment_angles=angles_per_gap[g],
+                                   segment_radii=radii_per_gap[g],
+                                   base_angle=base_angles[g],
+                                   segment_rotations=self._rotations_for_gap(
+                                       rotations_per_gap, g))
+        if self._is_bem and not self._attach_bem_for_current_geometry():
+            raise RuntimeError(f"BEM attach failed for the FINAL geometry: "
+                               f"{self._bem_last_error}")
+        if 'bunch_phase' in rf_vals:
+            of.design.set_bunch_phase(rf_vals['bunch_phase'])
+        if 'rf_freq' in rf_vals:
+            of.design.set_rf_frequency(rf_vals['rf_freq'])
 
-        from .diagnostics import calculate_turn_metrics
-        metrics = calculate_turn_metrics(traj_ref, turn_ids)
+        dt = of._estimate_timestep(of._rf_base_frequency())
+        pd_final = of._prepare_beam(initial_beam, rf_vals.get('r0'), rf_vals.get('vr0'), r0_mode)
+        of._set_beam_meta(pd_final)
+        result = of.track_with_rf(pd_final, dt, max_turns, save_full_beam=True)
 
-        # Create result
-        optimized_orbit = OptimizedOrbit(
-            success=success,
-            final_energy_mev=turn_stats[-1].mean_energy_mev if len(turn_stats) > 0 else 0.0,
-            n_turns=len(turn_stats),
-            n_particles=self.orbit_finder.n_particles,
-            bunch_phase_deg=rf_params[0],
-            rf_frequency_mhz=rf_params[1] / 1e6,
-            initial_r_mm=r_mean * 1000,
-            initial_vr_m_s=vr_mean,
-            trajectory_reference=traj_ref,
-            poincare_points_all=poincare_all,
-            rf_crossings=rf_cross,
-            turn_statistics=turn_stats,
-            turn_metrics=metrics,
-            std_r_per_step=std_r_steps,
-            cost=final_cost,
-            metadata={
-                'initial_seo': initial_seo,
-                'optimization_method': method,
-                'optimization_time_s': elapsed,
-                'total_iterations': self.iteration,
-                'param_names': param_names,
-                'param_bounds': param_bounds,
-                'weights': weights,
-                'n_particles': self.orbit_finder.n_particles,
-                'r_spread_mm': r_spread_mm if self.orbit_finder.is_multiparticle else 0.0,
-                'vr_spread_m_s': vr_spread_m_s if self.orbit_finder.is_multiparticle else 0.0,
-                'envelope_oscillation_mm': np.std(std_r_steps) * 1000 if self.orbit_finder.is_multiparticle else 0.0,
-                'full_beam': full_beam,
-                'optimal_geometry': {
-                    'segment_angles': segment_angles,
-                    'segment_radii': segment_radii,
-                    'n_segments': self.n_segments
-                }
-            }
-        )
+        meta = {
+            'optimization_time_s': elapsed,
+            'total_iterations': of.iteration,
+            'optimal_geometry': {
+                'segment_angles_per_gap': [list(a) for a in angles_per_gap],
+                'segment_radii_per_gap': [list(r) for r in radii_per_gap],
+                'segment_rotations_per_gap': ([list(r) for r in rotations_per_gap]
+                                              if rotations_per_gap is not None else None),
+                'opening_angle_deg': (self.dee_system.opening_angle + opening_delta
+                                      if opening_delta is not None else None),
+                'n_segments': self.n_segments,
+                'n_gaps': self.n_gaps,
+            },
+        }
+        meta.update(extra_meta or {})
+        return of._build_result(result, rf_vals, final_cost, param_names, param_bounds,
+                                weights, method, elapsed, r0_mode, metadata_extra=meta)
+
+    # ---------------------------------------------------------------- DFO-LS
+    def optimize_dfols(self,
+                       initial_beam,
+                       max_turns: int = 8,
+                       rf_optimize_params: List[str] = ['bunch_phase', 'rf_freq'],
+                       rf_bounds: Optional[Dict] = None,
+                       ls_weights: Optional[Dict] = None,
+                       maxfun: Optional[int] = None,
+                       seed_x0: Optional[np.ndarray] = None,
+                       r0_mode: str = 'offset',
+                       skip_turns: int = DEFAULT_SKIP_TURNS,
+                       verify_max_turns: Optional[int] = None,
+                       verify_steps_per_turn: Optional[int] = None) -> OptimizedOrbit:
+        """Optimize with DFO-LS (model-based derivative-free least squares).
+
+        Minimizes ||objective residuals||^2 (see ``residuals_with_geometry``) —
+        the recommended optimizer for the high-dimensional per-gap geometry space
+        (noise-robust, needs only n+1 evals to build its first model).
+
+        Parameters
+        ----------
+        maxfun : int, optional
+            Evaluation budget (default 30*(n_params+1)).
+        seed_x0 : array, optional
+            Starting point (e.g. from a stage-A RF scan). Defaults to straight
+            segments + nominal radii + RF defaults.
+        verify_max_turns / verify_steps_per_turn : int, optional
+            If given, the FINAL tracking (and returned result) runs at this
+            higher resolution while the search stays at the current settings.
+        ls_weights : dict, optional
+            Least-squares weights {'energy','center','smooth'}; defaults
+            DEFAULT_LS_WEIGHTS (energy-dominant - see its comment for why).
+        """
+        import dfols
+
+        of = self.orbit_finder
+        of._set_beam_meta(initial_beam)
+        if ls_weights is None:
+            ls_weights = dict(DEFAULT_LS_WEIGHTS)
+
+        param_bounds, param_names, x0_default = self._build_full_param_space(
+            initial_beam, rf_optimize_params, rf_bounds, r0_mode)
+        lower = np.array([b[0] for b in param_bounds], dtype=float)
+        upper = np.array([b[1] for b in param_bounds], dtype=float)
+        x0 = np.asarray(seed_x0 if seed_x0 is not None else x0_default, dtype=float)
+        # dfols with scaling_within_bounds needs x0 strictly inside the box
+        margin = 1e-6 * (upper - lower)
+        x0 = np.clip(x0, lower + margin, upper - margin)
+
+        n = len(x0)
+        budget = maxfun if maxfun is not None else 30 * (n + 1)
 
         if self.verbose:
-            print(f"\nFinal results:")
-            print(f"  Final energy: {optimized_orbit.final_energy_mev:.3f} MeV")
-            print(f"  Turns: {optimized_orbit.n_turns}")
-            if self.orbit_finder.is_multiparticle and len(turn_stats) > 0:
-                print(f"  Final radial spread: {turn_stats[-1].std_r * 1000:.3f} mm")
-                print(f"  Envelope oscillation: {np.std(std_r_steps) * 1000:.3f} mm")
+            print("\n" + "=" * 70)
+            print("CAVITY GEOMETRY + RF OPTIMIZATION - DFO-LS (per-gap geometry)")
+            print("=" * 70)
+            print(f"Params: {n} ({self.n_gaps} gaps x {2 * self.n_segments} geometry "
+                  f"+ {len(rf_optimize_params)} RF), budget maxfun={budget}")
+            print(f"Search: steps_per_turn={of.steps_per_turn}, max_turns={max_turns}")
 
-        return optimized_orbit
+        of.iteration = 0
+        of.best_cost = np.inf
+        self.best_cost = np.inf
+        self.best_geometry = None
+        self._init_checkpoint_file()
+
+        dt = of._estimate_timestep(of._rf_base_frequency())
+
+        def objfun(x):
+            return self.residuals_with_geometry(x, initial_beam, dt, max_turns,
+                                                ls_weights, rf_optimize_params,
+                                                r0_mode, skip_turns=skip_turns)
+
+        start = time.time()
+        soln = dfols.solve(objfun, x0, bounds=(lower, upper), maxfun=budget,
+                           objfun_has_noise=True, scaling_within_bounds=True,
+                           do_logging=False)
+        elapsed = time.time() - start
+
+        if self.verbose:
+            print(f"DFO-LS: {soln.msg} (nf={soln.nf}, ||r||^2={soln.obj:.3e})")
+
+        # Final tracking (optionally at higher resolution).
+        spt_orig = of.steps_per_turn
+        if verify_steps_per_turn is not None:
+            of.steps_per_turn = verify_steps_per_turn
+        try:
+            result = self._finalize(
+                soln.x, rf_optimize_params, initial_beam,
+                verify_max_turns if verify_max_turns is not None else max_turns,
+                r0_mode, param_names, param_bounds, ls_weights, 'dfols', elapsed,
+                float(soln.obj),
+                extra_meta={'dfols_msg': str(soln.msg), 'dfols_nf': int(soln.nf)})
+        finally:
+            of.steps_per_turn = spt_orig
+
+        if self.verbose:
+            print(f"Final energy: {result.final_energy_mev:.3f} MeV, "
+                  f"turns: {result.n_turns}")
+        return result
+
+    # ---------------------------------------------------------------- staged
+    def optimize_staged(self,
+                        initial_beam,
+                        rf_optimize_params: List[str] = ['bunch_phase', 'rf_freq'],
+                        rf_bounds: Optional[Dict] = None,
+                        ls_weights: Optional[Dict] = None,
+                        search_steps_per_turn: int = 300,
+                        search_max_turns: int = 8,
+                        final_steps_per_turn: int = 500,
+                        final_max_turns: int = 12,
+                        phase_grid: Optional[np.ndarray] = None,
+                        freq_fracs: Optional[np.ndarray] = None,
+                        maxfun: Optional[int] = None,
+                        r0_mode: str = 'offset',
+                        skip_turns: int = DEFAULT_SKIP_TURNS,
+                        workers: int = 1,
+                        worker_builder=None,
+                        worker_builder_args: tuple = (),
+                        n_starts: Optional[int] = None,
+                        geometry_jitter_deg: float = 1.0) -> OptimizedOrbit:
+        """Three-stage optimization:
+
+        A. Coarse RF scan (geometry frozen straight): grid over bunch phase x
+           RF frequency at search resolution - removes the synchrotron
+           phase-locking multimodality that a local optimizer can't cross.
+        B. DFO-LS on the full per-gap parameter vector from the stage-A seed,
+           at search resolution (default 300 steps/turn, 8 turns - the measured
+           floor where candidate ranking is still reliable).
+        C. Final tracking of the winner at full resolution.
+
+        Parallel mode (``workers > 1``)
+        -------------------------------
+        Stage A is farmed over a persistent process pool, and stage B becomes a
+        MULTI-START: ``n_starts`` (default = workers) independent DFO-LS runs
+        from distinct stage-A RF basins (plus small geometry jitter for
+        diversity), each with its own ``maxfun`` budget; the best result is
+        verified in stage C. Requires ``worker_builder``: a MODULE-LEVEL
+        function (picklable by reference) returning a fully configured
+        CavityGeometryOptimizer; each worker calls it once (field load
+        included) and then evaluates many tasks. Per-eval checkpoints go to
+        per-worker files ``<checkpoint_file>.worker-<pid>.csv``.
+        """
+        if workers > 1:
+            if worker_builder is None:
+                raise ValueError("workers > 1 requires worker_builder (a module-level "
+                                 "function returning a configured CavityGeometryOptimizer)")
+            return self._optimize_staged_parallel(
+                initial_beam, rf_optimize_params, rf_bounds, ls_weights,
+                search_steps_per_turn, search_max_turns,
+                final_steps_per_turn, final_max_turns,
+                phase_grid, freq_fracs, maxfun, r0_mode, skip_turns,
+                workers, worker_builder, worker_builder_args,
+                n_starts, geometry_jitter_deg)
+
+        of = self.orbit_finder
+        of._set_beam_meta(initial_beam)
+        spt_orig = of.steps_per_turn
+
+        if phase_grid is None:
+            phase_grid = np.arange(-180.0, 180.0, 30.0)
+        if freq_fracs is None:
+            freq_fracs = np.linspace(0.98, 1.02, 5)
+
+        try:
+            # ---- Stage A: coarse RF scan, geometry frozen at x0 (straight).
+            of.steps_per_turn = search_steps_per_turn
+            f0 = of._rf_base_frequency()
+            _, _, x0 = self._build_full_param_space(
+                initial_beam, rf_optimize_params, rf_bounds, r0_mode)
+            angles0, radii0, _, _, _ = self._unpack_params(x0)
+            for g, cavity in enumerate(of.design.rf_cavities):
+                cavity.update_geometry(segment_angles=angles0[g], segment_radii=radii0[g])
+            if self._is_bem and not self._attach_bem_for_current_geometry():
+                raise RuntimeError(f"BEM attach failed for the stage-A "
+                                   f"geometry: {self._bem_last_error}")
+
+            if self.verbose:
+                print("\n" + "=" * 70)
+                print("STAGE A: RF scan (geometry frozen), "
+                      f"{len(phase_grid)}x{len(freq_fracs)} grid @ spt={search_steps_per_turn}")
+                print("=" * 70)
+
+            best = (-np.inf, None, None)
+            for ph in phase_grid:
+                for ff in freq_fracs:
+                    res = of.track_once(initial_beam, bunch_phase_deg=float(ph),
+                                        rf_freq_mhz=f0 * ff / 1e6,
+                                        max_turns=search_max_turns, r0_mode=r0_mode)
+                    if res.final_energy_mev > best[0]:
+                        best = (res.final_energy_mev, float(ph), f0 * ff)
+                        if self.verbose:
+                            print(f"  new best: E={best[0]:.3f} MeV @ "
+                                  f"phase={best[1]:.0f} deg, f={best[2] / 1e6:.3f} MHz")
+
+            e_seed, ph_seed, f_seed = best
+            if self.verbose:
+                print(f"Stage A seed: phase={ph_seed:.1f} deg, f={f_seed / 1e6:.4f} MHz "
+                      f"(E={e_seed:.3f} MeV in {search_max_turns} turns)")
+
+            # Seed vector: straight geometry + stage-A RF values.
+            order = ['bunch_phase', 'rf_freq', 'r0', 'vr0']
+            rf_seed_map = {'bunch_phase': ph_seed, 'rf_freq': f_seed}
+            seed = np.asarray(x0, dtype=float).copy()
+            k = self._rf_offset
+            for name in order:
+                if name in rf_optimize_params:
+                    if name in rf_seed_map:
+                        seed[k] = rf_seed_map[name]
+                    k += 1
+
+            # ---- Stage B: DFO-LS at search resolution; Stage C: verify at full.
+            return self.optimize_dfols(
+                initial_beam, max_turns=search_max_turns,
+                rf_optimize_params=rf_optimize_params, rf_bounds=rf_bounds,
+                ls_weights=ls_weights, maxfun=maxfun, seed_x0=seed, r0_mode=r0_mode,
+                skip_turns=skip_turns,
+                verify_max_turns=final_max_turns,
+                verify_steps_per_turn=final_steps_per_turn)
+        finally:
+            of.steps_per_turn = spt_orig
+
+    def _optimize_staged_parallel(self, initial_beam, rf_optimize_params, rf_bounds,
+                                  ls_weights, search_spt, search_turns, final_spt,
+                                  final_turns, phase_grid, freq_fracs, maxfun, r0_mode,
+                                  skip_turns, workers, worker_builder,
+                                  worker_builder_args, n_starts,
+                                  geometry_jitter_deg) -> OptimizedOrbit:
+        """Parallel staged optimization (see optimize_staged docstring)."""
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            tqdm = None
+
+        of = self.orbit_finder
+        of._set_beam_meta(initial_beam)
+
+        if ls_weights is None:
+            ls_weights = dict(DEFAULT_LS_WEIGHTS)
+        if phase_grid is None:
+            phase_grid = np.arange(-180.0, 180.0, 30.0)
+        if freq_fracs is None:
+            freq_fracs = np.linspace(0.98, 1.02, 5)
+        n_starts = n_starts if n_starts is not None else workers
+
+        param_bounds, param_names, x0 = self._build_full_param_space(
+            initial_beam, rf_optimize_params, rf_bounds, r0_mode)
+        lower = np.array([b[0] for b in param_bounds], dtype=float)
+        upper = np.array([b[1] for b in param_bounds], dtype=float)
+        angles0, radii0, _, _, _ = self._unpack_params(x0)
+        f0 = of._rf_base_frequency()
+        n = len(x0)
+        maxfun_per = maxfun if maxfun is not None else 30 * (n + 1)
+
+        x_vec = np.array(initial_beam.x_vec, dtype=float)
+        p_vec = np.array(initial_beam.p_vec, dtype=float)
+
+        if self.verbose:
+            print("\n" + "=" * 70)
+            print(f"STAGED OPTIMIZATION - PARALLEL ({workers} workers)")
+            print("=" * 70)
+            print(f"Params: {n}; stage A grid {len(phase_grid)}x{len(freq_fracs)}; "
+                  f"stage B: {n_starts} DFO-LS starts x maxfun={maxfun_per}")
+            print("(each worker builds its own system once - field load takes a moment)")
+
+        # Remove stale per-worker checkpoint files from previous runs (pids can
+        # repeat, and the stage-B eval counter globs these files).
+        if self.checkpoint_file:
+            import glob as _glob
+            for stale in _glob.glob(self.checkpoint_file + ".worker-*.csv"):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+
+        t_start = time.time()
+        with ProcessPoolExecutor(
+                max_workers=workers, initializer=_pool_init,
+                initargs=(worker_builder, tuple(worker_builder_args),
+                          self.checkpoint_file)) as pool:
+
+            # ---- Stage A: parallel RF grid scan, geometry frozen at x0.
+            tasks_a = [(float(ph), float(f0 * ff), x_vec, p_vec, search_spt,
+                        search_turns, r0_mode, angles0, radii0)
+                       for ph in phase_grid for ff in freq_fracs]
+            futs = [pool.submit(_pool_track_once, t) for t in tasks_a]
+            bar = (tqdm(total=len(futs), desc="Stage A (RF scan)", ncols=100)
+                   if (self.verbose and tqdm) else None)
+            scan = []
+            best_e = -np.inf
+            for fut in as_completed(futs):
+                s = fut.result()
+                if s is not None:
+                    scan.append(s)
+                    best_e = max(best_e, s[0])
+                if bar:
+                    bar.update(1)
+                    bar.set_postfix_str(f"best E={best_e:.3f} MeV")
+            if bar:
+                bar.close()
+            if not scan:
+                raise RuntimeError("Stage A: all grid evaluations failed")
+            scan.sort(key=lambda s: -s[0])
+
+            if self.verbose:
+                t_a = time.time() - t_start
+                print(f"Stage A done in {t_a:.0f}s; top basins:")
+                for E, ph, f in scan[:min(n_starts, 5)]:
+                    print(f"  E={E:.3f} MeV @ phase={ph:.0f} deg, f={f / 1e6:.3f} MHz")
+
+            # ---- Seeds: distinct VIABLE phase basins (>= 25% of the best
+            # stage-A energy), then jittered clones of the good basins. Seeding
+            # non-accelerating phases wastes whole DFO-LS starts.
+            e_min = 0.25 * scan[0][0]
+            picked = []
+            for E, ph, f in scan:
+                if len(picked) >= n_starts:
+                    break
+                if E >= e_min and all(abs(ph - p[1]) > 1e-6 for p in picked):
+                    picked.append((E, ph, f))
+            if not picked:
+                picked.append(scan[0])
+            base_seeds = list(picked)
+            i_clone = 0
+            while len(picked) < n_starts:
+                picked.append(base_seeds[i_clone % len(base_seeds)])
+                i_clone += 1
+
+            rng = np.random.default_rng(42)
+            order = ['bunch_phase', 'rf_freq', 'r0', 'vr0']
+            seeds = []
+            for i, (E, ph, f) in enumerate(picked):
+                s = np.asarray(x0, dtype=float).copy()
+                if i > 0 and geometry_jitter_deg > 0:
+                    for g in range(self.n_gaps):
+                        base = g * self._blk
+                        s[base:base + self.n_segments] += rng.uniform(
+                            -geometry_jitter_deg, geometry_jitter_deg, self.n_segments)
+                k = self._rf_offset
+                for name in order:
+                    if name in rf_optimize_params:
+                        if name == 'bunch_phase':
+                            s[k] = ph
+                        elif name == 'rf_freq':
+                            s[k] = f
+                        k += 1
+                seeds.append(s)
+
+            # ---- Stage B: multi-start DFO-LS in parallel.
+            tasks_b = [(s, lower, upper, x_vec, p_vec, search_spt, search_turns,
+                        dict(ls_weights), tuple(rf_optimize_params), r0_mode,
+                        int(skip_turns), maxfun_per, float(f0)) for s in seeds]
+            futs = [pool.submit(_pool_dfols, t) for t in tasks_b]
+            bar = (tqdm(total=len(futs), desc="Stage B (DFO-LS starts)", ncols=100)
+                   if (self.verbose and tqdm) else None)
+
+            # Live eval counter: sum rows of the per-worker checkpoint CSVs.
+            mon_stop = None
+            if bar and self.checkpoint_file:
+                import glob as _glob
+                import threading
+
+                def _monitor(stop):
+                    while not stop.wait(15.0):
+                        try:
+                            n = 0
+                            for fp in _glob.glob(self.checkpoint_file + ".worker-*.csv"):
+                                with open(fp, 'rb') as fh:
+                                    n += max(sum(1 for _ in fh) - 1, 0)
+                            bar.set_postfix_str(f"~{n} evals total")
+                        except Exception:
+                            pass
+
+                mon_stop = threading.Event()
+                threading.Thread(target=_monitor, args=(mon_stop,), daemon=True).start()
+
+            runs = []
+            best_obj = np.inf
+            for fut in as_completed(futs):
+                r = fut.result()
+                runs.append(r)
+                if bar:
+                    if r and 'error' not in r:
+                        best_obj = min(best_obj, r['obj'])
+                        bar.write(f"  start finished: ||r||^2={r['obj']:.3e} "
+                                  f"(nf={r['nf']}, best so far {best_obj:.3e})")
+                    bar.update(1)
+            if mon_stop is not None:
+                mon_stop.set()
+            if bar:
+                bar.close()
+
+            ok = [r for r in runs if r and 'error' not in r]
+            failed = [r for r in runs if r and 'error' in r]
+            if self.verbose and failed:
+                print(f"WARNING: {len(failed)} DFO-LS start(s) failed: "
+                      f"{[r['error'] for r in failed]}")
+            if not ok:
+                raise RuntimeError(f"All DFO-LS starts failed: "
+                                   f"{[r.get('error') for r in runs]}")
+
+            # ---- Stage C part 1: verify EVERY start at FINAL resolution and
+            # select by the VERIFIED objective. A start can win at search
+            # resolution on a marginal capture basin that does not survive full
+            # resolution; the search objective must never pick the winner.
+            tasks_v = [(r['x'], x_vec, p_vec, final_spt, final_turns,
+                        dict(ls_weights), tuple(rf_optimize_params), r0_mode,
+                        int(skip_turns), float(f0)) for r in ok]
+            vers = list(pool.map(_pool_verify, tasks_v, chunksize=1))
+            for r, v in zip(ok, vers):
+                if v and 'error' not in v:
+                    r['obj_verified'] = v['obj']
+                    r['energy_verified'] = v['energy']
+                    r['turns_verified'] = v['turns']
+                else:
+                    r['obj_verified'] = np.inf
+                    r['energy_verified'] = 0.0
+                    r['turns_verified'] = 0
+
+        best_run = min(ok, key=lambda r: r['obj_verified'])
+        elapsed = time.time() - t_start
+        # Total evaluations across the pool (stage A + DFO-LS + verification).
+        of.iteration = len(tasks_a) + sum(r['nf'] for r in ok) + len(ok)
+
+        if self.verbose:
+            print(f"Stage B+verify done ({elapsed:.0f}s). Starts "
+                  f"(search ||r||^2 -> verified ||r||^2 @ {final_spt} spt/"
+                  f"{final_turns} turns):")
+            for r in sorted(ok, key=lambda r: r['obj_verified']):
+                marker = " <-- WINNER" if r is best_run else ""
+                fragile = ("  [FRAGILE: does not survive full resolution]"
+                           if r['obj_verified'] > 3.0 * r['obj'] else "")
+                print(f"  {r['obj']:.3e} -> {r['obj_verified']:.3e}  "
+                      f"E={r['energy_verified']:.3f} MeV, "
+                      f"turns={r['turns_verified']}{marker}{fragile}")
+
+        # ---- Stage C part 2: final tracking of the verified winner (parent).
+        spt_orig = of.steps_per_turn
+        of.steps_per_turn = final_spt
+        try:
+            result = self._finalize(
+                np.asarray(best_run['x'], dtype=float), rf_optimize_params,
+                initial_beam, final_turns, r0_mode, param_names, param_bounds,
+                ls_weights, 'dfols-multistart', elapsed, best_run['obj_verified'],
+                extra_meta={'workers': workers,
+                            'n_starts': len(ok),
+                            'start_objs': [r['obj'] for r in ok],
+                            'start_objs_verified': [r['obj_verified'] for r in ok],
+                            'dfols_msg': best_run['msg'],
+                            'dfols_nf': best_run['nf']})
+        finally:
+            of.steps_per_turn = spt_orig
+
+        if self.verbose:
+            print(f"Final energy: {result.final_energy_mev:.3f} MeV, "
+                  f"turns: {result.n_turns}")
+        return result
 
 
 if __name__ == "__main__":
-    print("cavity_optimizer.py - RF Cavity Geometry Optimization")
-    print("=" * 70)
-    print("Optimizes cavity segment geometry + RF parameters for improved acceleration.")
-    print("\nUsage:")
-    print("  from cavity_optimizer import CavityGeometryOptimizer")
-    print("  geo_opt = CavityGeometryOptimizer(finder, n_segments=2, ...)")
-    print("  result = geo_opt.optimize(initial_seo)")
+    print("cavity_optimizer.py - RF Cavity Geometry Optimization (user-beam entry point)")

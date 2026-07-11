@@ -1,7 +1,8 @@
-/examples/
 /resources/
 .idea/
 /output/
 /backup/
 /create_md.py
 /codebase.md
+/build/
+/tests/

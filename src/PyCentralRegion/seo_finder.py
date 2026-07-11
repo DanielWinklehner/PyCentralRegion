@@ -29,6 +29,7 @@ from PyPATools.pusher import Pusher
 from PyPATools.field import Field
 from PyPATools.particles import ParticleDistribution
 from PyPATools.global_variables import CLIGHT
+from PyPATools.trackers import Tracker, Recorder
 import warnings
 import matplotlib.pyplot as plt
 import pickle
@@ -114,6 +115,87 @@ class StaticOrbit:
                 f"B={self.b_field_avg:.4f} T, "
                 f"f={self.frequency_hz / 1e6:.2f} MHz, "
                 f"closed={self.is_closed}")
+
+
+class _PoincareTrajRecorder(Recorder):
+    """Reproduces SEOFinder.track_with_poincare exactly as a Tracker recorder:
+    stores the full trajectory, accumulates the path-averaged Bz, and records a
+    PoincarePoint at every +x-axis (y: -ve -> +ve) crossing via re-push
+    interpolation. Numerics are identical to the legacy hand-rolled loop."""
+
+    def __init__(self, finder, r0, v0, nsteps, dt):
+        self.pusher = finder.pusher
+        self.ef = finder._zero_efield
+        self.bf = finder.design.bfield
+        self.dt = dt
+        self.r_traj = np.zeros((nsteps, 3))
+        self.v_traj = np.zeros((nsteps, 3))
+        self.points = [PoincarePoint(turn=0, r=r0[0], vr=v0[0],
+                                     z=r0[2], vz=v0[2], time=0.0, bz_avg=0.0)]
+        self.turn = 0
+        self.bz_accum = 0.0
+        self.steps_taken = 0
+
+    def record(self, step, r_prev, v_prev, r, v, active, t):
+        self.steps_taken += 1
+        rp = r[0]
+        self.r_traj[step] = rp
+        self.v_traj[step] = v[0]
+
+        ro = r_prev[0]
+        if ro[1] < 0.0 < rp[1]:                       # +x-axis crossing (legacy rule)
+            t_frac = ro[1] / (ro[1] - rp[1])
+            r_cross, v_cross = self.pusher.push(ro, v_prev[0], self.ef, self.bf,
+                                                t_frac * self.dt)
+            self.bz_accum += self.bf(r_cross.reshape(1, 3))[0][2]
+            self.points.append(PoincarePoint(
+                turn=self.turn, r=r_cross[0], vr=v_cross[0],
+                z=r_cross[2], vz=v_cross[2],
+                time=t - self.dt + t_frac * self.dt,
+                bz_avg=self.bz_accum / self.steps_taken))
+            self.turn += 1
+            self.bz_accum = 0.0
+            self.steps_taken = 0
+        else:
+            self.bz_accum += self.bf(rp.reshape(1, 3))[0][2]
+        return None
+
+    def finalize(self, r, v, active, t):
+        self.v_traj[-1] = v[0]
+
+
+class _AngleCrossRecorder(Recorder):
+    """Stops at the first increasing crossing of polar angle theta_target and
+    stores the interpolated (r_cross, v_cross, t_cross). Reproduces the legacy
+    SEOFinder._track_to_angle crossing logic exactly."""
+
+    stop_reason = "angle_crossing"
+
+    def __init__(self, finder, theta_target, dt):
+        self.pusher = finder.pusher
+        self.ef = finder._zero_efield
+        self.bf = finder.design.bfield
+        self.boris = (self.pusher.algorithm == 'boris')
+        self.theta = theta_target
+        self.dt = dt
+        self.result = None
+
+    def _offset(self, rr):
+        d = np.arctan2(rr[1], rr[0]) - self.theta
+        return np.arctan2(np.sin(d), np.cos(d))      # wrap to (-pi, pi]
+
+    def record(self, step, r_prev, v_prev, r, v, active, t):
+        d_prev = self._offset(r_prev[0])
+        d_new = self._offset(r[0])
+        if d_prev < 0.0 <= d_new and (d_new - d_prev) < np.pi:
+            t_frac = -d_prev / (d_new - d_prev) if d_new != d_prev else 1.0
+            r_c, v_c = self.pusher.push(r_prev[0], v_prev[0], self.ef, self.bf,
+                                        t_frac * self.dt)
+            if self.boris:                            # de-stagger velocity at crossing
+                _, v_c = self.pusher.push(r_c, v_c, self.ef, self.bf, 0.5 * self.dt)
+            self.result = (r_c, v_c, t - self.dt + t_frac * self.dt)
+            return True
+        return None
 
 
 class SEOFinder:
@@ -377,6 +459,14 @@ class SEOFinder:
 
         return False, None
 
+    def _make_pd(self, pos, vel) -> ParticleDistribution:
+        """Build a single-particle ParticleDistribution (lab frame) for the Tracker."""
+        pos = np.asarray(pos, dtype=float).reshape(1, 3)
+        pd = ParticleDistribution(species=self.design.species,
+                                  x_vec=pos.copy(), p_vec=np.zeros((1, 3)))
+        pd.set_p_from_v_vec(np.asarray(vel, dtype=float).reshape(1, 3))
+        return pd
+
     def track_with_poincare(self,
                             r0: np.ndarray,
                             v0: np.ndarray,
@@ -407,89 +497,17 @@ class SEOFinder:
         """
         nsteps = n_turns * self.steps_per_turn
 
-        # Storage
-        r_traj = np.zeros((nsteps, 3))
-        v_traj = np.zeros((nsteps, 3))
-        poincare_points = []
+        # Centralized tracking: the integration loop, Boris staggering and the
+        # alive mask all live in PyPATools.trackers.Tracker. The Poincare section
+        # detection, path-averaged Bz and trajectory storage are provided by a
+        # recorder hook that reproduces the legacy loop exactly.
+        pd = self._make_pd(r0, v0)
+        recorder = _PoincareTrajRecorder(self, np.asarray(r0), np.asarray(v0), nsteps, dt)
+        tracker = Tracker(self.pusher, self._zero_efield, self.design.bfield,
+                          recorders=[recorder])
+        tracker.run(pd, dt, nsteps, record_every=1, show_progress=False, sync_back=False)
 
-        # Initialize
-        r = r0.copy()
-        v = v0.copy()
-        t = 0.0
-        turn = 0
-
-        # Record first Poincare point (starting point is on the x-axis)
-        poincare_points.append(PoincarePoint(
-            turn=turn,
-            r=r[0],
-            vr=v[0],
-            z=r[2],
-            vz=v[2],
-            time=t,
-            bz_avg=0.0
-        ))
-
-        # Boris: half-step back initialization
-        if self.pusher.algorithm == 'boris':
-            _, v = self.pusher.push(r, v, self._zero_efield, self.design.bfield, -0.5 * dt)
-
-        bz_accum = 0.0
-        steps_taken = 0
-
-        # Track
-        for step in range(nsteps):
-
-            steps_taken += 1
-
-            r_prev = r.copy()
-            v_prev = v.copy()
-
-            # Push
-            r, v = self.pusher.push(r, v, self._zero_efield, self.design.bfield, dt)
-            t += dt
-
-            # Store
-            r_traj[step] = r
-            v_traj[step] = v
-
-            # Check Poincare crossing
-            crossed, t_frac = self._check_poincare_crossing_simple(r_prev, r)
-
-            if crossed:
-                # Interpolate position and velocity at crossing
-                if t_frac is not None:
-                    r_cross, v_cross = self.pusher.push(r_prev, v_prev,
-                                                        self._zero_efield, self.design.bfield, t_frac*dt)
-                else:
-                    r_cross = r
-                    v_cross = v
-
-                bz_accum += self.design.bfield(r_cross.copy().reshape(1, 3))[0][2]
-
-                # Record Poincare point
-                poincare_points.append(PoincarePoint(
-                    turn=turn,
-                    r=r_cross[0],
-                    vr=v_cross[0],  # Since our crossing point is the x-axis
-                    z=r_cross[2],
-                    vz=v_cross[2],
-                    time=t - dt + t_frac * dt if t_frac else t,
-                    bz_avg=bz_accum / steps_taken
-                ))
-
-                turn += 1
-                bz_accum = 0.0
-                steps_taken = 0
-
-            else:
-                bz_accum += self.design.bfield(r.copy().reshape(1, 3))[0][2]
-
-        # Boris: final half-step
-        if self.pusher.algorithm == 'boris':
-            _, v = self.pusher.push(r, v, self._zero_efield, self.design.bfield, 0.5 * dt)
-            v_traj[-1] = v
-
-        return poincare_points, r_traj, v_traj
+        return recorder.points, recorder.r_traj, recorder.v_traj
 
     # ==================================================================
     # Gordon-seeded fixed-point (Newton) equilibrium-orbit solver.
@@ -521,31 +539,13 @@ class SEOFinder:
 
         Returns (r_cross, v_cross, t_cross) in the tracker (lab) frame, or None.
         """
-        bfield = self.design.bfield
-        ef = self._zero_efield
-        r = pos.copy()
-        v = vel.copy()
-        t = 0.0
-        boris = (self.pusher.algorithm == 'boris')
-        if boris:  # staggered velocity init
-            _, v = self.pusher.push(r, v, ef, bfield, -0.5 * dt)
-
-        def offset(rr):
-            d = np.arctan2(rr[1], rr[0]) - theta_target
-            return np.arctan2(np.sin(d), np.cos(d))  # wrap to (-pi, pi]
-
-        for _ in range(int(max_steps)):
-            r_prev, v_prev = r.copy(), v.copy()
-            r, v = self.pusher.push(r, v, ef, bfield, dt)
-            t += dt
-            d_prev, d_new = offset(r_prev), offset(r)
-            if d_prev < 0.0 <= d_new and (d_new - d_prev) < np.pi:
-                t_frac = -d_prev / (d_new - d_prev) if d_new != d_prev else 1.0
-                r_c, v_c = self.pusher.push(r_prev, v_prev, ef, bfield, t_frac * dt)
-                if boris:  # de-stagger velocity at the crossing
-                    _, v_c = self.pusher.push(r_c, v_c, ef, bfield, 0.5 * dt)
-                return r_c, v_c, t - dt + t_frac * dt
-        return None
+        pd = self._make_pd(pos, vel)
+        recorder = _AngleCrossRecorder(self, theta_target, dt)
+        tracker = Tracker(self.pusher, self._zero_efield, self.design.bfield,
+                          recorders=[recorder])
+        tracker.run(pd, dt, int(max_steps), record_every=1, show_progress=False,
+                    sync_back=False)
+        return recorder.result
 
     def _one_turn(self, r, vr, v_total, dt, max_steps):
         """One-turn map at theta=0: (r, vr) -> (r', vr', turn_time). None if it fails."""
@@ -969,6 +969,20 @@ class SEOFinder:
             print(f"{'=' * 70}")
 
         return orbits
+
+    def mean_frequency(self, radii_mm: List[float], solver: Optional[str] = None) -> float:
+        """Average orbital frequency [Hz] over SEOs at the given radii.
+
+        Use this to set the RF base frequency to the ISOCHRONOUS region of the
+        field (larger radii, where flutter provides focusing) rather than the
+        injection orbit near the center, whose frequency is far off-isochronous.
+        """
+        orbits = self.find_seos_at_radii(list(radii_mm), solver=solver,
+                                         do_final_tracking=False)
+        freqs = [o.frequency_hz for o in orbits if o.frequency_hz > 0]
+        if not freqs:
+            raise RuntimeError("mean_frequency: no valid SEOs found")
+        return float(np.mean(freqs))
 
     @staticmethod
     def plot_poincare_section(orbit: StaticOrbit, ax=None):

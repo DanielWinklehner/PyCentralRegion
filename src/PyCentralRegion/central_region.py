@@ -12,7 +12,7 @@ import numpy as np
 import pickle
 from typing import Optional, List, Dict, Union
 from pathlib import Path
-from PyPATools.field import Field
+from PyPATools.field import Field, FieldBase
 from PyPATools.species import IonSpecies
 from PyPATools.particles import ParticleDistribution
 from .rf_cavity import RFCavity
@@ -71,6 +71,10 @@ class CentralRegion:
 
         self.name = name
         self.dim = dimensionality
+        # Gates the per-call prints of set_bunch_phase / set_rf_frequency.
+        # Optimizers set this False: those are called on EVERY objective
+        # evaluation (spamming the console, badly interleaved with workers>1).
+        self.verbose = True
 
         # Fields
         self.bfield = None
@@ -141,12 +145,12 @@ class CentralRegion:
             Additional arguments passed to Field.from_file()
         """
 
-        if isinstance(field_or_filename, Field):
+        if isinstance(field_or_filename, FieldBase):
             self.efield = field_or_filename
         elif isinstance(field_or_filename, (str, Path)):
             self.efield = Field.from_file(str(field_or_filename), **kwargs)
         else:
-            raise TypeError("field_or_filename must be Field object or path to file")
+            raise TypeError("field_or_filename must be a FieldBase object or path to file")
 
         print(f"Electric field loaded: {self.efield}")
 
@@ -191,7 +195,7 @@ class CentralRegion:
         for cavity in self.rf_cavities:
             cavity.set_bunch_phase_offset(phase_deg)
 
-        if len(self.rf_cavities) > 0:
+        if len(self.rf_cavities) > 0 and getattr(self, 'verbose', True):
             print(f"Set bunch phase offset to {phase_deg:.2f} deg for {len(self.rf_cavities)} cavities")
 
     def set_rf_frequency(self, freq_hz: float):
@@ -206,7 +210,7 @@ class CentralRegion:
         for cavity in self.rf_cavities:
             cavity.set_frequency(freq_hz)
 
-        if len(self.rf_cavities) > 0:
+        if len(self.rf_cavities) > 0 and getattr(self, 'verbose', True):
             print(f"Set RF frequency to {self.rf_cavities[0].harmonic * freq_hz / 1e6:.6f} MHz "
                   f"({freq_hz / 1e6:.6f} MHz base, harmonic {self.rf_cavities[0].harmonic}) for {len(self.rf_cavities)} cavities")
 

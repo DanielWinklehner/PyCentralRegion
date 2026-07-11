@@ -34,6 +34,7 @@ class TurnStatistics:
     mean_x: float
     mean_y: float
     emittance_r: float = 0.0
+    n_active: int = 0  # surviving particles at this turn
 
 
 class PoincareAnalyzer:
@@ -193,7 +194,10 @@ def calculate_turn_metrics(traj: np.ndarray,
     Returns
     -------
     metrics : dict
-        'r_center' : mean orbit radius per turn [m]
+        'r_center' : orbit-center offset per turn, CENTROID metric [m]
+                     (contaminated by ~dr/2pi for accelerated orbits)
+        'r_center_h1' : orbit-center offset per turn, first-harmonic fit with
+                        the acceleration spiral removed [m] (preferred)
         'r_spread' : radial spread per turn [m]
         'r_avg' : average radius per turn [m]
         'dr' : turn separation [m]
@@ -205,6 +209,7 @@ def calculate_turn_metrics(traj: np.ndarray,
     if len(turn_ids) == 0:
         return {
             'r_center': np.array([]),
+            'r_center_h1': np.array([]),
             'r_spread': np.array([]),
             'r_avg': np.array([]),
             'dr': np.array([]),
@@ -214,6 +219,7 @@ def calculate_turn_metrics(traj: np.ndarray,
 
     n_turns = len(turn_ids)
     r_center = np.zeros(n_turns)
+    r_center_h1 = np.zeros(n_turns)
     r_spread = np.zeros(n_turns)
     r_avg = np.zeros(n_turns)
     x_center = np.zeros(n_turns)
@@ -228,7 +234,11 @@ def calculate_turn_metrics(traj: np.ndarray,
         if len(traj_segment) < 2:
             continue
 
-        # Orbit center
+        # Orbit center - CENTROID metric (legacy). NOTE: for an ACCELERATED
+        # orbit this conflates the true orbit-center offset with the
+        # acceleration spiral: a perfectly centered spiral turn with radius
+        # gain dr has its centroid offset by ~dr/(2*pi). Kept for plots and
+        # backward compatibility; prefer r_center_h1 for optimization.
         x_center[i] = np.mean(traj_segment[:, 0])
         y_center[i] = np.mean(traj_segment[:, 1])
         r_center[i] = np.sqrt(x_center[i] ** 2 + y_center[i] ** 2)
@@ -238,10 +248,29 @@ def calculate_turn_metrics(traj: np.ndarray,
         r_spread[i] = np.std(radii)
         r_avg[i] = np.mean(radii)
 
+        # Orbit center - FIRST-HARMONIC metric (spiral-corrected): fit
+        #   r(theta) = r0 + a*theta + c1*cos(theta) + s1*sin(theta)
+        # over the turn. The linear term absorbs the acceleration spiral; the
+        # first-harmonic amplitude hypot(c1, s1) is the actual orbit-center
+        # offset (for an off-center circle r ~ R + dx*cos + dy*sin).
+        if len(traj_segment) >= 8:
+            theta = np.unwrap(np.arctan2(traj_segment[:, 1], traj_segment[:, 0]))
+            theta = theta - theta[0]
+            A = np.column_stack([np.ones_like(theta), theta,
+                                 np.cos(theta), np.sin(theta)])
+            try:
+                coef, *_ = np.linalg.lstsq(A, radii, rcond=None)
+                r_center_h1[i] = float(np.hypot(coef[2], coef[3]))
+            except np.linalg.LinAlgError:
+                r_center_h1[i] = r_center[i]
+        else:
+            r_center_h1[i] = r_center[i]
+
     dr = np.diff(r_avg)
 
     return {
         'r_center': r_center,
+        'r_center_h1': r_center_h1,
         'r_spread': r_spread,
         'r_avg': r_avg,
         'dr': dr,
@@ -340,7 +369,8 @@ class BeamStatisticsCollector:
             std_energy_mev=np.std(energies_mev),
             mean_x=np.mean(r_active[:, 0]),
             mean_y=np.mean(r_active[:, 1]),
-            emittance_r=0.0  # TODO: calculate properly
+            emittance_r=0.0,  # TODO: calculate properly
+            n_active=int(len(r_active))
         )
 
         self.turn_stats.append(stats)

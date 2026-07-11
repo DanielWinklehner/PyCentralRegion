@@ -40,7 +40,17 @@ class RFCavity:
     phase : float
         Cavity phase [degrees]
     gap_width : float
-        Gap width [m]
+        Nominal gap width [m] (the full width at large radii)
+    gap_width_inner : float, optional
+        Gap width [m] at the cavity inner radius ``r_min``. Together with
+        ``gap_taper_radius`` this defines a linear TAPER: the gap channel
+        narrows from ``gap_width`` at ``gap_taper_radius`` down to
+        ``gap_width_inner`` at ``r_min`` (like real central regions, where
+        narrower inner gaps leave room for metal between converging gaps).
+        Default None = no taper (constant ``gap_width``).
+    gap_taper_radius : float, optional
+        Transition radius [m] from tapered to straight (nominal) gap width.
+        Required together with ``gap_width_inner``.
     bunch_phase_offset : float
         Global bunch phase offset [degrees]
     n_variable_segments : int
@@ -83,7 +93,10 @@ class RFCavity:
                  bunch_phase_offset: float = 0.0,
                  n_variable_segments: int = 0,
                  segment_angles: Optional[List[float]] = None,
-                 segment_radii: Optional[List[float]] = None):
+                 segment_radii: Optional[List[float]] = None,
+                 segment_rotations: Optional[List[float]] = None,
+                 gap_width_inner: Optional[float] = None,
+                 gap_taper_radius: Optional[float] = None):
 
         self.r_min = r_min
         self.r_max = r_max
@@ -98,10 +111,32 @@ class RFCavity:
         self.bunch_phase_offset = np.deg2rad(bunch_phase_offset)
         self.gap_width = gap_width
 
-        # Variable segments
+        # Optional linear taper of the gap CHANNEL width toward the center.
+        if (gap_width_inner is None) != (gap_taper_radius is None):
+            raise ValueError("gap_width_inner and gap_taper_radius must be "
+                             "given together (or both omitted)")
+        if gap_width_inner is not None:
+            if gap_width_inner <= 0.0:
+                raise ValueError(f"gap_width_inner must be > 0 (got {gap_width_inner})")
+            if not r_min < gap_taper_radius <= r_max:
+                raise ValueError(f"gap_taper_radius must be in (r_min, r_max] "
+                                 f"(got {gap_taper_radius} for r_min={r_min}, "
+                                 f"r_max={r_max})")
+        self.gap_width_inner = gap_width_inner
+        self.gap_taper_radius = gap_taper_radius
+
+        # Variable segments. `segment_rotations` rotates each variable segment
+        # about its own MIDPOINT (deg, CCW) after the chain is laid out - the
+        # segment need not point at the origin. This decouples the crossing
+        # azimuth (RF phase) from the kick direction (segment normal). In the
+        # thin-gap model the resulting disconnect between neighboring segments
+        # is harmless (each is an independent crossing line); electrode
+        # continuity is re-imposed at the field-solving stage.
         self.n_variable_segments = n_variable_segments
         self.segment_angles = segment_angles if segment_angles is not None else []
         self.segment_radii = segment_radii if segment_radii is not None else []
+        self.segment_rotations = (segment_rotations if segment_rotations is not None
+                                  else [0.0] * n_variable_segments)
 
         # Validate
         if n_variable_segments > 0:
@@ -109,6 +144,8 @@ class RFCavity:
                 raise ValueError(f"segment_angles must have length {n_variable_segments}")
             if len(self.segment_radii) != n_variable_segments:
                 raise ValueError(f"segment_radii must have length {n_variable_segments}")
+            if len(self.segment_rotations) != n_variable_segments:
+                raise ValueError(f"segment_rotations must have length {n_variable_segments}")
 
             # Check monotonicity
             all_radii = [r_min] + list(self.segment_radii) + [r_max]
@@ -153,9 +190,22 @@ class RFCavity:
                 0.0
             ])
 
+            # Optional rotation about the segment midpoint (decouples kick
+            # direction from crossing azimuth). The CHAIN continues from the
+            # NOMINAL (unrotated) endpoint so rotations don't propagate.
+            rot = np.deg2rad(self.segment_rotations[i]) if self.segment_rotations else 0.0
+            if rot != 0.0:
+                mid = 0.5 * (p1 + p2)
+                c, s = np.cos(rot), np.sin(rot)
+                R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+                p1_stored = mid + R @ (p1 - mid)
+                p2_stored = mid + R @ (p2 - mid)
+            else:
+                p1_stored, p2_stored = p1, p2
+
             self.segments.append({
-                'p1': p1,
-                'p2': p2,
+                'p1': p1_stored,
+                'p2': p2_stored,
                 'r_min': r_current,
                 'r_max': r_outer,
                 'type': 'variable'
@@ -165,15 +215,23 @@ class RFCavity:
             r_current = r_outer
             angle_current = angle_end
 
-        # Fixed radial segment (from last variable segment to r_max)
+        # Fixed radial segment out to r_max, anchored at the NOMINAL base angle:
+        # it must NOT inherit the variable segments' angular excursions. The
+        # variable segments shape the INNER region only; letting the excursion
+        # re-azimuth the whole outer gap line (a) moves the dee edge at large
+        # radii with an inner-region parameter (not buildable as intended) and
+        # (b) makes a common-mode segment angle degenerate with bunch_phase
+        # (a pure global RF-phase trim). The disconnect from the variable tip is
+        # the same thin-gap idiom as the rotations - electrode continuity is
+        # re-imposed at the field-solving stage.
         p1 = np.array([
-            r_current * np.cos(angle_current),
-            r_current * np.sin(angle_current),
+            r_current * np.cos(base_angle_rad),
+            r_current * np.sin(base_angle_rad),
             0.0
         ])
         p2 = np.array([
-            self.r_max * np.cos(angle_current),
-            self.r_max * np.sin(angle_current),
+            self.r_max * np.cos(base_angle_rad),
+            self.r_max * np.sin(base_angle_rad),
             0.0
         ])
 
@@ -208,7 +266,9 @@ class RFCavity:
         segment['perp_3d'] = np.array([segment['perp_2d'][0], segment['perp_2d'][1], 0.0])
 
     def update_geometry(self, segment_angles: Optional[List[float]] = None,
-                        segment_radii: Optional[List[float]] = None):
+                        segment_radii: Optional[List[float]] = None,
+                        base_angle: Optional[float] = None,
+                        segment_rotations: Optional[List[float]] = None):
         """
         Update cavity geometry (for optimization).
 
@@ -218,6 +278,11 @@ class RFCavity:
             New angular excursions [degrees]
         segment_radii : list of float, optional
             New outer radii [m]
+        base_angle : float, optional
+            New azimuthal position of the gap [degrees] (used when the dee
+            opening angle is an optimization parameter).
+        segment_rotations : list of float, optional
+            New per-segment midpoint rotations [degrees].
         """
 
         if segment_angles is not None:
@@ -230,8 +295,32 @@ class RFCavity:
                 raise ValueError(f"segment_radii must have length {self.n_variable_segments}")
             self.segment_radii = segment_radii
 
+        if base_angle is not None:
+            self.base_angle = base_angle
+
+        if segment_rotations is not None:
+            if len(segment_rotations) != self.n_variable_segments:
+                raise ValueError(f"segment_rotations must have length {self.n_variable_segments}")
+            self.segment_rotations = segment_rotations
+
         # Rebuild geometry
         self._build_geometry()
+
+    def gap_width_at(self, r):
+        """Local gap channel width [m] at radius ``r`` (scalar or array).
+
+        Linear taper from ``gap_width_inner`` at ``r_min`` to the nominal
+        ``gap_width`` at ``gap_taper_radius``, constant nominal beyond;
+        constant ``gap_width`` everywhere when no taper is configured.
+        """
+        if self.gap_width_inner is None:
+            if np.isscalar(r):
+                return self.gap_width
+            return np.full(np.shape(r), self.gap_width)
+        frac = np.clip((np.asarray(r, dtype=float) - self.r_min)
+                       / (self.gap_taper_radius - self.r_min), 0.0, 1.0)
+        w = self.gap_width_inner + frac * (self.gap_width - self.gap_width_inner)
+        return float(w) if np.isscalar(r) else w
 
     def check_crossing(self, r_old: np.ndarray, r_new: np.ndarray) -> Tuple[bool, Optional[float], Optional[int]]:
         """
@@ -342,14 +431,29 @@ class RFCavity:
                           v_array: np.ndarray,
                           crossed_mask: np.ndarray,
                           t_cross: np.ndarray,
+                          segment_ids: np.ndarray,
                           t: float,
                           dt: float,
                           design,
                           pusher) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Apply RF kicks (uses first segment's perpendicular direction for now)."""
+        """Apply RF kicks perpendicular to the actually-crossed gap segment.
 
+        Physics model (thin gap): the gap accelerates along its NORMAL (the
+        segment's perpendicular), leaving the momentum component parallel to the
+        gap line unchanged. The conserved/added split therefore uses the crossed
+        segment's own orientation (``segment_ids``), so varying the segment
+        geometry changes the kick - not just where the particle crosses.
+
+        All beta*gamma <-> velocity conversions are done locally from the TOTAL
+        speed |v| (norm-based), avoiding both the component-wise error in the
+        generic helpers and any mutation of the shared ``design.beam`` scratch
+        state. ``t_cross`` and ``segment_ids`` are full-length (aligned with the
+        global particle arrays); ``r_old_array`` is unused (kept for signature
+        stability).
+        """
+        c = CLIGHT
         n_particles = len(r_new_array)
-        n_crossed = np.sum(crossed_mask)
+        n_crossed = int(np.sum(crossed_mask))
 
         if n_crossed == 0:
             return v_array.copy(), r_new_array.copy(), np.zeros(n_particles), np.zeros(n_particles)
@@ -372,45 +476,52 @@ class RFCavity:
             v_cavity = v_array[crossed_indices]
             t_cavity = t
 
-        # TTF calculation
-        v_mag = np.linalg.norm(v_cavity, axis=1)
-        transit_time = self.gap_width / v_mag
+        # Old energy from the TOTAL speed (norm-based, relativistic).
+        speed = np.linalg.norm(v_cavity, axis=1)
+        gamma = 1.0 / np.sqrt(1.0 - (speed / c) ** 2)
+        e_old_mev = (gamma - 1.0) * design.species.mass_mev
+
+        # Transit-time factor (local gap width at the crossing radius when
+        # the gap is tapered).
+        r_crossing = np.linalg.norm(r_cavity[:, :2], axis=1)
+        transit_time = self.gap_width_at(r_crossing) / speed
         omega_tau_half = self.omega * transit_time / 2.0
         ttf = np.sin(omega_tau_half) / omega_tau_half
 
-        # Energy gain
+        # Energy gain at the crossing.
         total_phase = self.get_total_phase_rad()
         d_e_mev = 1e-6 * design.species.q * self.voltage * ttf * np.cos(
             self.omega * t_cavity + total_phase
         )
 
-        # Update momentum (conserve radial, adjust tangential)
-        design.beam.x_vec_p_vec = (r_cavity, v_cavity / np.sqrt(CLIGHT ** 2 - v_cavity ** 2))
-        e_old_mev = design.beam.ekin_mev
-
+        # New total relativistic momentum magnitude |u_new| = beta*gamma.
         gamma_new = (e_old_mev + d_e_mev) / design.species.mass_mev + 1.0
-        beta_gamma_new = np.sqrt(gamma_new ** 2 - 1.0)
+        bg_new = np.sqrt(np.maximum(gamma_new ** 2 - 1.0, 0.0))
 
-        # Use base angle for momentum calculation
-        cos_angle = np.cos(np.deg2rad(self.base_angle))
-        sin_angle = np.sin(np.deg2rad(self.base_angle))
+        # Relativistic momentum vector u = gamma * v / c (norm-based).
+        u = (gamma / c)[:, None] * v_cavity
 
-        px_old = design.beam.px
-        py_old = design.beam.py
+        # Per-particle gap orientation from the segment actually crossed.
+        seg = segment_ids[crossed_indices]
+        dir_along = np.array([self.segments[s]['direction'] for s in seg])   # (n_crossed, 2)
+        perp = np.array([self.segments[s]['perp_2d'] for s in seg])          # (n_crossed, 2)
 
-        p_r = px_old * cos_angle + py_old * sin_angle
-        discriminant = beta_gamma_new ** 2 - p_r ** 2
+        u_xy = u[:, :2]
+        u_z = u[:, 2]
+        u_along = np.sum(u_xy * dir_along, axis=1)   # parallel to gap line -> conserved
+        u_perp_old = np.sum(u_xy * perp, axis=1)     # along gap normal -> kicked
 
-        sign = 1.0
-        p_theta = sign * np.sqrt(np.maximum(discriminant, 0.0))
+        # Re-solve the perpendicular (kicked) component for the new energy,
+        # keeping the along-gap and vertical components fixed.
+        u_perp_new_sq = bg_new ** 2 - u_along ** 2 - u_z ** 2
+        u_perp_new = np.sign(u_perp_old) * np.sqrt(np.maximum(u_perp_new_sq, 0.0))
 
-        px_new = p_r * cos_angle - p_theta * sin_angle
-        py_new = p_r * sin_angle + p_theta * cos_angle
+        u_xy_new = u_along[:, None] * dir_along + u_perp_new[:, None] * perp
+        u_new = np.column_stack([u_xy_new, u_z])
 
-        design.beam.px = px_new
-        design.beam.py = py_new
-
-        v_new = design.beam.v_vec
+        # Back to velocity: v = c * u / sqrt(1 + |u|^2) (norm-based).
+        u_new_mag2 = np.sum(u_new ** 2, axis=1)
+        v_new = c * u_new / np.sqrt(1.0 + u_new_mag2)[:, None]
 
         if use_backtrack:
             r_final, v_final = pusher.push_batch(
@@ -427,7 +538,7 @@ class RFCavity:
         crossing_phase_rad = np.fmod(self.omega * t_cavity + total_phase, 2.0 * np.pi)
         crossing_phases[crossed_indices] = np.rad2deg(crossing_phase_rad)
 
-        self.n_crossings += len(r_final)
+        self.n_crossings += n_crossed
         self.total_energy_gain += np.sum(d_e_mev)
 
         return v_array, r_new_array, energy_gains, crossing_phases
@@ -480,7 +591,101 @@ class RFCavity:
                     f"phase={total_phase:.1f}°")
 
 
-# Helper functions remain backward compatible
+# ============================================================================
+# Dee-system parametrization: a "dee" (cavity) is described by its CENTER
+# azimuth and OPENING angle; the two accelerating gaps sit at
+# center +- opening/2 with a 180 deg internal phase flip. The gap list is
+# ordered [dee0_entry, dee0_exit, dee1_entry, dee1_exit, ...].
+# ============================================================================
+class DeeSystem:
+    """Descriptor of a dee-based RF system (center + opening parametrization).
+
+    Holds the construction parameters so the OPENING ANGLE can later be changed
+    (or optimized): ``apply_opening_angle`` recomputes every gap's azimuthal
+    position from the stored centers without touching segment geometry.
+    """
+
+    def __init__(self, center_angles: List[float], opening_angle: float,
+                 gaps: List[RFCavity]):
+        self.center_angles = list(center_angles)
+        self.opening_angle = float(opening_angle)
+        self.gaps = gaps
+
+    @property
+    def n_dees(self) -> int:
+        return len(self.center_angles)
+
+    def gap_angles(self, opening_angle: Optional[float] = None) -> List[float]:
+        """Gap azimuths [deg] for the given (or stored) opening angle."""
+        op = self.opening_angle if opening_angle is None else float(opening_angle)
+        out = []
+        for c in self.center_angles:
+            out.extend([c - op / 2.0, c + op / 2.0])
+        return out
+
+    def apply_opening_angle(self, opening_angle: float):
+        """Reposition all gaps for a new opening angle (segments unchanged)."""
+        for gap, ang in zip(self.gaps, self.gap_angles(opening_angle)):
+            gap.update_geometry(base_angle=ang)
+
+
+def create_dee_system(r_min: float,
+                      r_max: float,
+                      center_angles: List[float],
+                      opening_angle: Optional[float] = None,
+                      voltage: float = 60000.0,
+                      frequency: float = 42e6,
+                      phases: Optional[List[float]] = None,
+                      gap_width: float = 0.01,
+                      harmonic: int = 4,
+                      n_variable_segments: int = 0,
+                      segment_angles: Optional[List[float]] = None,
+                      segment_radii: Optional[List[float]] = None,
+                      gap_width_inner: Optional[float] = None,
+                      gap_taper_radius: Optional[float] = None) -> DeeSystem:
+    """Create an N-dee RF system from (center angle, opening angle).
+
+    Parameters
+    ----------
+    center_angles : list of float
+        Azimuthal CENTER of each dee [deg]. Two-dee system: e.g. [90, 270].
+    opening_angle : float, optional
+        Angular width of each dee [deg]; the gaps sit at center +- opening/2.
+        Default: 180/harmonic (the classical synchronous dee angle).
+    phases : list of float, optional
+        RF phase of each dee's ENTRY gap [deg]; the exit gap is +180 deg.
+    gap_width_inner, gap_taper_radius : float, optional
+        Linear gap-width taper toward the center (see RFCavity): width is
+        ``gap_width_inner`` at ``r_min``, growing to the nominal ``gap_width``
+        at ``gap_taper_radius``, constant beyond.
+
+    Returns
+    -------
+    DeeSystem (gaps in ``.gaps``, ordered entry/exit per dee).
+    """
+    if opening_angle is None:
+        opening_angle = 180.0 / harmonic
+    if phases is None:
+        phases = [0.0] * len(center_angles)
+    if len(phases) != len(center_angles):
+        raise ValueError("phases must match center_angles in length")
+
+    gaps = []
+    for c, ph in zip(center_angles, phases):
+        for ang, gph in ((c - opening_angle / 2.0, ph),
+                         (c + opening_angle / 2.0, ph + 180.0)):
+            gaps.append(RFCavity(
+                r_min, r_max, ang, voltage, frequency, harmonic, gph, gap_width,
+                n_variable_segments=n_variable_segments,
+                segment_angles=list(segment_angles) if segment_angles else None,
+                segment_radii=list(segment_radii) if segment_radii else None,
+                gap_width_inner=gap_width_inner,
+                gap_taper_radius=gap_taper_radius,
+            ))
+    return DeeSystem(center_angles, opening_angle, gaps)
+
+
+# Helper functions remain backward compatible (implemented on the dee scheme).
 def create_double_gap_cavity(r_min: float,
                              r_max: float,
                              angle: float,
@@ -491,25 +696,16 @@ def create_double_gap_cavity(r_min: float,
                              harmonic: int = 4,
                              n_variable_segments: int = 0,
                              segment_angles: Optional[List[float]] = None,
-                             segment_radii: Optional[List[float]] = None) -> Tuple[RFCavity, RFCavity]:
-    """Create double-gap cavity (now with optional variable segments)."""
-
-    gap1 = RFCavity(
-        r_min, r_max, angle, voltage, frequency, harmonic, phase, gap_width,
-        n_variable_segments=n_variable_segments,
-        segment_angles=segment_angles,
-        segment_radii=segment_radii
-    )
-
-    angle2 = angle + 360.0 / (2.0 * harmonic)
-    gap2 = RFCavity(
-        r_min, r_max, angle2, voltage, frequency, harmonic, phase + 180.0, gap_width,
-        n_variable_segments=n_variable_segments,
-        segment_angles=segment_angles,
-        segment_radii=segment_radii
-    )
-
-    return gap1, gap2
+                             segment_radii: Optional[List[float]] = None,
+                             gap_width_inner: Optional[float] = None,
+                             gap_taper_radius: Optional[float] = None) -> Tuple[RFCavity, RFCavity]:
+    """Create double-gap cavity: first gap at ``angle``, opening 180/harmonic."""
+    opening = 360.0 / (2.0 * harmonic)
+    dee = create_dee_system(r_min, r_max, [angle + opening / 2.0], opening,
+                            voltage, frequency, [phase], gap_width, harmonic,
+                            n_variable_segments, segment_angles, segment_radii,
+                            gap_width_inner, gap_taper_radius)
+    return dee.gaps[0], dee.gaps[1]
 
 
 def create_four_cavity_system(r_min: float,
@@ -522,8 +718,10 @@ def create_four_cavity_system(r_min: float,
                               harmonic: int = 4,
                               n_variable_segments: int = 0,
                               segment_angles: Optional[List[float]] = None,
-                              segment_radii: Optional[List[float]] = None) -> List[RFCavity]:
-    """Create 4-cavity system (now with optional variable segments)."""
+                              segment_radii: Optional[List[float]] = None,
+                              gap_width_inner: Optional[float] = None,
+                              gap_taper_radius: Optional[float] = None) -> List[RFCavity]:
+    """Create 4-cavity system (``angles`` are the FIRST-gap azimuths)."""
 
     if phases is None:
         phases = [0.0] * 4
@@ -531,15 +729,74 @@ def create_four_cavity_system(r_min: float,
     if len(angles) != 4 or len(phases) != 4:
         raise ValueError("Must provide 4 angles and 4 phases")
 
-    gaps = []
-    for ang, ph in zip(angles, phases):
-        gap1, gap2 = create_double_gap_cavity(
-            r_min, r_max, ang, voltage, frequency, ph, gap_width, harmonic,
-            n_variable_segments, segment_angles, segment_radii
-        )
-        gaps.extend([gap1, gap2])
+    opening = 360.0 / (2.0 * harmonic)
+    dees = create_dee_system(r_min, r_max,
+                             [a + opening / 2.0 for a in angles], opening,
+                             voltage, frequency, list(phases), gap_width, harmonic,
+                             n_variable_segments, segment_angles, segment_radii,
+                             gap_width_inner, gap_taper_radius)
+    return dees.gaps
 
-    return gaps
+
+def snap_nodes_between_turns(design_or_cavities, trajectory,
+                             verbose: bool = True):
+    """Shift each gap's segment node radii midway between its turn crossings.
+
+    Uses a reference tracked trajectory (e.g. the thin-gap winner's
+    ``trajectory_reference``): for every gap, the radii where the trajectory
+    actually crosses its segments are extracted, and each variable-segment
+    node radius is moved to the midpoint of the two crossings that bracket
+    it - the segment joints (kick-direction changes, electrode bridge jogs)
+    then never coincide with a beam crossing. Several nodes falling in the
+    same bracket are distributed evenly inside it; nodes below the first or
+    above the last crossing stay put. Geometry is updated IN PLACE.
+
+    Returns a list of (label, old_radii, new_radii, crossing_radii) tuples.
+    """
+    cavities = getattr(design_or_cavities, 'rf_cavities', design_or_cavities)
+    xy = np.asarray(trajectory, dtype=float)[:, :2]
+    report = []
+    for gi, cav in enumerate(cavities):
+        if cav.n_variable_segments == 0:
+            continue
+        crossed, t_cross, _ = cav.check_crossings_batch(xy[:-1], xy[1:])
+        idx = np.where(crossed)[0]
+        if len(idx) < 2:
+            continue
+        pts = xy[idx] + t_cross[idx, None] * (xy[idx + 1] - xy[idx])
+        crossings = np.sort(np.hypot(pts[:, 0], pts[:, 1]))
+        # merge near-duplicate (grazing) crossings
+        keep = [crossings[0]]
+        for r in crossings[1:]:
+            if r - keep[-1] > 1e-3:
+                keep.append(r)
+        crossings = np.asarray(keep)
+
+        old = list(cav.segment_radii)
+        new = list(old)
+        # group node indices by the crossing bracket they fall into
+        brackets = {}
+        for i, r in enumerate(old):
+            k = int(np.searchsorted(crossings, r))
+            if 0 < k < len(crossings):
+                brackets.setdefault(k, []).append(i)
+        for k, nodes in brackets.items():
+            lo, hi = crossings[k - 1], crossings[k]
+            for j, i in enumerate(sorted(nodes, key=lambda i: old[i])):
+                new[i] = lo + (hi - lo) * (j + 1) / (len(nodes) + 1)
+        # keep strict monotonicity inside (r_min, r_max)
+        prev = cav.r_min
+        for i in range(len(new)):
+            new[i] = min(max(new[i], prev + 1e-3), cav.r_max - 1e-3)
+            prev = new[i]
+        cav.update_geometry(segment_radii=new)
+        report.append((f"gap{gi}", old, new, crossings))
+        if verbose:
+            moves = ", ".join(f"{o*1000:.1f}->{n*1000:.1f}"
+                              for o, n in zip(old, new))
+            print(f"[snap_nodes] gap{gi} ({cav.base_angle:.1f} deg): "
+                  f"{len(crossings)} crossings, node radii [mm]: {moves}")
+    return report
 
 
 if __name__ == "__main__":
