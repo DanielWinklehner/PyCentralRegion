@@ -33,7 +33,7 @@ from PyCentralRegion.cavity_optimizer import CavityGeometryOptimizer
 # System configuration (module level so multiprocessing workers can rebuild
 # the identical system via build_worker_optimizer)
 # ============================================================================
-FIELD_PATH = Path(__file__).parent.parent / 'resources' / 'uCyclo_v2_Midplane2D_400mm_0.5mm.comsol'
+FIELD_PATH = Path(__file__).parent.parent / 'resources' /  'uCyclo_v3_midplane_field.comsol'  # 'uCyclo_v2_Midplane2D_400mm_0.5mm.comsol'
 SPECIES = 'muon'
 TARGET_ENERGY_MEV = 5.0
 MAX_RADIUS_M = 0.4
@@ -116,7 +116,11 @@ def build_system(rf_frequency=None, quiet=False, checkpoint_file=None):
             optimize_opening_angle=OPTIMIZE_OPENING_ANGLE,
             opening_delta_max=OPENING_DELTA_MAX,
             rotatable_segments=ROTATABLE_SEGMENTS,
-            rotation_max=ROTATION_MAX)
+            rotation_max=ROTATION_MAX,
+            pinch_target_r_m=[0.016, 0.013, 0.030, 0.036, 0.047, 0.052, 0.063, 0.012],
+            pinch_metal_width_m=0.002,  # match your BEM build
+            pinch_weight=50.0
+        )
 
     return design, finder, geo_optimizer, rf_frequency
 

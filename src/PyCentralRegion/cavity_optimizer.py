@@ -178,6 +178,23 @@ class CavityGeometryOptimizer:
     the search and verify winners at full resolution (example 07). Unbuildable
     candidates (mesh/solve failure, ``max_r_inner`` guard) get a graded
     penalty, not a crash.
+
+    ``pinch_target_r_m`` (opt-in) adds a pinch-radius tie-breaker to both
+    objective forms (thin-gap and bem2d finders alike): wedges whose metal
+    pinches below ``pinch_metal_width_m`` ABOVE the target radius are
+    penalized in proportion to the excess. Among near-degenerate
+    beam-dynamics optima this steers the search toward geometries whose
+    segments run parallel enough near the center that the electrodes can
+    follow the beam corridor all the way down (tips buried ~ a gap width
+    below their first crossing) instead of ending in a shallow tip just
+    under the beam. A scalar applies to every wedge; a sequence of length
+    n_gaps gives per-wedge targets (order dee0, ground0, dee1, ground1, ...
+    with dees sorted by base angle) - set each to (turn-1 radius at that
+    wedge's azimuth - tip clearance) from a reference trajectory so the
+    pressure lands only on wedges whose pinch actually blocks the beam
+    corridor, not on wedges that are corridor-limited anyway. In parallel
+    mode the worker builder must construct the optimizer with the SAME
+    pinch settings (as with dee_system and optimize_opening_angle).
     """
 
     def __init__(self,
@@ -195,7 +212,10 @@ class CavityGeometryOptimizer:
                  rotation_max: float = 15.0,
                  bem_build_kwargs: Optional[Dict] = None,
                  bem_solve_kwargs: Optional[Dict] = None,
-                 bem_field_kwargs: Optional[Dict] = None):
+                 bem_field_kwargs: Optional[Dict] = None,
+                 pinch_target_r_m: Optional[float] = None,
+                 pinch_metal_width_m: Optional[float] = None,
+                 pinch_weight: float = 50.0):
         if getattr(orbit_finder, 'gap_model', 'thin') not in ('thin', 'bem2d'):
             raise ValueError(f"unsupported gap_model "
                              f"'{getattr(orbit_finder, 'gap_model', 'thin')}'")
@@ -249,6 +269,40 @@ class CavityGeometryOptimizer:
             (cavs[k].gap_width, getattr(cavs[k], 'gap_width_inner', None),
              getattr(cavs[k], 'gap_taper_radius', None), cavs[k].r_min)
             for k in self._clearance_order]
+
+        # Opt-in pinch-radius tie-breaker (see class docstring). The pinch
+        # radius is where the metal wedge between two neighboring gap chains
+        # thins below the electrode build's min_metal_width - i.e. where
+        # build_gap_electrodes must truncate the wedge tip. A pinch ABOVE
+        # pinch_target_r_m means the tip cannot follow the beam corridor
+        # down to the target (the first crossing then sits close over a
+        # sharp tip: non-perpendicular gap field AND a thin fin that
+        # degrades the BEM solve conditioning). Scalar target: same for all
+        # wedges. Sequence (length n_gaps): per-wedge targets in the order
+        # dee0, ground0, dee1, ground1, ... (dees sorted by base angle, as
+        # in build_gap_electrodes) - set each to (turn-1 radius at that
+        # wedge's azimuth - tip clearance) so the pressure lands only on
+        # wedges whose pinch actually blocks the corridor. The scan width
+        # defaults to the BEM build's min_metal_width, else the clearance
+        # guard's.
+        if pinch_target_r_m is None:
+            self.pinch_target_r_m = None
+        else:
+            tgt = np.atleast_1d(np.asarray(pinch_target_r_m, dtype=float))
+            if len(tgt) == 1:
+                tgt = np.full(self.n_gaps, tgt[0])
+            elif len(tgt) != self.n_gaps:
+                raise ValueError(
+                    f"pinch_target_r_m must be a scalar or a sequence of "
+                    f"length n_gaps={self.n_gaps} (one per wedge: dee0, "
+                    f"ground0, dee1, ground1, ... in dee base-angle order), "
+                    f"got length {len(tgt)}")
+            self.pinch_target_r_m = tgt
+        if pinch_metal_width_m is None:
+            pinch_metal_width_m = (bem_build_kwargs or {}).get(
+                'min_metal_width', self.min_metal_width_m)
+        self.pinch_metal_width_m = float(pinch_metal_width_m)
+        self.pinch_weight = float(pinch_weight)
 
         # BEM-in-the-loop state (gap_model='bem2d' finders only).
         self.bem_build_kwargs = bem_build_kwargs
@@ -484,6 +538,55 @@ class CavityGeometryOptimizer:
                     viol += required + (dphi - np.pi) * r
         return viol
 
+    def _pinch_excess(self) -> float:
+        """Total pinch-radius excess [m] above ``pinch_target_r_m``.
+
+        For every wedge of the CURRENT geometry (dee wedges: the metal
+        between one dee's entry/exit chains; ground wedges: between
+        azimuthally adjacent dees), find the outermost radius where the
+        wedge's arc width falls below ``pinch_metal_width_m`` - the same
+        offset-chain scan build_gap_electrodes uses for its truncation
+        floor, with the sub-sample crossing interpolated so the term is
+        smooth in the segment parameters. Returns the summed excess above
+        the target. Call AFTER the candidate geometry has been applied.
+        """
+        if self.pinch_target_r_m is None:
+            return 0.0
+        from .gap_fields import offset_gap_boundary, _ccw_width
+        cavs = self.orbit_finder.design.rf_cavities
+        n_dees = len(cavs) // 2
+        order = sorted(range(n_dees),
+                       key=lambda k: cavs[2 * k].base_angle % 360.0)
+        excess = 0.0
+        w_idx = 0
+        for pos, j in enumerate(order):
+            entry, exit_ = cavs[2 * j], cavs[2 * j + 1]
+            nxt_entry = cavs[2 * order[(pos + 1) % n_dees]]
+            for lo, hi in ((offset_gap_boundary(entry, +1.0),
+                            offset_gap_boundary(exit_, -1.0)),    # dee wedge
+                           (offset_gap_boundary(exit_, +1.0),
+                            offset_gap_boundary(nxt_entry, -1.0))):  # ground
+                target = float(self.pinch_target_r_m[w_idx])
+                w_idx += 1
+                r0 = max(np.hypot(*lo[0]), np.hypot(*hi[0]), 1e-4)
+                r_top = min(np.hypot(*lo[-1]), np.hypot(*hi[-1]), 0.15)
+                ladder = np.arange(r0, r_top, 5e-4)
+                if not len(ladder):
+                    continue
+                width = _ccw_width(lo, hi, ladder)
+                bad = np.where(width < self.pinch_metal_width_m)[0]
+                if not len(bad):
+                    continue
+                k = int(bad[-1])
+                if k + 1 < len(width) and width[k + 1] > width[k]:
+                    t = ((self.pinch_metal_width_m - width[k])
+                         / (width[k + 1] - width[k]))
+                    pinch = float(ladder[k] + np.clip(t, 0.0, 1.0) * 5e-4)
+                else:
+                    pinch = float(ladder[k] + 5e-4)
+                excess += max(0.0, pinch - target)
+        return excess
+
     # ------------------------------------------------------------------- BEM
     @property
     def _is_bem(self) -> bool:
@@ -538,19 +641,26 @@ class CavityGeometryOptimizer:
                                    segment_rotations=self._rotations_for_gap(
                                        rotations_per_gap, g))
         violation += self._clearance_violation()
+        pinch_resid = (self.pinch_weight * self._pinch_excess()
+                       if self.pinch_target_r_m is not None else None)
 
         if self._is_bem and not self._attach_bem_for_current_geometry():
             # Unbuildable candidate (electrode build/solve failure or the
             # max_r_inner guard): graded fallback, worse than any tracked
-            # geometry, keeping the clearance term for a slope back toward
-            # feasibility. Sized from the last successful evaluation.
+            # geometry, keeping the clearance (and pinch) terms for a slope
+            # back toward feasibility. Sized from the last successful
+            # evaluation.
             if self._n_resid is None:
                 raise RuntimeError(
                     "BEM attach failed on the FIRST evaluation (cannot size "
                     f"the penalty residual): {self._bem_last_error}")
             self.orbit_finder.iteration += 1
             resid = np.full(self._n_resid, 10.0)
-            resid[-1] = max(w_violation * violation, 10.0)
+            if pinch_resid is not None:
+                resid[-2] = max(w_violation * violation, 10.0)
+                resid[-1] = max(pinch_resid, 10.0)
+            else:
+                resid[-1] = max(w_violation * violation, 10.0)
             self._write_checkpoint(angles_per_gap, radii_proj, rf_vals,
                                    float(np.sum(resid ** 2)), 0.0, 0, False,
                                    opening_delta=opening_delta,
@@ -561,6 +671,8 @@ class CavityGeometryOptimizer:
             rf_params, initial_beam, dt, max_turns, ls_weights, rf_param_names,
             r0_mode, skip_turns=skip_turns)
         resid = np.append(resid, w_violation * violation)
+        if pinch_resid is not None:
+            resid = np.append(resid, pinch_resid)
         self._n_resid = len(resid)
 
         cost = float(np.sum(resid ** 2))
@@ -579,9 +691,12 @@ class CavityGeometryOptimizer:
                 'rf_params': rf_params.copy(),
             }
             if self.verbose:
+                pinch_note = ("" if pinch_resid is None else
+                              f", pinch excess "
+                              f"{pinch_resid / self.pinch_weight * 1000:.2f} mm")
                 print(f"    eval {self.orbit_finder.iteration}: NEW BEST "
                       f"||r||^2={cost:.3e}, E={self.orbit_finder.last_energy_mev:.3f} MeV, "
-                      f"turns={self.orbit_finder.last_n_turns}")
+                      f"turns={self.orbit_finder.last_n_turns}{pinch_note}")
         elif self.verbose and self.orbit_finder.iteration % 25 == 0:
             print(f"    eval {self.orbit_finder.iteration}: ||r||^2={cost:.3e} "
                   f"(best {self.best_cost:.3e})")
@@ -626,6 +741,9 @@ class CavityGeometryOptimizer:
         # Clearance violation (rotated/tilted lines must not overlap): graded.
         clear_viol = self._clearance_violation()
         cost_penalty = 1e6 * clear_viol
+        if self.pinch_target_r_m is not None:
+            # pinch tie-breaker, squared to match the least-squares form
+            cost_penalty += (self.pinch_weight * self._pinch_excess()) ** 2
 
         if self._is_bem and not self._attach_bem_for_current_geometry():
             if self.verbose:

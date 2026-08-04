@@ -394,8 +394,12 @@ def _scroll_ring(arcs: List[np.ndarray], scroll_xy, prog_of, post_ds: float,
       tip corner) - interior seam edges shared verbatim with that wedge, so
       hub and dummy-dee form one contiguous area. seam[-1] must equal the
       first point of that wedge's row-0 arc, which becomes the ring start.
-    * ``step_prog`` given: radial step face there, then an inner-branch hold
-      back to the wrap (profile continuous across the wrap).
+    * an arc spans the turn wrap (its end prog < start prog - the wrap
+      dummy-dee's seam arc): that arc IS the closure - the spiral runs up to
+      its start and the rim continues along it across the wrap.
+    * ``step_prog`` given (and no wrap-spanning arc): radial step face there,
+      then an inner-branch hold back to the wrap (profile continuous across
+      the wrap).
     """
     ring_pts: List[np.ndarray] = []
     is_wall: List[bool] = []
@@ -458,7 +462,30 @@ def _scroll_ring(arcs: List[np.ndarray], scroll_xy, prog_of, post_ds: float,
             ring_pts.append(np.asarray(p, dtype=float))
             is_wall.append(i == 0)               # junction joins the wall rim
             seam_edge.append(True)
-        return np.array(ring_pts), is_wall, seam_edge
+        return _checked_ring(ring_pts, is_wall, seam_edge)
+
+    p0 = [float(prog_of(a[:1])[0]) for a in arcs]
+    p1 = [float(prog_of(a[-1:])[0]) for a in arcs]
+    wrap = [k for k in range(len(arcs)) if p1[k] < p0[k]]
+    if wrap:
+        # An arc spans the turn wrap (the wrap dummy-dee's seam arc, trimmed
+        # onto the outer spiral on one side and near the injection azimuth on
+        # the other): that arc IS the closure. Treating it as a normal spoke
+        # would leave prev ~ 0 after it and lay a SECOND full spiral wrap
+        # (plus the step face) on top of the whole ring - a self-intersecting
+        # rim with doubled wall/cap sheets that stalls the BEM GMRES solve.
+        if len(wrap) > 1 or wrap[0] != len(arcs) - 1:
+            raise RuntimeError("scroll ring: unexpected wrap-spanning spoke "
+                               "arcs (CW beam?) - geometry inspection needed")
+        add_arc(arcs[-1])
+        prev = p1[-1]
+        for k, arc in enumerate(arcs[:-1]):
+            fill_smooth(prev, p0[k])
+            add_arc(arc)
+            prev = p1[k]
+        fill_smooth(prev, p0[-1])
+        # cyclic closing edge lands back on the wrap arc's start corner
+        return _checked_ring(ring_pts, is_wall, seam_edge)
 
     add(scroll_xy(0.0), True)                    # ring anchor (wrap is smooth)
     prev = 0.0
@@ -468,7 +495,39 @@ def _scroll_ring(arcs: List[np.ndarray], scroll_xy, prog_of, post_ds: float,
         prev = float(prog_of(arc[-1:])[0])
     fill(prev, 2.0 * np.pi)
     # cyclic closing edge back to the anchor: profile continuous at the wrap
-    return np.array(ring_pts), is_wall, seam_edge
+    return _checked_ring(ring_pts, is_wall, seam_edge)
+
+
+def _checked_ring(ring_pts: List[np.ndarray], is_wall: List[bool],
+                  seam_edge: List[bool]
+                  ) -> Tuple[np.ndarray, List[bool], List[bool]]:
+    """Assemble the rim polygon and verify it is simple (no self-crossing).
+
+    A self-intersecting rim extrudes into interpenetrating wall/cap sheets,
+    which makes the first-kind BEM system near-singular (GMRES stalls at any
+    iteration count) - fail loudly at build time instead.
+    """
+    ring = np.array(ring_pts)
+    a0 = ring
+    d = np.roll(ring, -1, axis=0) - ring
+    for i in range(len(ring)):
+        denom = d[i, 0] * d[:, 1] - d[i, 1] * d[:, 0]
+        ok = np.abs(denom) > 1e-18
+        rel = a0 - a0[i]
+        safe = np.where(ok, denom, 1.0)
+        t = np.where(ok, (rel[:, 0] * d[:, 1] - rel[:, 1] * d[:, 0]) / safe, -1.0)
+        u = np.where(ok, (rel[:, 0] * d[i, 1] - rel[:, 1] * d[i, 0]) / safe, -1.0)
+        hit = ok & (t > 1e-9) & (t < 1 - 1e-9) & (u > 1e-9) & (u < 1 - 1e-9)
+        hit[i] = False
+        if hit.any():
+            j = int(np.where(hit)[0][0])
+            p = a0[i] + t[j] * d[i]
+            raise RuntimeError(
+                f"scroll hub rim self-intersects at ({p[0] * 1000:.1f}, "
+                f"{p[1] * 1000:.1f}) mm - the hub would interpenetrate the "
+                f"electrodes and stall the BEM solve; geometry inspection "
+                f"needed")
+    return ring, is_wall, seam_edge
 
 
 def _mesh_scroll_hub(ring: np.ndarray, is_wall: List[bool],
@@ -1008,11 +1067,14 @@ def build_gap_electrodes(design_or_cavities,
         defines a radius profile r1(azimuth); every electrode inner edge is
         trimmed to follow it (dee tips at r1 - traj_tip_clearance) and the
         central post becomes a SCROLL polygon at
-        r1 - traj_tip_clearance - post_tip_gap. The spiral TERMINATES at the
-        last electrode edge: its radial closing face sits one tip gap past
-        the outermost electrode tip, and the remaining sector back to the
-        injection azimuth holds the inner-branch radius (profile continuous
-        across the turn wrap; the dummy-dee there keeps its full sector).
+        r1 - traj_tip_clearance - post_tip_gap. The spiral TERMINATES on the
+        wrap dummy-dee: at the junction where that wedge's edge crosses the
+        spiral (rim closes along the edge, an interior seam), or - if the
+        edge was trimmed exactly ONTO the spiral - along the wedge's inner
+        arc across the wrap. Only when neither exists (no ground wedge at
+        the injection azimuth) does the scroll end in a radial step face one
+        tip gap past the outermost electrode tip, holding the inner-branch
+        radius back to the wrap.
         Ground wedges merge contiguously onto the scroll. Requires
         ``post_tip_gap``; exclusive with r_inner / center_post_radius /
         post_min_radius. Gaps are active at every beam crossing by
@@ -1174,9 +1236,13 @@ def build_gap_electrodes(design_or_cavities,
     # where it intersects the wrap dummy-dee's gap-offset edge (the dummy-dee
     # whose boundary sweeps across the turn wrap), and the closing edge of the
     # hub FOLLOWS that edge back to the wedge tip - an interior seam, so hub
-    # and dummy-dee form one contiguous grounded area. Fallback (no such
-    # intersection): radial step one tip gap past the outermost electrode
-    # tip + inner-branch hold back to the wrap.
+    # and dummy-dee form one contiguous grounded area. If the wrap dummy-dee's
+    # edge instead lands exactly ON the spiral (trimmed onto it, no transversal
+    # crossing), its inner arc spans the wrap and IS the hub closure (handled
+    # in _scroll_ring; no step face). Last-resort fallback (wrap sector not
+    # covered by a ground arc, e.g. injection inside a dee sector): radial
+    # step one tip gap past the outermost electrode tip + inner-branch hold
+    # back to the wrap.
     scroll_trims = None
     if scroll_mode:
         scroll_trims = []
@@ -1203,6 +1269,7 @@ def build_gap_electrodes(design_or_cavities,
         spiral_poly = np.column_stack([rs * np.cos(azs), rs * np.sin(azs)])
 
         special = None   # (iw, side_idx, seg_i, J, prog_J)
+        wrap_iw = None   # ground wedge whose inner arc spans the turn wrap
         for iw, w in enumerate(wedges):
             if w.kind != 'ground':
                 continue
@@ -1241,7 +1308,48 @@ def build_gap_electrodes(design_or_cavities,
                       f"r = {np.hypot(*sp_J)*1000:.1f} mm "
                       f"(az {np.rad2deg(np.arctan2(sp_J[1], sp_J[0])):.1f} deg)")
         else:
-            # fallback: radial step past the last tip + hold sector
+            # no transversal junction: does a ground wedge's inner arc span
+            # the turn wrap (chain tips on both sides of the injection
+            # azimuth)? Then that arc is the natural hub closure.
+            for iw2, w2 in enumerate(wedges):
+                if w2.kind != 'ground':
+                    continue
+                lo2, hi2 = scroll_trims[iw2]
+                if (float(prog_of(hi2[:1])[0])
+                        < float(prog_of(lo2[:1])[0])):
+                    wrap_iw = iw2
+                    break
+
+        if special is None and wrap_iw is not None:
+            # wrap-arc closure: the spiral terminates at the wrap dummy-dee's
+            # low-side tip and the hub rim continues along that wedge's inner
+            # (row-0) arc across the wrap - hub and wrap dummy-dee merge
+            # contiguously along the shared seam arc; no radial step face.
+            lo2, hi2 = scroll_trims[wrap_iw]
+            p_lo = float(prog_of(lo2[:1])[0])
+            p_hi = float(prog_of(hi2[:1])[0])
+            r_lo_tip = float(np.hypot(*lo2[0]))
+            r_hi_tip = float(np.hypot(*hi2[0]))
+            arc_span = float(np.mod(p_hi - p_lo, 2.0 * np.pi))
+            step_prog = None
+            prog_J = p_hi    # clamp target: just downstream of the closure
+
+            def scroll_r(prog):
+                # hub radius: spiral outside the wrap arc's sector, the
+                # arc's linear radius blend (see _cap_grid) across it
+                base = np.interp(prog, u1, r1v) - d_tip - post_tip_gap
+                dp = np.mod(np.asarray(prog, dtype=float) - p_lo, 2.0 * np.pi)
+                s = np.minimum(dp / arc_span, 1.0)
+                return np.where(dp <= arc_span,
+                                (1.0 - s) * r_lo_tip + s * r_hi_tip, base)
+
+            if verbose:
+                print(f"[gap_fields] scroll closes along "
+                      f"{wedges[wrap_iw].label}'s inner arc across the wrap "
+                      f"(r {r_lo_tip*1000:.1f} -> {r_hi_tip*1000:.1f} mm, "
+                      f"no step face)")
+        elif special is None:
+            # last-resort fallback: radial step past the last tip + hold sector
             r_at_end = float(np.interp(prog_tips, u1, r1v)) - d_tip - post_tip_gap
             step_prog = min(prog_tips + post_tip_gap / max(r_at_end, 1e-3),
                             2.0 * np.pi - 0.01)
@@ -1273,10 +1381,11 @@ def build_gap_electrodes(design_or_cavities,
         is_special = scroll_mode and special is not None and iw == special[0]
         if scroll_mode:
             lo, hi = scroll_trims[iw]
-            if not is_special:
+            if not is_special and iw != wrap_iw:
                 # keep wedge boundaries out of the hub (a chain sweeping past
                 # the closure would run buried under the outer branch); dees
-                # get the full voltage-gap setback off the closure
+                # get the full voltage-gap setback off the closure. The wrap
+                # wedge (arc closure) is exempt: its chains ARE the seam.
                 setback = 0.0015 if w.kind == 'ground' else post_tip_gap
                 lo = _clamp_chain_out_of_hub(lo, prog_of, scroll_r, phi0,
                                              s_dir, prog_J, setback)
@@ -1383,6 +1492,9 @@ def build_gap_electrodes(design_or_cavities,
                                     and special is not None else None),
                 'scroll_junction_prog': (special[4] if scroll_mode
                                          and special is not None else None),
+                'scroll_closure': (('seam' if special is not None else
+                                    'wrap-arc' if wrap_iw is not None else
+                                    'step') if scroll_mode else None),
                 'fillet_radius': fillet_radius},
     )
 
@@ -1420,6 +1532,7 @@ class GapFieldSolution:
     neumann: object
     gmres_info: int
     solve_time_s: float
+    n_iterations: int = 0
 
     def potential(self, pts: np.ndarray, chunk: int = 50000,
                   verbose: bool = False) -> np.ndarray:
@@ -1510,16 +1623,22 @@ class GapFieldSolution:
 
 def solve_gap_field(model: ElectrodeModel,
                     tol: float = 1e-5,
-                    maxiter: int = 4000,
+                    maxiter: int = 20000,
                     restart: int = 1000,
                     verbose: bool = True) -> GapFieldSolution:
     """Laplace Dirichlet solve (DP0 / single-layer / GMRES) on the model.
 
     Uses the STRONG form (mass-matrix preconditioned) - the plain weak-form
-    first-kind system stalls at these element counts / size ratios. Defaults
-    (tol 1e-5, restart 1000) are set for the hardest verified case (optimized
-    tilted/rotated geometry, ~22k elements, thin inner arcs): field accuracy
-    is mesh-limited at ~0.3% well above the 1e-5 residual.
+    first-kind system stalls at these element counts / size ratios. bempp
+    passes a callback to scipy, which puts scipy's gmres in 'legacy' mode:
+    ``maxiter`` counts INNER iterations, not restart cycles.
+
+    The iteration count is set by conditioning, which degrades sharply with
+    thin metal features (opposite faces of a thin fin carry near-canceling
+    charge - intrinsically hard for the first-kind single-layer operator).
+    Measured on the same ~27k-element scroll geometry: 792 iterations at
+    min_metal_width = 2 mm vs 9641 at 1 mm. tol 1e-5 is comfortable: field
+    accuracy is mesh-limited at ~0.3%, well above the residual.
     """
     bempp = _bempp()
     from bempp_cl.api.operators.boundary import laplace as lap_bnd
@@ -1532,17 +1651,27 @@ def solve_gap_field(model: ElectrodeModel,
     slp = lap_bnd.single_layer(space, space, space)
 
     t0 = time.time()
-    neumann, info = gmres(slp, dirichlet, tol=tol, maxiter=maxiter,
-                          restart=restart, use_strong_form=True)
+    neumann, info, residuals, n_iter = gmres(
+        slp, dirichlet, tol=tol, maxiter=maxiter, restart=restart,
+        use_strong_form=True, return_residuals=True,
+        return_iteration_count=True)
     dt = time.time() - t0
     if info != 0:
-        raise RuntimeError(f"gap-field GMRES did not converge (info={info}, "
-                           f"tol={tol}, maxiter={maxiter})")
+        last = residuals[-1] if len(residuals) else float('nan')
+        raise RuntimeError(
+            f"gap-field GMRES did not converge (info={info}, tol={tol}, "
+            f"maxiter={maxiter}, residual reached {last:.2e}). Slowly "
+            f"grinding convergence usually means thin-feature conditioning: "
+            f"raise maxiter or increase min_metal_width (thin fins are "
+            f"intrinsically hard for this operator). A hard stall at O(0.1+) "
+            f"residual points to intersecting/overlapping electrode "
+            f"surfaces instead.")
     if verbose:
         print(f"[gap_fields] GMRES solved {space.global_dof_count} DOFs "
-              f"in {dt:.1f} s")
+              f"in {dt:.1f} s ({n_iter} iterations)")
     return GapFieldSolution(model=model, space=space, neumann=neumann,
-                            gmres_info=info, solve_time_s=dt)
+                            gmres_info=info, solve_time_s=dt,
+                            n_iterations=int(n_iter))
 
 
 def make_bem_efield(design,

@@ -56,7 +56,7 @@ MAX_TURNS = 15
 #                       width at r_min (uncomment to override)
 BUILD_KWARGS = dict(chain_ds=0.012, arc_ds=0.04,
                     post_tip_gap=0.005,
-                    min_metal_width=0.002)
+                    min_metal_width=0.001)
                     # traj_tip_clearance=0.010,
                     # fillet_radius=0.002)
 FIELD_KWARGS = dict(spacing=0.0015)
