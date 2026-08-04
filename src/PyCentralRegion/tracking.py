@@ -102,6 +102,97 @@ class RadialVerticalTerminator(Terminator):
         return active
 
 
+class RadialSlitCollimator(Terminator):
+    """Central-region phase slit: a simple two-piece grounded block at
+    azimuth ``azimuth_rad``. On each particle's FIRST outbound crossing
+    of that half-plane (turn 1 - later turns pass tens of mm further
+    out, beyond the physical block), particles crossing OUTSIDE the
+    radial aperture are intercepted. In the center region the turn-1
+    radius correlates strongly with RF phase (energy gained in the
+    first gaps), so the radial aperture acts as a phase slit.
+
+    Two aperture modes:
+      absolute  - pass ``r_lo_m`` / ``r_hi_m`` explicitly.
+      reference - pass ``aperture_m`` (+ ``ref_particle``, default 0):
+          the aperture is CENTERED on the reference particle's own
+          first-crossing radius (the prepended bunch centroid in the
+          multiparticle examples). This makes the slit self-centering
+          for ANY candidate RF/geometry inside an optimization loop.
+          Particles crossing before the reference are judged
+          retroactively a few steps later, once the center is known
+          (mm-scale path error on particles that are removed anyway).
+          If the reference dies before crossing, no collimation occurs.
+
+    Interceptions are logged in ``hits`` as (particle, step, r_cross_m);
+    ``r_center_m`` holds the realized aperture center. ``reset()`` is
+    called by TrackingEngine before every run.
+    """
+
+    def __init__(self, azimuth_rad, r_lo_m=None, r_hi_m=None,
+                 aperture_m=None, ref_particle=0):
+        self.azimuth_rad = float(azimuth_rad)
+        if aperture_m is None and (r_lo_m is None or r_hi_m is None):
+            raise ValueError("give r_lo_m/r_hi_m or aperture_m")
+        self.aperture_m = None if aperture_m is None else float(aperture_m)
+        self.ref_particle = int(ref_particle)
+        self._r_lo0 = None if r_lo_m is None else float(r_lo_m)
+        self._r_hi0 = None if r_hi_m is None else float(r_hi_m)
+        self.reset()
+
+    def reset(self):
+        self.seen = None
+        self.judged = None
+        self.first_r = None
+        self.hits = []
+        if self.aperture_m is None:
+            self.r_center_m = 0.5 * (self._r_lo0 + self._r_hi0)
+            self.r_lo_m, self.r_hi_m = self._r_lo0, self._r_hi0
+        else:
+            self.r_center_m = None          # set by the reference crossing
+            self.r_lo_m = self.r_hi_m = None
+
+    def _judge(self, active):
+        """Judge all crossed-but-unjudged particles against the (now
+        known) aperture."""
+        idx = np.flatnonzero(self.seen & ~self.judged)
+        for p in idx:
+            rr = self.first_r[p]
+            if rr < self.r_lo_m or rr > self.r_hi_m:
+                if active[p]:
+                    active[p] = False
+                    self.hits.append((int(p), -1, float(rr)))
+            self.judged[p] = True
+        return active
+
+    def update(self, step, r_prev, v_prev, r, v, active, t):
+        if self.seen is None:
+            n = len(r)
+            self.seen = np.zeros(n, dtype=bool)
+            self.judged = np.zeros(n, dtype=bool)
+            self.first_r = np.full(n, np.nan)
+        ca, sa = np.cos(self.azimuth_rad), np.sin(self.azimuth_rad)
+        u_prev = -r_prev[:, 0] * sa + r_prev[:, 1] * ca
+        u = -r[:, 0] * sa + r[:, 1] * ca
+        along = r[:, 0] * ca + r[:, 1] * sa
+        crossed = active & ~self.seen & (u_prev < 0.0) & (u >= 0.0) \
+            & (along > 0.0)
+        if np.any(crossed):
+            idx = np.flatnonzero(crossed)
+            f = -u_prev[idx] / (u[idx] - u_prev[idx])
+            rc = r_prev[idx, :2] + f[:, None] * (r[idx, :2] - r_prev[idx, :2])
+            self.first_r[idx] = np.hypot(rc[:, 0], rc[:, 1])
+            self.seen[idx] = True
+            if self.r_center_m is None \
+                    and self.seen[self.ref_particle]:
+                self.r_center_m = float(self.first_r[self.ref_particle])
+                self.r_lo_m = self.r_center_m - 0.5 * self.aperture_m
+                self.r_hi_m = self.r_center_m + 0.5 * self.aperture_m
+        if self.r_center_m is not None and self.seen is not None \
+                and np.any(self.seen & ~self.judged):
+            active = self._judge(active)
+        return active
+
+
 class CallbackRecorder(Recorder):
     """Adapt a legacy callback(step, r, v, active, t) -> terminate into a Recorder."""
 
@@ -163,6 +254,11 @@ class TrackingEngine:
         # Create pusher
         self.pusher = Pusher(design.species, algorithm=algorithm)
 
+        # Extra terminators (e.g. RadialSlitCollimator) appended to the
+        # boundary terminator on every run; stateful ones exposing
+        # reset() are reset per run.
+        self.extra_terminators = []
+
         # Temporary ParticleDistribution for calculations
         self.pd_temp = ParticleDistribution(species=design.species)
 
@@ -190,6 +286,10 @@ class TrackingEngine:
             terminators = [RadialVerticalTerminator(self.r_max)]
         else:
             terminators = [RadialBoundaryTerminator(self.r_max)]
+        for tm in self.extra_terminators:
+            if hasattr(tm, 'reset'):
+                tm.reset()
+        terminators += list(self.extra_terminators)
 
         recorders = [CallbackRecorder(callback)] if callback is not None else []
         return interactions, terminators, recorders

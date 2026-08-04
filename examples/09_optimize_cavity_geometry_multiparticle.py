@@ -64,8 +64,14 @@ PREPEND_CENTROID = True
 # 'smooth': 0.5, 'envelope': 0.5, 'survival': 4.0, 'phase': 0.5}; entries here
 # override them. envelope/survival only act with numpart > 1.
 LS_WEIGHTS = {
-    'envelope': 0.5,
+    # envelope raised 0.5 -> 2.0 (2026-08-04): the extraction studies
+    # showed the caught-turn radial spread (~4 mm rms) drives the septum
+    # foil shadow - weight the radial beam size accordingly.
+    'envelope': 2.0,
     'survival': 4.0,
+    # one-time price of the phase-slit collimator's removals (beam count
+    # at the END; dynamic survival is measured post-collimator)
+    'collimated': 4.0,
 }
 
 # Staged-run settings (mirroring example 06's main()).
@@ -177,10 +183,18 @@ def main():
 
     result = geo_optimizer.optimize_staged(
         initial_beam,
-        rf_optimize_params=['bunch_phase', 'rf_freq'],
+        # coll_azimuth / coll_aperture: central-region phase-slit
+        # collimator (RadialSlitCollimator, reference-centered on the
+        # prepended bunch centroid), optimized jointly with geometry +
+        # RF. Its removals are priced ONCE by the 'collimated' LS
+        # weight; the aperture starts wide open (x0 = upper bound).
+        rf_optimize_params=['bunch_phase', 'rf_freq',
+                            'coll_azimuth', 'coll_aperture'],
         rf_bounds={
             'bunch_phase': (-180, 180),
             'rf_freq': (rf_frequency * 0.95, rf_frequency * 1.05),
+            'coll_azimuth': (0.0, 360.0),
+            'coll_aperture': (2.0, 20.0),
         },
         ls_weights=dict(LS_WEIGHTS),
         search_steps_per_turn=SEARCH_STEPS_PER_TURN,
@@ -222,6 +236,13 @@ def main():
     print(f"\nOptimal RF parameters:")
     print(f"  Bunch phase: {result.bunch_phase_deg:.2f} degrees")
     print(f"  RF frequency: {result.rf_frequency_mhz:.6f} MHz")
+    coll = result.metadata.get('collimator')
+    if coll:
+        print(f"\nOptimal collimator (phase slit, first turn):")
+        print(f"  Azimuth: {coll['azimuth_deg']:.1f} deg, aperture: "
+              f"{coll['aperture_mm']:.1f} mm "
+              f"(center r = {coll['r_center_mm']} mm)")
+        print(f"  Collimated: {coll['n_collimated']}/{n_part}")
 
     geom = result.metadata['optimal_geometry']
     print(f"\nOptimal cavity geometry (per gap):")

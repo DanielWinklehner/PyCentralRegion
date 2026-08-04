@@ -126,8 +126,17 @@ def make_beam_from_cylindrical(species, r, theta_deg, z, p_r, p_theta, p_z) -> P
 # scale 15 deg): without it the optimizer tolerates a large synchronous-phase
 # walk (observed: 139 -> 44 deg over 12 turns, with almost no energy gain in
 # the final turn). Phase stability at hand-off matters for the main machine.
+# 'collimated' prices the central-region phase slit (RadialSlitCollimator,
+# optimize via 'coll_azimuth' [deg] / 'coll_aperture' [mm] in the RF param
+# list): ONE residual sqrt(w) * n_collimated/n0. Intentional turn-1 removal
+# is priced once (it reduces the beam count at the END), unlike dynamic
+# 'survival' losses which count per turn - otherwise a cheap 30 keV
+# grounded-block interception would cost ~n_turns times a late loss and the
+# optimizer would pin the aperture open. Dynamic survival is measured
+# against the post-collimator population.
 DEFAULT_LS_WEIGHTS = {'energy': 4.0, 'center': 1.0, 'smooth': 0.5,
-                      'envelope': 0.5, 'survival': 4.0, 'phase': 0.5}
+                      'envelope': 0.5, 'survival': 4.0, 'phase': 0.5,
+                      'collimated': 4.0}
 DEFAULT_SKIP_TURNS = 2
 
 
@@ -323,7 +332,9 @@ class AcceleratedOrbitFinder:
 
     @staticmethod
     def _unpack(params, optimize_params) -> Dict[str, float]:
-        order = ['bunch_phase', 'rf_freq', 'r0', 'vr0']
+        # canonical order must match _build_param_space's append order
+        order = ['bunch_phase', 'rf_freq', 'r0', 'vr0',
+                 'coll_azimuth', 'coll_aperture']
         names = [n for n in order if n in optimize_params]
         return dict(zip(names, np.asarray(params, dtype=float)))
 
@@ -354,6 +365,23 @@ class AcceleratedOrbitFinder:
             writer.writerow(row)
 
     # --------------------------------------------------------------- tracking
+    def _make_collimator(self, vals):
+        """Central-region phase slit from optimization values
+        ('coll_azimuth' [deg], 'coll_aperture' [mm]) with fallback to
+        the fixed ``self.collimator`` dict (azimuth_deg / aperture_mm /
+        ref_particle). Reference-centered: the aperture centers itself
+        on the reference particle's first-crossing radius, so it stays
+        valid for any candidate RF/geometry. Returns None if unset."""
+        cfg = getattr(self, 'collimator', None) or {}
+        az = vals.get('coll_azimuth', cfg.get('azimuth_deg'))
+        ap = vals.get('coll_aperture', cfg.get('aperture_mm'))
+        if az is None or ap is None:
+            return None
+        from .tracking import RadialSlitCollimator
+        return RadialSlitCollimator(
+            np.radians(float(az)), aperture_m=float(ap) * 1e-3,
+            ref_particle=int(cfg.get('ref_particle', 0)))
+
     def track_with_rf(self,
                       pd_init: ParticleDistribution,
                       dt: float,
@@ -598,6 +626,8 @@ class AcceleratedOrbitFinder:
         if 'rf_freq' in vals:
             self.design.set_rf_frequency(vals['rf_freq'])
 
+        coll = self._make_collimator(vals)
+        self.engine.extra_terminators = [coll] if coll is not None else []
         try:
             pd = self._prepare_beam(initial_beam, vals.get('r0'), vals.get('vr0'), r0_mode)
             self._set_beam_meta(pd)
@@ -644,8 +674,14 @@ class AcceleratedOrbitFinder:
                     env_turns[:min(n_turns, max_turns)] = stds[:max_turns]
                     if n_turns < max_turns:
                         env_turns[n_turns:] = stds[-1]
-                    frac_lost = 1.0 - np.array([t.n_active for t in turn_stats],
-                                               dtype=float) / n0
+                    # dynamic survival against the POST-COLLIMATOR
+                    # population (intentional slit removal is priced
+                    # once, in the 'collimated' block below)
+                    n_coll = len(coll.hits) if coll is not None else 0
+                    n_eff = max(n0 - n_coll, 1)
+                    frac_lost = np.clip(
+                        1.0 - np.array([t.n_active for t in turn_stats],
+                                       dtype=float) / n_eff, 0.0, 1.0)
                     surv_turns[:min(n_turns, max_turns)] = frac_lost[:max_turns]
                     if n_turns < max_turns:
                         # pad with the last observed loss (early stop on target
@@ -657,6 +693,8 @@ class AcceleratedOrbitFinder:
         except Exception as e:
             if self.verbose:
                 print(f"    Iter {self.iteration}: residual eval failed: {e}")
+        finally:
+            self.engine.extra_terminators = []
 
         blocks = [
             we * (ramp - e_turns) / self.target_energy_mev,
@@ -667,6 +705,10 @@ class AcceleratedOrbitFinder:
         if is_multi:
             blocks.append(wv * env_turns[skip:] / ENV_SCALE)
             blocks.append(wu * surv_turns)
+            if coll is not None:
+                wk = np.sqrt(ls_weights.get(
+                    'collimated', DEFAULT_LS_WEIGHTS['collimated']))
+                blocks.append(np.array([wk * len(coll.hits) / n0]))
         resid = np.concatenate(blocks)
 
         cost = float(np.sum(resid ** 2))
@@ -707,6 +749,16 @@ class AcceleratedOrbitFinder:
             param_names.append('vr0')
             param_bounds.append(bounds.get('vr0', (-5e5, 5e5)))
             x0.append(0.0)
+        if 'coll_azimuth' in optimize_params:
+            b = bounds.get('coll_azimuth', (0.0, 360.0))
+            param_names.append('coll_azimuth')
+            param_bounds.append(b)
+            x0.append(0.5 * (b[0] + b[1]))
+        if 'coll_aperture' in optimize_params:
+            b = bounds.get('coll_aperture', (2.0, 20.0))
+            param_names.append('coll_aperture')
+            param_bounds.append(b)
+            x0.append(b[1])          # start wide open (no collimation)
         return param_bounds, param_names, x0
 
     def optimize(self,
@@ -797,15 +849,30 @@ class AcceleratedOrbitFinder:
         self._set_beam_meta(pd)
         dt = self._estimate_timestep(self._rf_base_frequency())
 
-        result = self.track_with_rf(pd, dt, max_turns, save_full_beam=save_full_beam)
+        # fixed-config collimator (self.collimator), if any
+        coll = self._make_collimator({})
+        self.engine.extra_terminators = [coll] if coll is not None else []
+        try:
+            result = self.track_with_rf(pd, dt, max_turns,
+                                        save_full_beam=save_full_beam)
+        finally:
+            self.engine.extra_terminators = []
         vals = {'bunch_phase': bunch_phase_deg, 'rf_freq': rf_freq_mhz * 1e6}
         if r0 is not None:
             vals['r0'] = r0
         if pr0 is not None:
             vals['vr0'] = pr0
+        meta_extra = {'mode': 'single_run'}
+        if coll is not None:
+            meta_extra['collimator'] = {
+                'azimuth_deg': float(np.degrees(coll.azimuth_rad)),
+                'aperture_mm': float(coll.aperture_m * 1e3),
+                'r_center_mm': (float(coll.r_center_m * 1e3)
+                                if coll.r_center_m is not None else None),
+                'n_collimated': len(coll.hits)}
         return self._build_result(result, vals, 0.0, list(vals.keys()), [], {},
                                   'single_run', 0.0, r0_mode,
-                                  metadata_extra={'mode': 'single_run'})
+                                  metadata_extra=meta_extra)
 
     # ----------------------------------------------------------------- result
     def _build_result(self, result, vals, cost, param_names, param_bounds, weights,

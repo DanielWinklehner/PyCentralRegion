@@ -331,6 +331,7 @@ class CavityGeometryOptimizer:
             if self.optimize_opening_angle:
                 header += ['opening_angle_deg']
             header += ['bunch_phase_deg', 'rf_freq_mhz', 'r0', 'vr0',
+                       'coll_azimuth_deg', 'coll_aperture_mm',
                        'final_energy_mev', 'n_turns', 'cost', 'success', 'timestamp']
             writer.writerow(header)
         self._checkpoint_inited = True
@@ -354,6 +355,8 @@ class CavityGeometryOptimizer:
                 row += [base + (opening_delta or 0.0)]
             row += [rf_vals.get('bunch_phase', 0.0), rf_vals.get('rf_freq', 0.0) / 1e6,
                     rf_vals.get('r0', 0.0), rf_vals.get('vr0', 0.0),
+                    rf_vals.get('coll_azimuth', 0.0),
+                    rf_vals.get('coll_aperture', 0.0),
                     energy, n_turns, cost, success, time.time()]
             writer.writerow(row)
 
@@ -926,7 +929,12 @@ class CavityGeometryOptimizer:
         dt = of._estimate_timestep(of._rf_base_frequency())
         pd_final = of._prepare_beam(initial_beam, rf_vals.get('r0'), rf_vals.get('vr0'), r0_mode)
         of._set_beam_meta(pd_final)
-        result = of.track_with_rf(pd_final, dt, max_turns, save_full_beam=True)
+        coll = of._make_collimator(rf_vals)
+        of.engine.extra_terminators = [coll] if coll is not None else []
+        try:
+            result = of.track_with_rf(pd_final, dt, max_turns, save_full_beam=True)
+        finally:
+            of.engine.extra_terminators = []
 
         meta = {
             'optimization_time_s': elapsed,
@@ -942,6 +950,19 @@ class CavityGeometryOptimizer:
                 'n_gaps': self.n_gaps,
             },
         }
+        if coll is not None:
+            meta['collimator'] = {
+                'azimuth_deg': rf_vals.get('coll_azimuth'),
+                'aperture_mm': rf_vals.get('coll_aperture'),
+                'r_center_mm': (float(coll.r_center_m * 1e3)
+                                if coll.r_center_m is not None else None),
+                'n_collimated': len(coll.hits)}
+            if self.verbose:
+                print(f"  collimator: azimuth "
+                      f"{rf_vals.get('coll_azimuth', 0.0):.1f} deg, "
+                      f"aperture {rf_vals.get('coll_aperture', 0.0):.1f} mm "
+                      f"(center r {meta['collimator']['r_center_mm']} mm), "
+                      f"{len(coll.hits)} collimated")
         meta.update(extra_meta or {})
         return of._build_result(result, rf_vals, final_cost, param_names, param_bounds,
                                 weights, method, elapsed, r0_mode, metadata_extra=meta)
