@@ -1087,7 +1087,8 @@ class CavityGeometryOptimizer:
                         worker_builder=None,
                         worker_builder_args: tuple = (),
                         n_starts: Optional[int] = None,
-                        geometry_jitter_deg: float = 1.0) -> OptimizedOrbit:
+                        geometry_jitter_deg: float = 1.0,
+                        collimator_seed: Optional[tuple] = None) -> OptimizedOrbit:
         """Three-stage optimization:
 
         A. Coarse RF scan (geometry frozen straight): grid over bunch phase x
@@ -1120,7 +1121,7 @@ class CavityGeometryOptimizer:
                 final_steps_per_turn, final_max_turns,
                 phase_grid, freq_fracs, maxfun, r0_mode, skip_turns,
                 workers, worker_builder, worker_builder_args,
-                n_starts, geometry_jitter_deg)
+                n_starts, geometry_jitter_deg, collimator_seed)
 
         of = self.orbit_finder
         of._set_beam_meta(initial_beam)
@@ -1168,7 +1169,8 @@ class CavityGeometryOptimizer:
                       f"(E={e_seed:.3f} MeV in {search_max_turns} turns)")
 
             # Seed vector: straight geometry + stage-A RF values.
-            order = ['bunch_phase', 'rf_freq', 'r0', 'vr0']
+            order = ['bunch_phase', 'rf_freq', 'r0', 'vr0',
+                     'coll_azimuth', 'coll_aperture']
             rf_seed_map = {'bunch_phase': ph_seed, 'rf_freq': f_seed}
             seed = np.asarray(x0, dtype=float).copy()
             k = self._rf_offset
@@ -1194,8 +1196,17 @@ class CavityGeometryOptimizer:
                                   final_turns, phase_grid, freq_fracs, maxfun, r0_mode,
                                   skip_turns, workers, worker_builder,
                                   worker_builder_args, n_starts,
-                                  geometry_jitter_deg) -> OptimizedOrbit:
-        """Parallel staged optimization (see optimize_staged docstring)."""
+                                  geometry_jitter_deg,
+                                  collimator_seed=None) -> OptimizedOrbit:
+        """Parallel staged optimization (see optimize_staged docstring).
+
+        ``collimator_seed``: optional (azimuth_deg, aperture_mm) applied
+        to every SECOND stage-B start. The aperture's natural x0 is wide
+        open, and from there DFO-LS faces a barrier - each collimated
+        particle is priced immediately while the envelope gain accrues
+        only once several tail particles are gone - so half the starts
+        begin on the closed side of the barrier.
+        """
         from concurrent.futures import ProcessPoolExecutor, as_completed
         try:
             from tqdm import tqdm
@@ -1297,7 +1308,8 @@ class CavityGeometryOptimizer:
                 i_clone += 1
 
             rng = np.random.default_rng(42)
-            order = ['bunch_phase', 'rf_freq', 'r0', 'vr0']
+            order = ['bunch_phase', 'rf_freq', 'r0', 'vr0',
+                     'coll_azimuth', 'coll_aperture']
             seeds = []
             for i, (E, ph, f) in enumerate(picked):
                 s = np.asarray(x0, dtype=float).copy()
@@ -1306,6 +1318,7 @@ class CavityGeometryOptimizer:
                         base = g * self._blk
                         s[base:base + self.n_segments] += rng.uniform(
                             -geometry_jitter_deg, geometry_jitter_deg, self.n_segments)
+                seed_closed = collimator_seed is not None and i % 2 == 1
                 k = self._rf_offset
                 for name in order:
                     if name in rf_optimize_params:
@@ -1313,6 +1326,10 @@ class CavityGeometryOptimizer:
                             s[k] = ph
                         elif name == 'rf_freq':
                             s[k] = f
+                        elif seed_closed and name == 'coll_azimuth':
+                            s[k] = float(collimator_seed[0])
+                        elif seed_closed and name == 'coll_aperture':
+                            s[k] = float(collimator_seed[1])
                         k += 1
                 seeds.append(s)
 

@@ -197,6 +197,10 @@ def main():
             'coll_aperture': (2.0, 20.0),
         },
         ls_weights=dict(LS_WEIGHTS),
+        # Half the DFO-LS starts begin with the slit CLOSED at the
+        # seeded-test optimum (the wide-open start faces a discrete-
+        # price-vs-diffuse-gain barrier DFO-LS does not cross).
+        collimator_seed=(346.0, 6.5),
         search_steps_per_turn=SEARCH_STEPS_PER_TURN,
         search_max_turns=SEARCH_MAX_TURNS,
         final_steps_per_turn=FINAL_STEPS_PER_TURN,
