@@ -314,6 +314,7 @@ class CavityGeometryOptimizer:
 
         self.best_cost = np.inf
         self.best_geometry = None
+        self.best_resid_blocks = {}
         self._checkpoint_inited = False
 
     # ------------------------------------------------------------- checkpoint
@@ -693,13 +694,23 @@ class CavityGeometryOptimizer:
                 'opening_delta': opening_delta,
                 'rf_params': rf_params.copy(),
             }
+            # Per-block cost decomposition (orbit-finder blocks plus the
+            # geometry terms added here), so weights can be tuned against what
+            # actually dominates instead of reconstructed from a saved result.
+            self.best_resid_blocks = dict(self.orbit_finder.last_resid_blocks)
+            self.best_resid_blocks['violation'] = float((w_violation * violation) ** 2)
+            if pinch_resid is not None:
+                self.best_resid_blocks['pinch'] = float(pinch_resid ** 2)
             if self.verbose:
                 pinch_note = ("" if pinch_resid is None else
                               f", pinch excess "
                               f"{pinch_resid / self.pinch_weight * 1000:.2f} mm")
+                shares = ", ".join(f"{k} {v:.3f}" for k, v in
+                                   self.best_resid_blocks.items() if v > 0.0)
                 print(f"    eval {self.orbit_finder.iteration}: NEW BEST "
                       f"||r||^2={cost:.3e}, E={self.orbit_finder.last_energy_mev:.3f} MeV, "
-                      f"turns={self.orbit_finder.last_n_turns}{pinch_note}")
+                      f"turns={self.orbit_finder.last_n_turns}{pinch_note}"
+                      f"\n        blocks: {shares}")
         elif self.verbose and self.orbit_finder.iteration % 25 == 0:
             print(f"    eval {self.orbit_finder.iteration}: ||r||^2={cost:.3e} "
                   f"(best {self.best_cost:.3e})")
@@ -853,6 +864,7 @@ class CavityGeometryOptimizer:
         of.best_cost = np.inf
         self.best_cost = np.inf
         self.best_geometry = None
+        self.best_resid_blocks = {}
         self._init_checkpoint_file()
 
         dt = of._estimate_timestep(of._rf_base_frequency())
@@ -927,8 +939,9 @@ class CavityGeometryOptimizer:
             of.design.set_rf_frequency(rf_vals['rf_freq'])
 
         dt = of._estimate_timestep(of._rf_base_frequency())
-        pd_final = of._prepare_beam(initial_beam, rf_vals.get('r0'), rf_vals.get('vr0'), r0_mode)
-        of._set_beam_meta(pd_final)
+        pd_final, n_ref = of._prepare_beam(initial_beam, rf_vals.get('r0'),
+                                           rf_vals.get('vr0'), r0_mode)
+        of._set_beam_meta(pd_final, n_ref)
         coll = of._make_collimator(rf_vals)
         of.engine.extra_terminators = [coll] if coll is not None else []
         try:
@@ -1031,6 +1044,7 @@ class CavityGeometryOptimizer:
         of.best_cost = np.inf
         self.best_cost = np.inf
         self.best_geometry = None
+        self.best_resid_blocks = {}
         self._init_checkpoint_file()
 
         dt = of._estimate_timestep(of._rf_base_frequency())

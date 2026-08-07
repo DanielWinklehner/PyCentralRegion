@@ -126,15 +126,27 @@ class RadialSlitCollimator(Terminator):
     Interceptions are logged in ``hits`` as (particle, step, r_cross_m);
     ``r_center_m`` holds the realized aperture center. ``reset()`` is
     called by TrackingEngine before every run.
+
+    Particle indices in ``hits`` are shifted by ``index_offset`` so they
+    address the PHYSICAL bunch: when a virtual reference particle is
+    prepended (AcceleratedOrbitFinder.reference_centroid) the tracked
+    arrays carry it at index 0, but every consumer - full_beam, the user's
+    beam, the plots - is indexed without it.
     """
 
     def __init__(self, azimuth_rad, r_lo_m=None, r_hi_m=None,
-                 aperture_m=None, ref_particle=0):
+                 aperture_m=None, ref_particle=0, exempt_ref=False,
+                 index_offset=0):
         self.azimuth_rad = float(azimuth_rad)
         if aperture_m is None and (r_lo_m is None or r_hi_m is None):
             raise ValueError("give r_lo_m/r_hi_m or aperture_m")
         self.aperture_m = None if aperture_m is None else float(aperture_m)
         self.ref_particle = int(ref_particle)
+        # Set when the reference is a VIRTUAL centroid particle rather than
+        # beam: removing it would end turn counting. In self-centering mode it
+        # sits exactly at the aperture centre and cannot be hit anyway.
+        self.exempt_ref = bool(exempt_ref)
+        self.index_offset = int(index_offset)
         self._r_lo0 = None if r_lo_m is None else float(r_lo_m)
         self._r_hi0 = None if r_hi_m is None else float(r_hi_m)
         self.reset()
@@ -156,11 +168,14 @@ class RadialSlitCollimator(Terminator):
         known) aperture."""
         idx = np.flatnonzero(self.seen & ~self.judged)
         for p in idx:
+            if self.exempt_ref and p == self.ref_particle:
+                self.judged[p] = True
+                continue
             rr = self.first_r[p]
             if rr < self.r_lo_m or rr > self.r_hi_m:
                 if active[p]:
                     active[p] = False
-                    self.hits.append((int(p), -1, float(rr)))
+                    self.hits.append((int(p) - self.index_offset, -1, float(rr)))
             self.judged[p] = True
         return active
 

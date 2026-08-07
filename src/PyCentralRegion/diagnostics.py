@@ -45,12 +45,23 @@ class PoincareAnalyzer:
     ----------
     section_angle : float
         Angle [rad] defining Poincaré section (default: 0 = +x axis)
+    arm_angle : float
+        Accumulated azimuth [rad] the particle must travel before the FIRST
+        crossing may be logged (default 0 = disabled). Set it to ~pi when the
+        particle is launched ON the section: the crossing test only sees
+        consecutive tracked positions, so a launch a fraction of a step behind
+        the section registers a crossing within the first few steps and turn 0
+        then spans almost no azimuth. Arming makes "turn N" mean N genuine
+        revolutions from launch whatever the injection geometry.
     """
 
 
-    def __init__(self, section_angle: float = 0.0):
+    def __init__(self, section_angle: float = 0.0, arm_angle: float = 0.0):
         self.section_angle = section_angle
+        self.arm_angle = float(arm_angle)
         self.crossings = []
+        self._azimuth_travelled = 0.0
+        self._armed = self.arm_angle <= 0.0
 
 
     def check_crossing(self,
@@ -67,6 +78,20 @@ class PoincareAnalyzer:
         t_frac : float or None
             Fractional timestep of crossing (0-1)
         """
+
+        if not self._armed:
+            # Signed accumulation (motion is counter-clockwise); a brief
+            # backward excursion must not arm the detector early.
+            dtheta = (np.arctan2(r_new[1], r_new[0])
+                      - np.arctan2(r_old[1], r_old[0]))
+            if dtheta > np.pi:
+                dtheta -= 2.0 * np.pi
+            elif dtheta < -np.pi:
+                dtheta += 2.0 * np.pi
+            self._azimuth_travelled += dtheta
+            if self._azimuth_travelled < self.arm_angle:
+                return False, None
+            self._armed = True
 
         if self.section_angle == 0.0:
             # Optimized for +x axis: y crosses zero upward

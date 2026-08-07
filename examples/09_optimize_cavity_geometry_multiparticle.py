@@ -19,9 +19,12 @@ build_system - single source of truth; this file only swaps the beam and
 the run bookkeeping.
 
 The bunch is 2D-projected for this midplane study: z and vz are dropped
-(vertical dynamics is 3D roadmap physics). The bunch CENTROID (mean position
-and velocity) is prepended as particle 0, so trajectory_reference and the
-per-turn Poincare metrics describe the centroid orbit.
+(vertical dynamics is 3D roadmap physics). The bunch CENTROID is prepended as
+a virtual particle 0 by AcceleratedOrbitFinder itself (reference_centroid,
+on by default), so trajectory_reference and the per-turn Poincare metrics
+describe the centroid orbit; unlike the hand-rolled prepend this file used to
+do, the library strips it again from every beam statistic and from the saved
+bunch, so it no longer dilutes envelope/survival or the particle count.
 
 COST: every objective evaluation tracks the full bunch, so expect roughly
 linear scaling in particle count per evaluation. Use N_PARTICLES to
@@ -55,9 +58,10 @@ BUNCH_CSV = HERE.parent / 'resources' / 'MuonBunchOutOfInflector.csv'
 N_PARTICLES = None
 SUBSAMPLE_SEED = 42
 
-# Prepend the bunch centroid as particle 0 (the reference for
-# trajectory_reference / turn metrics / Poincare plots).
-PREPEND_CENTROID = True
+# The centroid reference particle is now prepended by AcceleratedOrbitFinder
+# (reference_centroid=True by default) and stripped again before any beam
+# statistic, so this file must NOT prepend one of its own - that would give
+# two centroid particles, one of them counted as beam.
 
 # Least-squares residual weights. Defaults live in
 # accelerated_orbit_finder.DEFAULT_LS_WEIGHTS = {'energy': 4.0, 'center': 1.0,
@@ -99,8 +103,8 @@ def load_bunch(species):
     """The inflector-exit bunch as a 2D-projected ParticleDistribution.
 
     Reads x,y,z [m] and vx,vy,vz [m/s] from BUNCH_CSV, zeroes z/vz (midplane
-    study), optionally subsamples to N_PARTICLES, and prepends the centroid
-    as particle 0 (PREPEND_CENTROID).
+    study) and optionally subsamples to N_PARTICLES. Returns the PHYSICAL bunch
+    only - the centroid reference particle is prepended by the orbit finder.
     """
     data = np.genfromtxt(BUNCH_CSV, delimiter=',', skip_header=1)
     if data.ndim != 2 or data.shape[1] != 6:
@@ -116,10 +120,6 @@ def load_bunch(species):
         idx = rng.choice(len(x), size=int(N_PARTICLES), replace=False)
         idx.sort()
         x, v = x[idx], v[idx]
-
-    if PREPEND_CENTROID:
-        x = np.vstack([x.mean(axis=0), x])
-        v = np.vstack([v.mean(axis=0), v])
 
     return make_beam_from_state(species, x, v)
 
@@ -163,7 +163,6 @@ def main():
     print(f"   {len(design.rf_cavities)} gaps x {ex06.N_VARIABLE_SEGMENTS} "
           f"variable segment(s)")
     print(f"\n2. Loaded bunch: {n_part} particles"
-          + (" (centroid prepended as reference)" if PREPEND_CENTROID else "")
           + (f", subsampled from CSV with seed {SUBSAMPLE_SEED}"
              if N_PARTICLES is not None else ""))
     print(f"   r = {r_all.mean() * 1000:.2f} +/- {r_all.std() * 1000:.2f} mm "
@@ -452,8 +451,7 @@ def main():
         f.write("MULTIPARTICLE CAVITY GEOMETRY + RF OPTIMIZATION SUMMARY\n")
         f.write("=" * 70 + "\n\n")
         f.write(f"Species: {design.species.name}\n")
-        f.write(f"Bunch: {n_part} particles from {BUNCH_CSV.name}"
-                + (" (centroid prepended)" if PREPEND_CENTROID else "") + "\n")
+        f.write(f"Bunch: {n_part} particles from {BUNCH_CSV.name}\n")
         f.write(f"Target energy: {ex06.TARGET_ENERGY_MEV} MeV\n")
         f.write(f"Final mean energy: {result.final_energy_mev:.3f} MeV\n")
         f.write(f"Number of turns: {result.n_turns}\n")
