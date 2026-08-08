@@ -154,6 +154,29 @@ TURN_BUDGET_MARGIN = 2
 U_SCALE = 0.10
 DR_EPS = 1e-3        # m
 
+# Saturation limit [residual units] for the smoothness block. An orbit that is
+# not accelerating has dr wobbling through zero, and log(max(dr,0) + DR_EPS)
+# then swings ~3 log-units per step: measured on such a candidate the block
+# reached 814 against an energy block of 15, i.e. entries of magnitude ~57 next
+# to entries of ~0.2 on a healthy orbit. That is a conditioning problem for the
+# least-squares model, not a modelling one, so the cure is saturation rather
+# than a smaller scale. tanh is C-infinity, so no discontinuity is introduced.
+#
+# Fidelity where it matters: at 1 unit the clip costs 1.3%, at 2 units 5.0%,
+# and on the measured 15-turn run (entries ~0.15) under 0.1%. A fully saturated
+# block is 0.5 * U_RESID_MAX**2 * n_curvature_entries, ~100 at 15 turns with
+# skip 4 - still above the energy block's ~22 ceiling, which is deliberate: a
+# garbage orbit should be dominated by "your turn separation is nonsense", and
+# that gradient points toward a monotone spiral, i.e. toward acceleration.
+# Lower this to ~2.5 to force strict energy dominance everywhere, at the cost
+# of compressing genuine kinks.
+U_RESID_MAX = 5.0
+
+
+def _soft_clip(x, limit=U_RESID_MAX):
+    """Smoothly saturate |x| at ``limit``; near-identity for small |x|."""
+    return limit * np.tanh(np.asarray(x, dtype=float) / limit)
+
 
 def log_turn_curvature(dr, skip: int = 0) -> np.ndarray:
     """Second difference of log(turn separation) over the kept turns.
@@ -714,7 +737,7 @@ class AcceleratedOrbitFinder:
         w_smooth = weights.get('smooth', 100.0)
         curv = log_turn_curvature(metrics['dr'])
         if len(curv) > 0:
-            cost += w_smooth * float(np.mean((curv / U_SCALE) ** 2))
+            cost += w_smooth * float(np.mean(_soft_clip(curv / U_SCALE) ** 2))
 
         if self.is_multiparticle:
             envelope_osc = float(np.std(std_r_steps))
@@ -752,9 +775,10 @@ class AcceleratedOrbitFinder:
                      achieved energy, so early loss degrades smoothly instead
                      of a cost cliff.
           - center:  sqrt(w_c) * r_center_i / 0.02 m           per turn.
-          - smooth:  sqrt(w_s) * d2[log dr]_i / U_SCALE        per kept turn
+          - smooth:  sqrt(w_s) * clip(d2[log dr]_i / U_SCALE)  per kept turn
                      triple - the second difference of log(turn separation),
-                     see log_turn_curvature. This replaced a
+                     softly saturated at U_RESID_MAX, see log_turn_curvature
+                     and _soft_clip. This replaced a
                      deviation-of-dr-from-its-mean term, which had an
                      irreducible floor (r ~ sqrt(E) forces dr to shrink) that
                      grew with the energy gain, so crest-riding was net
@@ -795,8 +819,9 @@ class AcceleratedOrbitFinder:
         ramp = e0 + (self.target_energy_mev - e0) * (np.arange(1, max_turns + 1) / max_turns)
 
         # Defaults = "no acceleration at all", and the graceful failure vector
-        # for a candidate whose tracking throws: one residual unit per entry,
-        # matching the existing centering convention. Previously smoothness and
+        # for a candidate whose tracking throws: one residual unit per entry
+        # (0.99 for smoothness, which passes through _soft_clip), matching the
+        # existing centering convention. Previously smoothness and
         # phase defaulted to zeros, i.e. a candidate that failed to track scored
         # a PERFECT zero on both.
         # These are failure values only - turns that are merely not reached are
@@ -901,7 +926,7 @@ class AcceleratedOrbitFinder:
         blocks = {
             'energy': we * (ramp - e_turns) / self.target_energy_mev,
             'center': wc * c_turns[skip:] / C_SCALE,
-            'smooth': ws * curv_kept / U_SCALE,
+            'smooth': ws * _soft_clip(curv_kept / U_SCALE),
             'phase': wp * p_kept / PHASE_SCALE,
         }
         if is_multi:
