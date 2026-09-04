@@ -411,7 +411,14 @@ class RFCavity:
             s_part = np.zeros(n_particles)
 
             t_cav[valid_mask] = det_t_cav[valid_mask] / det[valid_mask]
-            s_part[valid_mask] = det_s_part[valid_mask] / det[valid_mask]
+            # Cramer's rule for A = [d_cav, -d_part]: det(A) = -det (the sign
+            # was folded into `det` above), so s_part = det_s / det(A) needs the
+            # minus sign. Without it the crossing was found on the chord AFTER
+            # the true crossing (s_part = -s_true), i.e. one step late, and a
+            # chord ending exactly on the gap line produced a missed or a
+            # doubled kick (seen as 7 or 9 kicks per turn in the HCHC-60
+            # accelerated orbit, 2026-09-03).
+            s_part[valid_mask] = -det_s_part[valid_mask] / det[valid_mask]
 
             # Check bounds
             this_crossed = (valid_mask & (t_cav >= 0.0) & (t_cav <= 1.0) &

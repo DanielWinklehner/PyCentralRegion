@@ -9,6 +9,9 @@ from .accelerated_orbit_finder import (AcceleratedOrbitFinder, OptimizedOrbit,
 from .cavity_optimizer import CavityGeometryOptimizer
 from . import diagnostics
 from . import gap_fields
+from . import closed_orbit
+from .closed_orbit import (CartesianMidplane, PolarMidplane, closed_orbits,
+                           orbits_at_radii)
 
 __all__ = [
     # seo_finder
@@ -27,6 +30,8 @@ __all__ = [
     'make_beam_from_cylindrical',
     # cavity_optimizer
     'CavityGeometryOptimizer',
+    # closed_orbit (Gordon polar closed-orbit solver)
+    'CartesianMidplane', 'PolarMidplane', 'closed_orbits', 'orbits_at_radii',
     # submodules
-    'diagnostics', 'gap_fields',
+    'diagnostics', 'gap_fields', 'closed_orbit',
 ]

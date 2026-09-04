@@ -252,7 +252,8 @@ class SEOFinder:
                  algorithm: str = 'boris',
                  solver: str = 'newton',
                  symmetry_half_angle_deg: float = 45.0,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 polar_seed: bool = True):
 
         self.design = design
         self.n_turns = n_turns
@@ -261,10 +262,18 @@ class SEOFinder:
         self.poincare_angle = np.deg2rad(poincare_angle)
         self.closure_tol_mm = closure_tol_mm
         self.algorithm = algorithm
-        # SEO solver: 'newton' (full-turn 2D Newton fixed point), 'symmetric'
-        # (mirror-plane shooting; assumes the tracked field is symmetric about
-        # theta=0 and theta=symmetry_half_angle), or 'centroid' (legacy averaging).
+        # SEO solver: 'newton' (full-turn 2D Newton fixed point of the Cartesian
+        # tracker), 'symmetric' (mirror-plane shooting; assumes the tracked field
+        # is symmetric about theta=0 and theta=symmetry_half_angle), 'polar'
+        # (Gordon closed-orbit integrator in polar coordinates on the regular-grid
+        # map, see closed_orbit.py -- ~100x faster than 'newton', identical
+        # orbit to ~1e-6), or 'centroid' (legacy averaging).
         self.solver = solver
+        # Seed the Cartesian Newton solver with the polar closed orbit. Without
+        # it the Newton iteration, started from the circle radius, can land on a
+        # degenerate off-centre orbit where nu_r dips towards 1 (pole edge).
+        self.polar_seed = polar_seed
+        self._eo_field = None          # lazily built CartesianMidplane
         self.symmetry_half_angle = np.deg2rad(symmetry_half_angle_deg)
         self.verbose = verbose
         self.pd = ParticleDistribution(species=design.species)
@@ -516,6 +525,40 @@ class SEOFinder:
     # so there is no residual betatron oscillation -- unlike the legacy
     # centroid-averaging finder in find_seo_at_radius.
     # ==================================================================
+    def _polar_field(self):
+        """CartesianMidplane view of the design's regular-grid midplane map
+        (None when the field is not a regular 2D grid map)."""
+        if self._eo_field is None:
+            from .closed_orbit import CartesianMidplane
+            try:
+                self._eo_field = CartesianMidplane.from_field(self.design.bfield)
+            except (ValueError, AttributeError, TypeError, KeyError):
+                self._eo_field = False
+        return self._eo_field or None
+
+    def _polar_closed_orbit(self, energy_kev: float, radius_m: float):
+        """Closed orbit at fixed energy from the polar integrator.
+
+        Returns the closed_orbits() dict (single entry) or None when the map is
+        not a regular grid or the orbit does not close.
+        """
+        fld = self._polar_field()
+        if fld is None:
+            return None
+        from .closed_orbit import closed_orbits, azimuthal_stats
+        # Seed at the scalloped hill radius r (1 + a_N / (N^2 - 1)), not at the
+        # nominal radius: near the pole edge a seed 5-8 cm inside the centred
+        # orbit converges onto a DISPLACED closed orbit of the nu_r = 1 family
+        # (tune 0, ~30 kHz off). Such orbits are flagged and rejected.
+        st = azimuthal_stats(fld, [radius_m])
+        x = float(st['a_dom'][0]) / max(st['n_dom'] ** 2 - 1.0, 1.0)
+        for r_seed in (radius_m * (1.0 + x), radius_m):
+            o = closed_orbits(fld, [energy_kev * 1e-3], self.design.species, [r_seed],
+                              n_steps=3600)
+            if o['converged'][0] and not o['displaced'][0]:
+                return o
+        return None
+
     def _v_from_energy_kev(self, energy_kev: float) -> float:
         """Particle speed [m/s] from kinetic energy [keV] (relativistic)."""
         gamma = energy_kev / 1000.0 / self.design.species.mass_mev + 1.0
@@ -572,12 +615,12 @@ class SEOFinder:
         col_v = np.array([pv[0] - r1, pv[1] - vr1]) / d_vr
         return np.column_stack([col_r, col_v]), r1, vr1, t_turn
 
-    def _newton_full_turn(self, r0, v_total, dt, max_steps, max_iter=15):
+    def _newton_full_turn(self, r0, v_total, dt, max_steps, max_iter=15, vr0=0.0):
         """2D Newton on (r, vr) for the one-turn fixed point.
 
         Returns (r, vr, t_turn, M, residual_m) or None.
         """
-        x = np.array([r0, 0.0])               # seed vr = 0 (symmetry-plane crossing)
+        x = np.array([r0, vr0])               # default seed vr = 0 (symmetry-plane crossing)
         M = r1 = vr1 = t_turn = None
         for _ in range(max_iter):
             jac = self._one_turn_jacobian(x[0], x[1], v_total, dt, max_steps)
@@ -638,9 +681,11 @@ class SEOFinder:
             Seed kinetic energy [keV] (e.g. from the Gordon method). If None, the
             energy is seeded from the rigidity p = q*<B>*R at this radius.
         solver : str, optional
-            'newton' or 'symmetric' (defaults to self.solver).
+            'newton', 'symmetric' or 'polar' (defaults to self.solver).
         do_final_tracking : bool
             Track 25 turns from the converged state for the stored trajectory.
+            With solver='polar' and do_final_tracking=False no tracking is done
+            at all (closure/frequency/tune come from the polar integrator).
         """
         solver = solver or self.solver
         radius_m = radius_mm / 1000.0
@@ -658,7 +703,41 @@ class SEOFinder:
                   + ("  [Gordon-seeded]" if energy_seed_kev is not None else ""))
             print(f"{'=' * 70}")
 
-        if solver == 'symmetric':
+        polar = None
+        if solver == 'polar' or (solver == 'newton' and self.polar_seed):
+            polar = self._polar_closed_orbit(energy_kev, radius_m)
+            if polar is None and solver == 'polar':
+                raise RuntimeError(f"Polar closed-orbit solve failed at R={radius_mm:.1f} mm "
+                                   "(no regular-grid 2D map, or no closed orbit)")
+
+        if solver == 'polar':
+            r_star = float(polar['r0'][0])
+            vr_star = float(v_total * polar['pr0'][0] / polar['brho'][0])
+            t_turn = float(polar['T_rev'][0])
+            M = None
+            nu_r = float(polar['nu_r'][0])
+            tune = (abs(nu_r - round(nu_r)) if np.isfinite(nu_r) else 0.0)
+            frequency = 1.0 / t_turn
+            if not do_final_tracking:
+                pos, vel = self._launch_state(r_star, vr_star, v_total)
+                if self.verbose:
+                    print(f"  polar: r* = {r_star * 1000:.4f} mm, f = {frequency / 1e6:.4f} MHz, "
+                          f"nu_r = {nu_r:.4f}, nu_z = {float(polar['nu_z'][0]):.4f}")
+                return StaticOrbit(
+                    radius_mm=radius_mm, energy_kev=energy_kev,
+                    b_field_avg=float(polar['B_avg_orbit'][0]),
+                    r0=pos, v0=vel, poincare_points=[], trajectory=None,
+                    is_closed=True, closure_error_mm=float(polar['residual_m'][0]) * 1e3,
+                    frequency_hz=frequency, tune=tune,
+                    metadata={'solver': 'polar', 'field_info': field_info,
+                              'turn_time_s': t_turn, 'transfer_matrix': None,
+                              'energy_seeded': energy_seed_kev is not None,
+                              'refined_radius_m': r_star, 'refined_vr_m_s': vr_star,
+                              'nu_r': nu_r, 'nu_z': float(polar['nu_z'][0]),
+                              'nu_z_sq': float(polar['nu_z_sq'][0]),
+                              'r_mean_m': float(polar['r_mean'][0]),
+                              'r_max_m': float(polar['r_max'][0])})
+        elif solver == 'symmetric':
             n_seg = max(1, int(round(2.0 * np.pi / self.symmetry_half_angle)))
             max_steps = int(self.steps_per_turn / n_seg * 2 + 20)
             sol = self._shoot_symmetric(radius_m, v_total, dt, self.symmetry_half_angle, max_steps)
@@ -671,13 +750,18 @@ class SEOFinder:
             M = jac[0] if jac is not None else None
         else:  # 'newton'
             max_steps = int(self.steps_per_turn * 1.5)
-            sol = self._newton_full_turn(radius_m, v_total, dt, max_steps)
+            r_seed, vr_seed = radius_m, 0.0
+            if polar is not None:
+                r_seed = float(polar['r0'][0])
+                vr_seed = float(v_total * polar['pr0'][0] / polar['brho'][0])
+            sol = self._newton_full_turn(r_seed, v_total, dt, max_steps, vr0=vr_seed)
             if sol is None:
                 raise RuntimeError(f"Newton SEO solve failed at R={radius_mm:.1f} mm")
             r_star, vr_star, t_turn, M, _ = sol
 
-        tune = (np.arccos(np.clip(np.trace(M) / 2.0, -1.0, 1.0)) / (2.0 * np.pi)
-                if M is not None else 0.0)
+        if solver != 'polar':
+            tune = (np.arccos(np.clip(np.trace(M) / 2.0, -1.0, 1.0)) / (2.0 * np.pi)
+                    if M is not None else 0.0)
         frequency = 1.0 / t_turn if t_turn else 0.0
 
         # Final tracking from the converged state (clean closed orbit -> tiny std).
@@ -717,6 +801,7 @@ class SEOFinder:
                 'energy_seeded': energy_seed_kev is not None,
                 'refined_radius_m': r_star,
                 'refined_vr_m_s': vr_star,
+                'polar_seeded': polar is not None,
             },
         )
 
