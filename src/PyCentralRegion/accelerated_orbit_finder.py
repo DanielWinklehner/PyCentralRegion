@@ -347,7 +347,8 @@ class AcceleratedOrbitFinder:
                          build_kwargs: Optional[dict] = None,
                          solve_kwargs: Optional[dict] = None,
                          field_kwargs: Optional[dict] = None,
-                         max_r_inner: Optional[float] = None):
+                         max_r_inner: Optional[float] = None,
+                         voltage_profile=None):
         """Solve the BEM gap field for the CURRENT cavity geometry (bem2d).
 
         Builds the closed dee/ground electrodes from the design's RF gaps,
@@ -362,12 +363,20 @@ class AcceleratedOrbitFinder:
         lands at or above it (the beam would cross gaps that have no
         electrodes there - no kick, fringe only).
 
+        ``voltage_profile`` (radial dee-voltage shape from the RF cavity
+        model, see ``gap_fields.VoltageProfile``): forwarded to the electrode
+        build; the cavity voltage stays the peak voltage at the profile's
+        reference radius. Same as ``build_kwargs['voltage_profile']``.
+
         Returns the TimedField; the full solution (surface charge, evaluators)
         is kept on ``self.bem_solution`` for diagnostics.
         """
         from .gap_fields import make_bem_efield
         if max_r_inner is not None:
             build_kwargs = {**(build_kwargs or {}), 'max_r_inner': max_r_inner}
+        if voltage_profile is not None:
+            build_kwargs = {**(build_kwargs or {}),
+                            'voltage_profile': voltage_profile}
         timed, solution = make_bem_efield(
             self.design, build_kwargs=build_kwargs, solve_kwargs=solve_kwargs,
             field_kwargs=field_kwargs, verbose=self.verbose)

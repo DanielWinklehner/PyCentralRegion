@@ -9,6 +9,7 @@ from .accelerated_orbit_finder import (AcceleratedOrbitFinder, OptimizedOrbit,
 from .cavity_optimizer import CavityGeometryOptimizer
 from . import diagnostics
 from . import gap_fields
+from .gap_fields import VoltageProfile
 from . import closed_orbit
 from .closed_orbit import (CartesianMidplane, PolarMidplane, closed_orbits,
                            orbits_at_radii)
@@ -32,6 +33,8 @@ __all__ = [
     'CavityGeometryOptimizer',
     # closed_orbit (Gordon polar closed-orbit solver)
     'CartesianMidplane', 'PolarMidplane', 'closed_orbits', 'orbits_at_radii',
+    # gap_fields (radial dee-voltage shape for the BEM Dirichlet data)
+    'VoltageProfile',
     # submodules
     'diagnostics', 'gap_fields', 'closed_orbit',
 ]

@@ -13,9 +13,19 @@ E = -grad(phi) as a PyPATools ``Field`` wrapped in a ``TimedField``:
 The per-gap 0/180 phase pattern of a dee system is folded into the STATIC
 potential signs (dee metal at -V*cos(entry_phase), ground at 0), which is exact
 for phases in {0, 180}: one static solve covers all gaps, and RF frequency /
-bunch-phase changes only re-modulate - no re-solve. Only GEOMETRY changes
-invalidate a solution, which is why attachment to a design is an explicit call
+bunch-phase changes only re-modulate - no re-solve. Only GEOMETRY changes (and
+a change of the radial voltage-profile SHAPE, see below) invalidate a solution,
+which is why attachment to a design is an explicit call
 (``AcceleratedOrbitFinder.attach_bem_field``).
+
+Radial voltage profile (``voltage_profile``): a resonant dee is not an
+equipotential at RF - the gap voltage varies with radius (standing wave along
+the dee / stem). The quasi-static model absorbs this as a radially varying
+Dirichlet value on the dee metal, phi_dee(r) = -V*cos(entry_phase) * scale(r),
+with the SHAPE scale(r) taken from the full RF cavity model (``VoltageProfile``:
+an (r, V) table normalized to 1 at a reference radius, so the cavity ``voltage``
+stays the peak voltage at that radius). Ground and post stay at 0. The
+amplitude still scales freely; only the shape needs a re-solve.
 
 2D model ("tall extrusion" limit): electrode footprints are extruded in z far
 beyond the gap width and the field is evaluated in the median plane only. The
@@ -831,9 +841,10 @@ def _ccw_width(chain_lo: np.ndarray, chain_hi: np.ndarray,
 # ============================================================================
 @dataclass
 class Wedge:
-    """One closed metal region (footprint) with a constant potential."""
-    kind: str                 # 'dee' or 'ground'
-    potential: float          # static Dirichlet value [V]
+    """One closed metal region (footprint) with a (reference) potential."""
+    kind: str                 # 'dee', 'ground' or 'post'
+    potential: float          # static Dirichlet value [V]; with a voltage_profile
+                              # the dee value AT r_ref (elements scale with r)
     chain_lo: np.ndarray      # (K, 2) boundary on the low-azimuth side
     chain_hi: np.ndarray      # (K, 2) boundary on the high-azimuth side
     polygon: np.ndarray = None            # closed 2D outline (set at mesh time)
@@ -988,6 +999,119 @@ def _mesh_wedge(cap: np.ndarray, z_levels: np.ndarray, open_inner: bool = False,
 
 
 # ============================================================================
+# Radial dee-voltage profile (shape of the Dirichlet data)
+# ============================================================================
+class VoltageProfile:
+    """Relative dee voltage vs radius, scale(r) = V(r) / V(r_ref).
+
+    A resonant dee is not an equipotential at RF: the gap voltage varies with
+    radius (standing wave along the dee / stem). ``build_gap_electrodes``
+    multiplies each dee element's Dirichlet value by ``scale(r)`` at the
+    element's centroid radius, so the cavity ``voltage`` remains the peak
+    voltage AT ``r_ref`` and the tabulated shape sets the rest. Ground and the
+    central post stay at 0. Laplace is linear, so the amplitude still scales
+    freely; only a change of the SHAPE needs a re-solve.
+
+    Parameters
+    ----------
+    r, v : array-like
+        Tabulated radius [m] and gap voltage (any unit - only the shape is
+        used), e.g. the gap-centerline voltage of the CST / COMSOL cavity
+        eigenmode. Unsorted input is sorted; duplicate radii are rejected.
+    r_ref : float, optional
+        Normalization radius [m], scale(r_ref) = 1. Default: the innermost
+        tabulated radius - the central region the design voltage refers to.
+
+    Outside the table the end values are HELD: below ``r_min`` the dee tips
+    are a lumped capacitance at the innermost voltage; above ``r_max`` the
+    profile is unknown (``build_gap_electrodes`` warns if the electrodes
+    extend past the table).
+    """
+
+    def __init__(self, r, v, r_ref: Optional[float] = None):
+        r = np.asarray(r, dtype=float).ravel()
+        v = np.asarray(v, dtype=float).ravel()
+        if r.size < 2 or r.shape != v.shape:
+            raise ValueError("VoltageProfile needs >= 2 (r, V) samples of equal length")
+        if not (np.all(np.isfinite(r)) and np.all(np.isfinite(v))):
+            raise ValueError("VoltageProfile: non-finite entries in the table")
+        if np.any(r < 0.0):
+            raise ValueError("VoltageProfile: negative radii in the table")
+        order = np.argsort(r)
+        r, v = r[order], v[order]
+        if np.any(np.diff(r) <= 0.0):
+            raise ValueError("VoltageProfile: duplicate radii in the table")
+        self.r_ref = float(r[0] if r_ref is None else r_ref)
+        v_ref = float(np.interp(self.r_ref, r, v))
+        if abs(v_ref) <= 1e-12 * float(np.max(np.abs(v))):
+            raise ValueError(f"VoltageProfile: V(r_ref = {self.r_ref:.4f} m) is zero")
+        scale = v / v_ref
+        if np.any(scale <= 0.0):
+            raise ValueError("VoltageProfile: the voltage changes sign (or vanishes) "
+                             "along the radius - a dee gap does not do that; "
+                             "check the table columns / units")
+        self.r = r
+        self.scale_tab = scale
+
+    @property
+    def r_min(self) -> float:
+        return float(self.r[0])
+
+    @property
+    def r_max(self) -> float:
+        return float(self.r[-1])
+
+    def __call__(self, r):
+        """scale(r) = V(r) / V(r_ref); end values held outside the table."""
+        return np.interp(np.asarray(r, dtype=float), self.r, self.scale_tab)
+
+    @classmethod
+    def from_file(cls, path, r_scale: float = 1.0,
+                  r_ref: Optional[float] = None, usecols=(0, 1),
+                  **loadtxt_kwargs) -> 'VoltageProfile':
+        """Two-column text table (radius, voltage).
+
+        ``r_scale`` converts the radius column to meters (1e-3 for a mm
+        export). Extra keyword arguments go to ``numpy.loadtxt``
+        (``delimiter``, ``skiprows``, ``comments``, ...).
+        """
+        data = np.atleast_2d(np.loadtxt(path, usecols=usecols, **loadtxt_kwargs))
+        return cls(data[:, 0] * r_scale, data[:, 1], r_ref=r_ref)
+
+    def __repr__(self) -> str:
+        return (f"VoltageProfile(r = {self.r_min * 1000:.1f}..{self.r_max * 1000:.1f} mm, "
+                f"r_ref = {self.r_ref * 1000:.1f} mm, scale = "
+                f"{self.scale_tab.min():.3f}..{self.scale_tab.max():.3f})")
+
+
+def _voltage_scale(voltage_profile):
+    """Normalize ``voltage_profile`` to (scale callable, info dict).
+
+    (None, None) if unset. Accepts a ``VoltageProfile``, an (N, 2) array of
+    (r [m], V) rows (wrapped with the default r_ref), or any vectorized
+    callable scale(r) used as-is (the caller owns its normalization).
+    """
+    if voltage_profile is None:
+        return None, None
+    if isinstance(voltage_profile, VoltageProfile):
+        prof = voltage_profile
+    elif callable(voltage_profile):
+        name = getattr(voltage_profile, '__name__', type(voltage_profile).__name__)
+        return voltage_profile, {'kind': 'callable', 'name': name,
+                                 'r_ref': None, 'r_min': None, 'r_max': None}
+    else:
+        arr = np.asarray(voltage_profile, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            raise ValueError("voltage_profile must be a VoltageProfile, a callable "
+                             "scale(r), or an (N, 2) array of (r [m], V) rows")
+        prof = VoltageProfile(arr[:, 0], arr[:, 1])
+    return prof, {'kind': 'table', 'r_ref': prof.r_ref, 'r_min': prof.r_min,
+                  'r_max': prof.r_max,
+                  'scale_range': (float(prof.scale_tab.min()),
+                                  float(prof.scale_tab.max()))}
+
+
+# ============================================================================
 # Dee-system -> electrode model
 # ============================================================================
 def _check_phase(deg: float, targets=(0.0, 180.0), tol: float = 1e-3) -> float:
@@ -1015,6 +1139,7 @@ def build_gap_electrodes(design_or_cavities,
                          trim_trajectory: Optional[np.ndarray] = None,
                          traj_tip_clearance: Optional[float] = None,
                          fillet_radius: Optional[float] = None,
+                         voltage_profile=None,
                          verbose: bool = True) -> ElectrodeModel:
     """Closed dee/ground solids from a dee system's RF gaps.
 
@@ -1088,8 +1213,20 @@ def build_gap_electrodes(design_or_cavities,
         Opt-in corner fillets: interior kinks of the boundary chains (segment
         node jogs, taper kinks, spoke junctions) are replaced by tangent arcs
         of this radius [m] (auto-reduced where adjacent edges are short).
+    voltage_profile : VoltageProfile, (N, 2) array or callable, optional
+        Radial dee-voltage SHAPE scale(r) from the RF cavity model (see
+        ``VoltageProfile``): every dee element's Dirichlet value is multiplied
+        by scale(r) at its centroid radius, so the cavity voltage is the peak
+        voltage at the profile's reference radius and the gap voltage follows
+        the cavity outward. An (N, 2) table is (r [m], V) rows with the
+        default reference (innermost radius); a callable is used as-is
+        (vectorized, caller-normalized). Ground and post stay at 0. Recorded
+        in ``params['voltage_profile']``; warns if the dee electrodes extend
+        beyond a tabulated profile (outermost value held there).
     """
     cavities = getattr(design_or_cavities, 'rf_cavities', design_or_cavities)
+    v_scale, v_info = _voltage_scale(voltage_profile)
+    r_dee_lo, r_dee_hi = np.inf, 0.0
     n = len(cavities)
     if n < 2 or n % 2 != 0:
         raise ValueError(f"need an even number of gaps (entry/exit per dee), got {n}")
@@ -1434,10 +1571,21 @@ def build_gap_electrodes(design_or_cavities,
         w.polygon = polygon
         all_verts.append(verts)
         all_tris.append(tris + v_offset)
-        all_pots.append(np.full(len(tris), w.potential))
+        pots = np.full(len(tris), w.potential)
+        pot_txt = f"{w.potential:+9.1f} V"
+        if w.kind == 'dee':
+            r_v = np.hypot(verts[:, 0], verts[:, 1])
+            r_dee_lo, r_dee_hi = min(r_dee_lo, r_v.min()), max(r_dee_hi, r_v.max())
+            if v_scale is not None:
+                # DP0 Dirichlet data: one value per element, taken at the
+                # element centroid radius (caps and walls alike)
+                cen = verts[tris].mean(axis=1)
+                pots = pots * v_scale(np.hypot(cen[:, 0], cen[:, 1]))
+                pot_txt = f"{pots.min():+9.1f}..{pots.max():+9.1f} V"
+        all_pots.append(pots)
         v_offset += len(verts)
         if verbose:
-            print(f"[gap_fields]   {w.label:>14s} ({w.kind:6s}) @ {w.potential:+9.1f} V: "
+            print(f"[gap_fields]   {w.label:>14s} ({w.kind:6s}) @ {pot_txt}: "
                   f"{len(tris):5d} tris, cap grid {cap.shape[0]}x{cap.shape[1]}")
 
     # --- grounded central post hub (stitched to the spokes) --------------------
@@ -1495,8 +1643,29 @@ def build_gap_electrodes(design_or_cavities,
                 'scroll_closure': (('seam' if special is not None else
                                     'wrap-arc' if wrap_iw is not None else
                                     'step') if scroll_mode else None),
-                'fillet_radius': fillet_radius},
+                'fillet_radius': fillet_radius,
+                'voltage_profile': v_info},
     )
+
+    # voltage-profile coverage (tabulated profiles only)
+    if v_info is not None and v_info['r_max'] is not None:
+        if r_dee_hi > v_info['r_max'] + 1e-3:
+            warnings.warn(
+                f"dee electrodes extend to r = {r_dee_hi * 1000:.1f} mm but the "
+                f"voltage profile is tabulated only to {v_info['r_max'] * 1000:.1f} mm; "
+                f"the outermost value is held beyond the table", stacklevel=2)
+        if verbose and r_dee_lo < v_info['r_min'] - 1e-3:
+            print(f"[gap_fields] voltage profile: innermost tabulated value held "
+                  f"below r = {v_info['r_min'] * 1000:.1f} mm (dee tips reach "
+                  f"{r_dee_lo * 1000:.1f} mm)")
+    if verbose and v_info is not None:
+        if v_info['kind'] == 'table':
+            print(f"[gap_fields] voltage profile: scale "
+                  f"{v_info['scale_range'][0]:.3f}..{v_info['scale_range'][1]:.3f} "
+                  f"over r = {v_info['r_min'] * 1000:.1f}..{v_info['r_max'] * 1000:.1f} mm, "
+                  f"reference (scale = 1) at {v_info['r_ref'] * 1000:.1f} mm")
+        else:
+            print(f"[gap_fields] voltage profile: callable {v_info['name']}")
 
     # degenerate-element guard
     v = model.vertices
