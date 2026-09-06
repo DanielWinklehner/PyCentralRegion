@@ -364,19 +364,36 @@ class AcceleratedOrbitFinder:
         electrodes there - no kick, fringe only).
 
         ``voltage_profile`` (radial dee-voltage shape from the RF cavity
-        model, see ``gap_fields.VoltageProfile``): forwarded to the electrode
-        build; the cavity voltage stays the peak voltage at the profile's
-        reference radius. Same as ``build_kwargs['voltage_profile']``.
+        model, see ``gap_fields.VoltageProfile``): by default the profile
+        already installed on the design's cavities
+        (``CentralRegion.set_voltage_profile``) is used, so the thin-gap kicks
+        and the BEM Dirichlet data share ONE object. An explicit argument is
+        installed on the cavities first (same as calling
+        ``set_voltage_profile`` beforehand), so a later thin-gap run agrees
+        with this field. ``build_kwargs['voltage_profile']`` is a BEM-only
+        override that leaves the cavities alone (giving both raises). The
+        cavity voltage stays the peak voltage at the profile's reference
+        radius either way.
 
         Returns the TimedField; the full solution (surface charge, evaluators)
         is kept on ``self.bem_solution`` for diagnostics.
         """
         from .gap_fields import make_bem_efield
+        build_kwargs = dict(build_kwargs or {})
         if max_r_inner is not None:
-            build_kwargs = {**(build_kwargs or {}), 'max_r_inner': max_r_inner}
-        if voltage_profile is not None:
-            build_kwargs = {**(build_kwargs or {}),
-                            'voltage_profile': voltage_profile}
+            build_kwargs['max_r_inner'] = max_r_inner
+        if 'voltage_profile' in build_kwargs:
+            if voltage_profile is not None:
+                raise ValueError("pass voltage_profile either as the argument "
+                                 "(installed on the cavities too) or in "
+                                 "build_kwargs (BEM-only), not both")
+        else:
+            if voltage_profile is not None:
+                voltage_profile = self.design.set_voltage_profile(voltage_profile)
+            else:
+                voltage_profile = self.design.get_voltage_profile()
+            if voltage_profile is not None:
+                build_kwargs['voltage_profile'] = voltage_profile
         timed, solution = make_bem_efield(
             self.design, build_kwargs=build_kwargs, solve_kwargs=solve_kwargs,
             field_kwargs=field_kwargs, verbose=self.verbose)

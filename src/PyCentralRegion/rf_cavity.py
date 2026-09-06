@@ -61,6 +61,10 @@ class RFCavity:
     segment_radii : list of float, optional
         Outer radius for each segment [m]
         Must be monotonically increasing: r_min < r0 < r1 < ... < r_max
+    voltage_profile : VoltageProfile, (N, 2) array or callable, optional
+        Radial dee-voltage SHAPE scale(r): the kick voltage at a crossing of
+        radius r is ``voltage * scale(r)`` (see ``set_voltage_profile``).
+        Default None = uniform ``voltage`` at every radius.
 
     Examples
     --------
@@ -96,7 +100,8 @@ class RFCavity:
                  segment_radii: Optional[List[float]] = None,
                  segment_rotations: Optional[List[float]] = None,
                  gap_width_inner: Optional[float] = None,
-                 gap_taper_radius: Optional[float] = None):
+                 gap_taper_radius: Optional[float] = None,
+                 voltage_profile=None):
 
         self.r_min = r_min
         self.r_max = r_max
@@ -124,6 +129,13 @@ class RFCavity:
                                  f"r_max={r_max})")
         self.gap_width_inner = gap_width_inner
         self.gap_taper_radius = gap_taper_radius
+
+        # Optional radial dee-voltage profile: the kick voltage becomes
+        # voltage * scale(r) at the crossing radius (see set_voltage_profile).
+        self._voltage_profile = None
+        self._voltage_scale = None
+        if voltage_profile is not None:
+            self.set_voltage_profile(voltage_profile)
 
         # Variable segments. `segment_rotations` rotates each variable segment
         # about its own MIDPOINT (deg, CCW) after the chain is laid out - the
@@ -322,6 +334,57 @@ class RFCavity:
         w = self.gap_width_inner + frac * (self.gap_width - self.gap_width_inner)
         return float(w) if np.isscalar(r) else w
 
+    # ------------------------------------------------------------------
+    # Radial dee-voltage profile
+    # ------------------------------------------------------------------
+    def set_voltage_profile(self, voltage_profile):
+        """Set (or clear, with None) the radial dee-voltage profile.
+
+        A resonant dee is not an equipotential at RF: the gap voltage varies
+        with radius (standing wave along the dee / stem). With a profile the
+        thin-gap kick uses ``voltage * scale(r)`` at the crossing radius, where
+        scale(r) is the SAME shape the BEM electrode build applies to the dee
+        Dirichlet data (``gap_fields.VoltageProfile``, normalized to 1 at its
+        reference radius - ``voltage`` stays the peak voltage there).
+
+        Accepts the same forms as ``build_gap_electrodes(voltage_profile=...)``:
+        a ``VoltageProfile``, an (N, 2) array of (r [m], V) rows (wrapped with
+        the default reference, the innermost radius), or a vectorized callable
+        scale(r) used as-is (the caller owns its normalization). Hand ONE
+        object to both stages - ``CentralRegion.set_voltage_profile`` installs
+        it on every cavity and ``AcceleratedOrbitFinder.attach_bem_field``
+        picks it up from there - so the thin-gap and bem2d models agree.
+        """
+        from .gap_fields import _voltage_scale
+        scale, _ = _voltage_scale(voltage_profile)
+        # Keep the NORMALIZED object (a table is wrapped in a VoltageProfile),
+        # so what the BEM build receives is exactly what the kick evaluates.
+        self._voltage_profile = scale
+        self._voltage_scale = scale
+
+    @property
+    def voltage_profile(self):
+        """Installed radial dee-voltage profile (None = uniform voltage)."""
+        return getattr(self, '_voltage_profile', None)
+
+    @voltage_profile.setter
+    def voltage_profile(self, voltage_profile):
+        self.set_voltage_profile(voltage_profile)
+
+    def voltage_at(self, r):
+        """Peak gap voltage [V] at radius ``r`` (scalar or array).
+
+        ``voltage * scale(r)`` with the installed profile; the uniform
+        ``voltage`` everywhere without one.
+        """
+        scale = getattr(self, '_voltage_scale', None)
+        if scale is None:
+            if np.isscalar(r):
+                return self.voltage
+            return np.full(np.shape(r), self.voltage, dtype=float)
+        v = self.voltage * scale(r)
+        return float(v) if np.isscalar(r) else v
+
     def check_crossing(self, r_old: np.ndarray, r_new: np.ndarray) -> Tuple[bool, Optional[float], Optional[int]]:
         """
         Check if particle crosses any segment of the cavity.
@@ -450,6 +513,8 @@ class RFCavity:
         gap line unchanged. The conserved/added split therefore uses the crossed
         segment's own orientation (``segment_ids``), so varying the segment
         geometry changes the kick - not just where the particle crosses.
+        The kick voltage is ``voltage_at(r_crossing)``: the uniform ``voltage``
+        or, with a radial profile installed, ``voltage * scale(r)``.
 
         All beta*gamma <-> velocity conversions are done locally from the TOTAL
         speed |v| (norm-based), avoiding both the component-wise error in the
@@ -495,9 +560,17 @@ class RFCavity:
         omega_tau_half = self.omega * transit_time / 2.0
         ttf = np.sin(omega_tau_half) / omega_tau_half
 
-        # Energy gain at the crossing.
+        # Energy gain at the crossing. With a radial voltage profile the gap
+        # voltage is voltage * scale(r) at the crossing radius - the same
+        # scale(r) the BEM build applies to the dee Dirichlet data. Without one
+        # the expression is the unchanged uniform-voltage kick (getattr: cavities
+        # unpickled from older designs have no profile attributes).
         total_phase = self.get_total_phase_rad()
-        d_e_mev = 1e-6 * design.species.q * self.voltage * ttf * np.cos(
+        v_gap = self.voltage
+        v_scale = getattr(self, '_voltage_scale', None)
+        if v_scale is not None:
+            v_gap = self.voltage * v_scale(r_crossing)
+        d_e_mev = 1e-6 * design.species.q * v_gap * ttf * np.cos(
             self.omega * t_cavity + total_phase
         )
 
@@ -589,13 +662,14 @@ class RFCavity:
 
     def __str__(self):
         total_phase = self.get_total_phase_deg()
+        prof = "" if self.voltage_profile is None else ", V(r) profile"
         if self.n_variable_segments == 0:
             return (f"RFCavity: {self.voltage / 1000:.1f} kV @ {self.frequency / 1e6:.1f} MHz, "
-                    f"angle={self.base_angle:.1f}°, phase={total_phase:.1f}°")
+                    f"angle={self.base_angle:.1f}°, phase={total_phase:.1f}°{prof}")
         else:
             return (f"RFCavity: {self.voltage / 1000:.1f} kV @ {self.frequency / 1e6:.1f} MHz, "
                     f"base_angle={self.base_angle:.1f}°, {self.n_variable_segments} variable segments, "
-                    f"phase={total_phase:.1f}°")
+                    f"phase={total_phase:.1f}°{prof}")
 
 
 # ============================================================================

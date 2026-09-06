@@ -214,6 +214,67 @@ class CentralRegion:
             print(f"Set RF frequency to {self.rf_cavities[0].harmonic * freq_hz / 1e6:.6f} MHz "
                   f"({freq_hz / 1e6:.6f} MHz base, harmonic {self.rf_cavities[0].harmonic}) for {len(self.rf_cavities)} cavities")
 
+    def set_voltage_profile(self, voltage_profile):
+        """
+        Set the radial dee-voltage profile on all RF cavities.
+
+        A resonant dee is not an equipotential at RF; the gap voltage varies
+        with radius. With a profile the thin-gap kicks use
+        ``voltage * scale(r)`` at each crossing radius, the same shape the
+        BEM electrode build applies to the dee Dirichlet data
+        (``gap_fields.VoltageProfile``). The table form is normalized ONCE
+        here so every cavity holds the same object, which
+        ``AcceleratedOrbitFinder.attach_bem_field`` picks up by default - the
+        two gap models then share one profile.
+
+        Parameters
+        ----------
+        voltage_profile : VoltageProfile, (N, 2) array, callable or None
+            ``gap_fields.VoltageProfile``; an (N, 2) table of (r [m], V) rows
+            (default reference = innermost radius); a vectorized callable
+            scale(r) used as-is; or None to restore the uniform voltage.
+
+        Returns
+        -------
+        profile
+            The (normalized) profile object installed on the cavities
+            (None when cleared).
+        """
+        from .gap_fields import _voltage_scale
+        profile, info = _voltage_scale(voltage_profile)
+        for cavity in self.rf_cavities:
+            cavity.set_voltage_profile(profile)
+
+        if len(self.rf_cavities) > 0 and getattr(self, 'verbose', True):
+            if profile is None:
+                what = "cleared (uniform voltage)"
+            elif info['kind'] == 'table':
+                what = (f"scale {info['scale_range'][0]:.3f}..{info['scale_range'][1]:.3f} "
+                        f"over r = {info['r_min'] * 1000:.1f}..{info['r_max'] * 1000:.1f} mm, "
+                        f"reference at {info['r_ref'] * 1000:.1f} mm")
+            else:
+                what = f"callable {info['name']}"
+            print(f"Set voltage profile: {what} for {len(self.rf_cavities)} cavities")
+        return profile
+
+    def get_voltage_profile(self):
+        """
+        The radial dee-voltage profile shared by all RF cavities.
+
+        Returns None when no profile is installed (or there are no cavities).
+        Raises ValueError if the cavities carry DIFFERENT profile objects -
+        the BEM build takes one shape for the whole dee system, so install it
+        for all with ``set_voltage_profile``.
+        """
+        profiles = [cavity.voltage_profile for cavity in self.rf_cavities]
+        if not profiles:
+            return None
+        first = profiles[0]
+        if any(p is not first for p in profiles[1:]):
+            raise ValueError("RF cavities carry different voltage profiles; install "
+                             "one for all with CentralRegion.set_voltage_profile")
+        return first
+
     # ========================================================================
     # Species & Beam
     # ========================================================================
@@ -409,7 +470,8 @@ class CentralRegion:
         print(f"Electric Field: {self.efield if self.efield else 'Not set'}")
         print(f"\nRF Cavities: {len(self.rf_cavities)}")
         for i, cavity in enumerate(self.rf_cavities):
-            print(f"  {i}: {cavity.voltage / 1000:.1f} kV @ {cavity.frequency / 1e6:.1f} MHz")
+            prof = "" if cavity.voltage_profile is None else " (V(r) profile)"
+            print(f"  {i}: {cavity.voltage / 1000:.1f} kV @ {cavity.frequency / 1e6:.1f} MHz{prof}")
         print(f"\nIon Species: {self.species.name if self.species else 'Not set'}")
         print(f"Initial Beam: {self.beam.numpart if self.beam else 0} particles")
         print(f"\nExtraction Radius: {self.geometry.get('extraction_radius', 'Not set')}")
