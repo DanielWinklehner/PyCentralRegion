@@ -47,8 +47,12 @@ Geometry notes:
    (a single-dee system has a ~315 deg ground wedge) without folding.
 
 Part of: PyCentralRegion module. bempp_cl is imported lazily inside the solve
-functions so it stays an optional dependency (first solve pays a one-time
-numba JIT of ~13 s per process).
+functions so it stays an optional dependency. Backends (``solve_gap_field``):
+dense assembly runs on OpenCL (CPU device) when pyopencl is available -
+measured ~8x faster than the numba fallback - and the linear solve is a
+Jacobi-preconditioned restarted GMRES on cupy when the dense matrix fits the
+GPU, on scipy otherwise (the first solve per process pays a few seconds of
+kernel compile / JIT).
 """
 
 import time
@@ -1684,13 +1688,115 @@ def build_gap_electrodes(design_or_cavities,
 # ============================================================================
 # BEM solve + field extraction
 # ============================================================================
-def _bempp():
+_OPENCL_CPU_OK: Optional[bool] = None
+
+
+def _bempp(device_interface: str = 'auto'):
+    """Import bempp_cl.api with the dense-assembly backend selected.
+
+    'auto': OpenCL when pyopencl AND a CPU OpenCL platform are available
+    (measured ~8x faster assembly than numba on the Intel CPU runtime),
+    otherwise numba. 'opencl' / 'numba' force the choice. GPU assembly is
+    never selected: fp64 on consumer GPUs is far slower than the CPU runtime
+    (80 s vs 1.1 s at 9.4k elements). The potential evaluation
+    (``GapFieldSolution.potential``) follows the same setting.
+    """
+    global _OPENCL_CPU_OK
     import bempp_cl.api as bempp
-    try:
-        import pyopencl  # noqa: F401
-    except ImportError:
-        bempp.DEFAULT_DEVICE_INTERFACE = "numba"
+    if device_interface == 'auto':
+        if _OPENCL_CPU_OK is None:
+            try:
+                import pyopencl  # noqa: F401
+                from bempp_cl.core.opencl_kernels import default_cpu_device
+                default_cpu_device()
+                _OPENCL_CPU_OK = True
+            except Exception:
+                _OPENCL_CPU_OK = False
+        device_interface = 'opencl' if _OPENCL_CPU_OK else 'numba'
+    if device_interface not in ('opencl', 'numba'):
+        raise ValueError("device_interface must be 'auto', 'opencl' or 'numba', "
+                         f"got {device_interface!r}")
+    bempp.DEFAULT_DEVICE_INTERFACE = device_interface
+    bempp.BOUNDARY_OPERATOR_DEVICE_TYPE = 'cpu'
+    bempp.POTENTIAL_OPERATOR_DEVICE_TYPE = 'cpu'
     return bempp
+
+
+def _dense_matrix(discrete_op) -> Optional[np.ndarray]:
+    """Dense ndarray behind a bempp discrete operator (dense assembly only)."""
+    for attr in ('_A', 'A'):
+        mat = getattr(discrete_op, attr, None)
+        if mat is not None:
+            arr = np.asarray(mat)
+            if arr.ndim == 2:
+                return arr
+    return None
+
+
+def _gpu_fits(n: int, restart: int, safety: float = 1.25) -> Tuple[bool, str]:
+    """Whether an n x n float64 matrix plus GMRES workspace fits in free GPU memory."""
+    try:
+        import cupy as cp
+        free, total = cp.cuda.Device().mem_info
+    except Exception as exc:                      # no cupy / no device / driver error
+        return False, f"cupy unavailable ({type(exc).__name__}: {exc})"
+    need = safety * 8.0 * float(n) * float(n) + 16.0 * (restart + 2) * float(n)
+    if need > free:
+        return False, (f"dense matrix needs {need / 2**30:.1f} GB, GPU has "
+                       f"{free / 2**30:.1f} GB free")
+    return True, f"{need / 2**30:.1f} GB of {free / 2**30:.1f} GB free"
+
+
+def _gmres_jacobi(weak_form, rhs: np.ndarray, tol: float, restart: int,
+                  maxiter: int, use_gpu: bool):
+    """Jacobi-preconditioned restarted GMRES on the dense weak-form matrix.
+
+    Ported from spyral_inflector.bempp_gmres_wrapper. The Laplace single-layer
+    matrix is badly scaled (its diagonal spans orders of magnitude with the
+    element size), and dividing the diagonal out roughly halves the iteration
+    count versus the mass-matrix strong form. ``maxiter`` counts INNER
+    iterations for both backends. Returns (x, info, residuals, n_reported):
+    scipy reports one residual per inner iteration, cupy one per restart cycle
+    (it always runs full cycles of ``restart`` matrix-vector products).
+    """
+    a = _dense_matrix(weak_form)
+    if a is None:
+        raise RuntimeError("Jacobi GMRES needs the dense weak-form matrix "
+                           "(dense assembly only)")
+    diag = np.diag(a).copy()
+    if not np.all(np.isfinite(diag)) or np.any(diag == 0.0):
+        raise RuntimeError("weak-form diagonal has zero / non-finite entries")
+    residuals: List[float] = []
+
+    def callback(res):
+        residuals.append(float(res))
+
+    if use_gpu:
+        import cupy as cp
+        import cupyx.scipy.sparse.linalg as cu_linalg
+        a_gpu = cp.asarray(a, dtype=cp.float64)
+        b_gpu = cp.asarray(rhs, dtype=cp.float64)
+        d_gpu = cp.asarray(diag, dtype=cp.float64)
+        precond = cu_linalg.LinearOperator(a.shape, matvec=lambda v: v / d_gpu,
+                                           dtype=cp.float64)
+        x_gpu, info = cu_linalg.gmres(a_gpu, b_gpu, rtol=tol, atol=0.0,
+                                      restart=restart, maxiter=maxiter, M=precond,
+                                      callback=callback, callback_type='pr_norm')
+        x = cp.asnumpy(x_gpu)
+        del a_gpu, b_gpu, d_gpu, x_gpu, precond
+        cp.get_default_memory_pool().free_all_blocks()   # hand the N^2 block back
+    else:
+        import scipy.sparse.linalg as spla
+        precond = spla.LinearOperator(a.shape, matvec=lambda v: v / diag, dtype=float)
+        n_cycles = max(1, int(np.ceil(maxiter / restart)))
+        x, info = spla.gmres(a, rhs, rtol=tol, atol=0.0, restart=restart,
+                             maxiter=n_cycles, M=precond, callback=callback,
+                             callback_type='pr_norm')
+    x = np.asarray(x).ravel()
+    # the callbacks report PRECONDITIONED norms (scipy: absolute); store the
+    # true relative residual of the returned solution as the last entry
+    residuals.append(float(np.linalg.norm(a @ x - rhs) / np.linalg.norm(rhs)))
+    return x, int(info), residuals, len(residuals) - 1
 
 
 @dataclass
@@ -1701,7 +1807,11 @@ class GapFieldSolution:
     neumann: object
     gmres_info: int
     solve_time_s: float
-    n_iterations: int = 0
+    n_iterations: int = 0          # scipy/strong: inner iterations; cupy: restart cycles
+    solver: str = ''               # 'cupy' | 'scipy' | 'strong'
+    device_interface: str = ''     # dense-assembly backend: 'opencl' | 'numba'
+    assembly_time_s: float = 0.0
+    final_residual: float = float('nan')
 
     def potential(self, pts: np.ndarray, chunk: int = 50000,
                   verbose: bool = False) -> np.ndarray:
@@ -1793,54 +1903,115 @@ class GapFieldSolution:
 def solve_gap_field(model: ElectrodeModel,
                     tol: float = 1e-5,
                     maxiter: int = 20000,
-                    restart: int = 1000,
+                    restart: Optional[int] = None,
+                    solver: str = 'auto',
+                    device_interface: str = 'auto',
                     verbose: bool = True) -> GapFieldSolution:
     """Laplace Dirichlet solve (DP0 / single-layer / GMRES) on the model.
 
-    Uses the STRONG form (mass-matrix preconditioned) - the plain weak-form
-    first-kind system stalls at these element counts / size ratios. bempp
-    passes a callback to scipy, which puts scipy's gmres in 'legacy' mode:
-    ``maxiter`` counts INNER iterations, not restart cycles.
+    Parameters
+    ----------
+    tol : float
+        Relative residual tolerance of the GMRES.
+    maxiter : int
+        Maximum number of INNER GMRES iterations (matrix-vector products).
+    restart : int, optional
+        Restart depth. Default 200 for the Jacobi solvers (measured optimum
+        on the spiral-inflector and dee meshes), 1000 for ``solver='strong'``.
+    solver : {'auto', 'cupy', 'scipy', 'strong'}
+        'cupy'   Jacobi-preconditioned GMRES on the GPU. The dense N x N
+                 float64 matrix is copied to the device, so it needs about
+                 8 N^2 bytes of free GPU memory (~38k elements on a 16 GB
+                 card with 3 GB in use by other jobs).
+        'scipy'  the same algorithm on the CPU.
+        'strong' the original path: bempp's scipy GMRES on the mass-matrix
+                 preconditioned strong form (kept for regression; about 2x
+                 the iterations of Jacobi, ~5x slower than cupy at 27k).
+        'auto'   'cupy' when it is importable and the matrix fits the free
+                 GPU memory, else 'scipy'.
+    device_interface : {'auto', 'opencl', 'numba'}
+        Dense-assembly backend (see ``_bempp``): 'auto' takes OpenCL on the
+        CPU device when pyopencl and a CPU OpenCL platform exist, else numba.
+
+    Measured on the single-dee model with 27k elements (10 numba threads,
+    other jobs running): assembly numba 38 s / OpenCL-CPU 4.9 s; solve strong
+    39 s (303 it) / scipy+Jacobi 18 s (148 it) / cupy+Jacobi 8 s. All three
+    solvers agree to 5 digits in the potential.
 
     The iteration count is set by conditioning, which degrades sharply with
     thin metal features (opposite faces of a thin fin carry near-canceling
     charge - intrinsically hard for the first-kind single-layer operator).
-    Measured on the same ~27k-element scroll geometry: 792 iterations at
-    min_metal_width = 2 mm vs 9641 at 1 mm. tol 1e-5 is comfortable: field
-    accuracy is mesh-limited at ~0.3%, well above the residual.
+    Measured on a ~27k-element scroll geometry with the strong form: 792
+    iterations at min_metal_width = 2 mm vs 9641 at 1 mm. tol 1e-5 is
+    comfortable: field accuracy is mesh-limited at ~0.3%, well above the
+    residual.
     """
-    bempp = _bempp()
+    if solver not in ('auto', 'cupy', 'scipy', 'strong'):
+        raise ValueError("solver must be 'auto', 'cupy', 'scipy' or 'strong', "
+                         f"got {solver!r}")
+    bempp = _bempp(device_interface)
     from bempp_cl.api.operators.boundary import laplace as lap_bnd
-    from bempp_cl.api.linalg import gmres
 
     grid = bempp.Grid(model.vertices.T.copy(),
                       model.triangles.T.astype(np.uint32).copy())
     space = bempp.function_space(grid, "DP", 0)
+    n = int(space.global_dof_count)
     dirichlet = bempp.GridFunction(space, coefficients=model.potentials.astype(float))
     slp = lap_bnd.single_layer(space, space, space)
 
     t0 = time.time()
-    neumann, info, residuals, n_iter = gmres(
-        slp, dirichlet, tol=tol, maxiter=maxiter, restart=restart,
-        use_strong_form=True, return_residuals=True,
-        return_iteration_count=True)
+    weak = slp.weak_form()               # dense assembly (cached on the operator)
+    t_asm = time.time() - t0
+    backend = str(bempp.DEFAULT_DEVICE_INTERFACE)
+    if verbose:
+        print(f"[gap_fields] assembled {n} x {n} single-layer matrix in "
+              f"{t_asm:.1f} s ({backend})")
+
+    if restart is None:
+        restart = 1000 if solver == 'strong' else 200
+    if solver in ('auto', 'cupy'):
+        fits, why = _gpu_fits(n, restart)
+        if solver == 'cupy' and not fits:
+            raise RuntimeError(f"solver='cupy' requested but {why}")
+        if solver == 'auto':
+            solver = 'cupy' if fits else 'scipy'
+            if verbose and not fits:
+                print(f"[gap_fields] cupy solver not used: {why}")
+
+    t0 = time.time()
+    if solver == 'strong':
+        from bempp_cl.api.linalg import gmres
+        neumann, info, residuals, n_iter = gmres(
+            slp, dirichlet, tol=tol, maxiter=maxiter, restart=restart,
+            use_strong_form=True, return_residuals=True,
+            return_iteration_count=True)
+        residuals = list(residuals)
+    else:
+        rhs = dirichlet.projections(slp.dual_to_range)
+        x, info, residuals, n_iter = _gmres_jacobi(
+            weak, rhs, tol=tol, restart=restart, maxiter=maxiter,
+            use_gpu=(solver == 'cupy'))
+        neumann = bempp.GridFunction(space, coefficients=x)
     dt = time.time() - t0
     if info != 0:
         last = residuals[-1] if len(residuals) else float('nan')
         raise RuntimeError(
-            f"gap-field GMRES did not converge (info={info}, tol={tol}, "
-            f"maxiter={maxiter}, residual reached {last:.2e}). Slowly "
-            f"grinding convergence usually means thin-feature conditioning: "
-            f"raise maxiter or increase min_metal_width (thin fins are "
-            f"intrinsically hard for this operator). A hard stall at O(0.1+) "
-            f"residual points to intersecting/overlapping electrode "
+            f"gap-field GMRES ({solver}) did not converge (info={info}, "
+            f"tol={tol}, maxiter={maxiter}, residual reached {last:.2e}). "
+            f"Slowly grinding convergence usually means thin-feature "
+            f"conditioning: raise maxiter or increase min_metal_width (thin "
+            f"fins are intrinsically hard for this operator). A hard stall at "
+            f"O(0.1+) residual points to intersecting/overlapping electrode "
             f"surfaces instead.")
     if verbose:
-        print(f"[gap_fields] GMRES solved {space.global_dof_count} DOFs "
-              f"in {dt:.1f} s ({n_iter} iterations)")
-    return GapFieldSolution(model=model, space=space, neumann=neumann,
-                            gmres_info=info, solve_time_s=dt,
-                            n_iterations=int(n_iter))
+        unit = "restart cycles" if solver == 'cupy' else "iterations"
+        print(f"[gap_fields] GMRES ({solver}) solved {n} DOFs in {dt:.1f} s "
+              f"({n_iter} {unit})")
+    return GapFieldSolution(
+        model=model, space=space, neumann=neumann, gmres_info=int(info),
+        solve_time_s=dt, n_iterations=int(n_iter), solver=solver,
+        device_interface=backend, assembly_time_s=t_asm,
+        final_residual=float(residuals[-1]) if len(residuals) else float('nan'))
 
 
 def make_bem_efield(design,
