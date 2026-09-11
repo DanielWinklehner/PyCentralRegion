@@ -436,11 +436,24 @@ class AcceleratedOrbitFinder:
         static field was attached: the zero field of the thin-gap model or the
         last TimedField) superposed with the attached static fields
         (``static_efields``: the inflector's map) as ``design.efield``."""
-        from .inflector import superpose_efield
+        from .inflector import superpose_efield, StaticPlusRFField
+        from PyPATools.field import CompositeField
         if rf_field is not None:
             self._base_efield = rf_field
         elif self._base_efield is None:
-            self._base_efield = self.design.efield
+            # first install on this finder: the design's field may already be
+            # a superposition made by ANOTHER finder on the same design
+            # (build helpers attach the inflector, then create a second finder)
+            # - strip our own statics so they are not counted twice
+            ef = self.design.efield
+            mine = [id(s) for s in self.static_efields]
+            if ef is not None and id(ef) in mine:
+                ef = Field.zero()
+            elif isinstance(ef, StaticPlusRFField):
+                ef = ef.rf if ef.rf is not None else Field.zero()
+            elif isinstance(ef, CompositeField) and mine and all(id(p) in mine for p in ef.fields):
+                ef = Field.zero()
+            self._base_efield = ef
         base = self._base_efield
         if self.static_efields:
             self.design.set_electric_field(superpose_efield(base, self.static_efields))

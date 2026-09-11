@@ -475,6 +475,23 @@ class CavityGeometryOptimizer:
         rf_params = np.asarray(params[self._rf_offset:], dtype=float)
         return angles_per_gap, radii_per_gap, rotations_per_gap, opening_delta, rf_params
 
+    def _seed_x0_from_cavities(self, x0) -> np.ndarray:
+        """x0 with the geometry blocks of the FREE gaps replaced by the
+        cavities' current segment geometry (warm start from a previous winner
+        applied to the design; the RF entries are left as built)."""
+        x0 = np.asarray(x0, dtype=float).copy()
+        n, blk = self.n_segments, self._blk
+        free = getattr(self, '_free_gaps', list(range(self.n_gaps)))
+        for k, g in enumerate(free):
+            cav = self.orbit_finder.design.rf_cavities[g]
+            base = k * blk
+            x0[base:base + n] = [float(a) for a in cav.segment_angles][:n]
+            x0[base + n:base + 2 * n] = [float(r) for r in cav.segment_radii][:n]
+            if self.rotatable_segments:
+                rots = cav.segment_rotations or [0.0] * n
+                x0[base + 2 * n:base + 3 * n] = [float(r) for r in rots][:n]
+        return x0
+
     def _rotations_for_gap(self, rotations_per_gap, g):
         return rotations_per_gap[g] if rotations_per_gap is not None else None
 
@@ -1215,7 +1232,8 @@ class CavityGeometryOptimizer:
                         worker_builder_args: tuple = (),
                         n_starts: Optional[int] = None,
                         geometry_jitter_deg: float = 1.0,
-                        collimator_seed: Optional[tuple] = None) -> OptimizedOrbit:
+                        collimator_seed: Optional[tuple] = None,
+                        seed_from_current_geometry: bool = False) -> OptimizedOrbit:
         """Three-stage optimization:
 
         A. Coarse RF scan (geometry frozen straight): grid over bunch phase x
@@ -1248,7 +1266,8 @@ class CavityGeometryOptimizer:
                 final_steps_per_turn, final_max_turns,
                 phase_grid, freq_fracs, maxfun, r0_mode, skip_turns,
                 workers, worker_builder, worker_builder_args,
-                n_starts, geometry_jitter_deg, collimator_seed)
+                n_starts, geometry_jitter_deg, collimator_seed,
+                seed_from_current_geometry)
 
         of = self.orbit_finder
         of._set_beam_meta(initial_beam)
@@ -1260,11 +1279,14 @@ class CavityGeometryOptimizer:
             freq_fracs = np.linspace(0.98, 1.02, 5)
 
         try:
-            # ---- Stage A: coarse RF scan, geometry frozen at x0 (straight).
+            # ---- Stage A: coarse RF scan, geometry frozen at x0 (straight,
+            # or the cavities' current geometry with seed_from_current_geometry).
             of.steps_per_turn = search_steps_per_turn
             f0 = of._rf_base_frequency()
             _, _, x0 = self._build_full_param_space(
                 initial_beam, rf_optimize_params, rf_bounds, r0_mode)
+            if seed_from_current_geometry:
+                x0 = self._seed_x0_from_cavities(x0)
             angles0, radii0, _, _, _ = self._unpack_params(x0)
             for g, cavity in enumerate(of.design.rf_cavities):
                 cavity.update_geometry(segment_angles=angles0[g], segment_radii=radii0[g])
@@ -1324,7 +1346,8 @@ class CavityGeometryOptimizer:
                                   skip_turns, workers, worker_builder,
                                   worker_builder_args, n_starts,
                                   geometry_jitter_deg,
-                                  collimator_seed=None) -> OptimizedOrbit:
+                                  collimator_seed=None,
+                                  seed_from_current_geometry: bool = False) -> OptimizedOrbit:
         """Parallel staged optimization (see optimize_staged docstring).
 
         ``collimator_seed``: optional (azimuth_deg, aperture_mm) applied
@@ -1353,6 +1376,8 @@ class CavityGeometryOptimizer:
 
         param_bounds, param_names, x0 = self._build_full_param_space(
             initial_beam, rf_optimize_params, rf_bounds, r0_mode)
+        if seed_from_current_geometry:
+            x0 = self._seed_x0_from_cavities(x0)
         lower = np.array([b[0] for b in param_bounds], dtype=float)
         upper = np.array([b[1] for b in param_bounds], dtype=float)
         angles0, radii0, _, _, _ = self._unpack_params(x0)
