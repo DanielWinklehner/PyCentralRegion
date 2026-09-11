@@ -542,11 +542,21 @@ class RFCavity:
                 r_new_array[crossed_indices], v_array[crossed_indices],
                 design.efield, design.bfield, -dt_back
             )
-            t_cavity = t - dt_back
+            # `t` is the time at the START of the tracker step (Tracker.run
+            # hands the pre-increment time to the interactions), so the chord
+            # runs from t to t + dt and the crossing is at t + t_cross * dt =
+            # t + dt - dt_back. (Until 2026-09-11 this read `t - dt_back`: the
+            # kick phase was early by omega * dt, i.e. 4.8 deg RF at 300
+            # steps/turn with harmonic 4, 2.9 deg at 500, 0.7 deg at 2000 -
+            # absorbed by the bunch phase, but differently at every dt.)
+            t_cavity = t + dt - dt_back
         else:
             r_cavity = r_new_array[crossed_indices]
             v_cavity = v_array[crossed_indices]
-            t_cavity = t
+            # no-backtrack (boris) branch: the kick is applied at the step-end
+            # state, but the RF phase is that of the true crossing at
+            # t + t_cross * dt (until 2026-09-11 the step-start time `t`).
+            t_cavity = t + t_cross[crossed_indices] * dt
 
         # Old energy from the TOTAL speed (norm-based, relativistic).
         speed = np.linalg.norm(v_cavity, axis=1)

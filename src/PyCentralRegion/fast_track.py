@@ -18,7 +18,7 @@ What the kernel reproduces, step by step, from ``Tracker.run`` /
   * thin-gap kicks in cavity order: Cramer crossing test on the step chord,
     RK4 backtrack to the crossing, kick along the crossed segment's normal
     with the transit-time factor, the radial voltage profile (tabulated) and
-    the crossing phase ``omega * (t_step - dt_back) + phase`` exactly as
+    the crossing phase ``omega * (t_step + dt - dt_back) + phase`` exactly as
     ``apply_kicks_batch`` computes it, RK4 forward to the step end;
   * radial boundary and the midplane obstacle raster as terminators;
   * the Poincare section crossing count with the same arming rule, so the
@@ -212,7 +212,7 @@ def _track_kernel(r0, v0, dt, n_steps, t0, q_over_m, q_state, mass_mev,
                 _rk4(r, v, -dt_back, cos_rf, q_over_m, bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
                      sm, sgx, sgy, svx, svy, svz, ssc, sconst, rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
                      r_c, v_c)
-                t_cavity = t - dt_back
+                t_cavity = t + dt - dt_back   # crossing time (t = step start)
                 speed = np.sqrt(v_c[0] * v_c[0] + v_c[1] * v_c[1] + v_c[2] * v_c[2])
                 gamma = 1.0 / np.sqrt(1.0 - (speed / CLIGHT) ** 2)
                 e_old = (gamma - 1.0) * mass_mev
