@@ -623,7 +623,11 @@ def warn_if_trajectory_hits_post(model: 'ElectrodeModel', trajectory,
     posts = [w for w in model.wedges if w.kind == 'post']
     if not posts:
         return float('inf')
-    from matplotlib.path import Path as MplPath
+    if model.params.get('post_mode') == 'housing':
+        # the union hub contains the hill footprints (flown through); only
+        # the housing itself is an obstacle
+        loops = model.params['housing']['loops']
+        posts = [Wedge('post', 0.0, l, l, polygon=l, label='housing') for l in loops]
     poly = np.asarray(posts[0].polygon, dtype=float)
     xy = np.asarray(trajectory, dtype=float)[:, :2]
     # the beam legitimately GRAZES the scroll step face as it emerges from
@@ -632,11 +636,12 @@ def warn_if_trajectory_hits_post(model: 'ElectrodeModel', trajectory,
     xy = xy[np.abs(phi - phi[0]) > np.deg2rad(15.0)]
     if len(xy) == 0:
         return float('inf')
-    inside = MplPath(poly).contains_points(xy)
+    inside = wedge_metal_mask(posts, xy)
     sub = xy[::max(len(xy) // 4000, 1)]
-    sub_inside = MplPath(poly).contains_points(sub)
-    a = poly
-    b = np.roll(poly, -1, axis=0)
+    sub_inside = wedge_metal_mask(posts, sub)
+    rings = [poly] + [np.asarray(h, dtype=float) for h in posts[0].holes]
+    a = np.vstack(rings)
+    b = np.vstack([np.roll(r, -1, axis=0) for r in rings])
     d = b - a
     lens2 = np.maximum(np.sum(d * d, axis=1), 1e-18)
 
@@ -840,6 +845,200 @@ def _ccw_width(chain_lo: np.ndarray, chain_hi: np.ndarray,
     return d * radii
 
 
+def wedge_metal_mask(wedges, pts_2d: np.ndarray) -> np.ndarray:
+    """True where (M, 2) midplane points [m] lie inside any wedge footprint
+    (``Wedge.polygon`` minus its ``holes``)."""
+    from matplotlib.path import Path as MplPath
+    pts = np.atleast_2d(np.asarray(pts_2d, dtype=float))[:, :2]
+    inside = np.zeros(len(pts), dtype=bool)
+    for w in wedges:
+        if w.polygon is None:
+            continue
+        m = MplPath(np.asarray(w.polygon, dtype=float)).contains_points(pts)
+        for h in getattr(w, 'holes', ()):
+            m &= ~MplPath(np.asarray(h, dtype=float)).contains_points(pts)
+        inside |= m
+    return inside
+
+
+# ============================================================================
+# Housing (spiral-inflector housing outline used as the grounded scroll)
+# ============================================================================
+class _HousingGeom:
+    """Midplane outline(s) of the grounded housing: signed distance and
+    metal test. ``loops`` are closed (K, 2) outlines [m]; nested loops are
+    holes (even-odd)."""
+
+    def __init__(self, loops, ds: float = 5e-4):
+        from scipy.spatial import cKDTree
+        from .polyprism import clean_polygon, densify_polygon, nest_loops, signed_area
+        if isinstance(loops, np.ndarray) and loops.ndim == 2:
+            loops = [loops]
+        self.loops = [clean_polygon(l) for l in loops]
+        self.faces = nest_loops(self.loops)          # [(outer, [holes]), ...]
+        dense = np.vstack([densify_polygon(l, ds) for l in self.loops])
+        self._tree = cKDTree(dense)
+        self._ds = ds
+        rr = np.hypot(dense[:, 0], dense[:, 1])
+        self.r_min, self.r_max = float(rr.min()), float(rr.max())
+        self.area = sum(abs(signed_area(o)) - sum(abs(signed_area(h)) for h in hs)
+                        for o, hs in self.faces)
+
+    def inside(self, pts: np.ndarray) -> np.ndarray:
+        from matplotlib.path import Path as MplPath
+        pts = np.atleast_2d(np.asarray(pts, dtype=float))[:, :2]
+        out = np.zeros(len(pts), dtype=bool)
+        for outer, holes in self.faces:
+            m = MplPath(outer).contains_points(pts)
+            for h in holes:
+                m &= ~MplPath(h).contains_points(pts)
+            out |= m
+        return out
+
+    def dist(self, pts: np.ndarray) -> np.ndarray:
+        """Signed distance to the metal outline [m]: negative inside the
+        metal, accurate to about ``ds`` / 2 (nearest boundary sample)."""
+        pts = np.atleast_2d(np.asarray(pts, dtype=float))[:, :2]
+        d, _ = self._tree.query(pts)
+        d = np.asarray(d, dtype=float)
+        d[self.inside(pts)] *= -1.0
+        return d
+
+
+def _truncate_chain_clear_of(pts: np.ndarray, dist_fn, clearance: float,
+                             step: float = 5e-4) -> np.ndarray:
+    """Cut an inner-to-outer chain at the OUTERMOST point where its signed
+    distance to an obstacle drops below ``clearance``; the part beyond is kept
+    with the cut point prepended. Raises if the chain's outer end itself is
+    too close (the whole chain would go)."""
+    pts = np.asarray(pts, dtype=float)
+    seg_len = np.hypot(*np.diff(pts, axis=0).T)
+    samples, owner, frac = [], [], []
+    for k, L in enumerate(seg_len):
+        n = max(int(np.ceil(L / step)), 1)
+        ts = np.linspace(0.0, 1.0, n, endpoint=False)
+        samples.append(pts[k] + ts[:, None] * (pts[k + 1] - pts[k]))
+        owner.append(np.full(n, k))
+        frac.append(ts)
+    samples.append(pts[-1:])
+    owner.append(np.array([len(seg_len) - 1]))
+    frac.append(np.array([1.0]))
+    samples, owner, frac = np.vstack(samples), np.concatenate(owner), np.concatenate(frac)
+    close = np.asarray(dist_fn(samples)) < clearance
+    if not close.any():
+        return pts
+    last = int(np.where(close)[0][-1])
+    if last == len(samples) - 1:
+        raise ValueError("chain lies entirely within the clearance of the housing")
+    k = int(owner[last])
+    a, b = pts[k], pts[k + 1]
+    t_lo, t_hi = float(frac[last]), float(frac[last + 1]) if owner[last + 1] == k else 1.0
+    for _ in range(30):
+        tm = 0.5 * (t_lo + t_hi)
+        if float(dist_fn((a + tm * (b - a))[None, :])[0]) < clearance:
+            t_lo = tm
+        else:
+            t_hi = tm
+    return np.vstack([a + t_hi * (b - a), pts[k + 1:]])
+
+
+def _spoke_target(pts: np.ndarray, hgeom: _HousingGeom, overlap: float,
+                  max_len: float, step: float = 2.5e-4) -> Optional[float]:
+    """Radius to which a ground chain should be extended (radial spoke at its
+    tip azimuth) so that it ends INSIDE the housing wall: half-way through the
+    wall or ``overlap`` past its outer surface, whichever is smaller. None if
+    the radial march of ``max_len`` never enters the housing."""
+    p0 = np.asarray(pts[0], dtype=float)
+    r0 = float(np.hypot(p0[0], p0[1]))
+    az = np.arctan2(p0[1], p0[0])
+    rs = np.arange(r0 - step, max(r0 - max_len, step), -step)
+    if len(rs) == 0:
+        return None
+    probe = np.column_stack([rs * np.cos(az), rs * np.sin(az)])
+    inside = hgeom.inside(probe)
+    if not inside.any():
+        return None
+    i_in = int(np.argmax(inside))
+    r_enter = float(rs[i_in])
+    after = np.where(~inside[i_in:])[0]
+    r_leave = float(rs[i_in + after[0]]) if len(after) else None
+    if r_leave is None:
+        return r_enter - overlap
+    return r_enter - min(overlap, 0.5 * (r_enter - r_leave))
+
+
+def _blend_arc(lo_tip: np.ndarray, hi_tip: np.ndarray, n: int = 60) -> np.ndarray:
+    """Points of the polar blend between two chain tips: the inner edge a
+    ``_cap_grid`` cap would get (radius and azimuth linear in the CCW
+    fraction from the low tip to the high tip)."""
+    az_lo, az_hi = np.arctan2(lo_tip[1], lo_tip[0]), np.arctan2(hi_tip[1], hi_tip[0])
+    r_lo, r_hi = np.hypot(*lo_tip), np.hypot(*hi_tip)
+    daz = np.mod(az_hi - az_lo, 2.0 * np.pi)
+    s = np.linspace(0.0, 1.0, n)
+    r = (1.0 - s) * r_lo + s * r_hi
+    az = az_lo + s * daz
+    return np.column_stack([r * np.cos(az), r * np.sin(az)])
+
+
+def _raise_tips_above_floor(lo: np.ndarray, hi: np.ndarray, floor_fn, tol: float = 2e-4):
+    """If the polar blend between the two chain tips dips below a radial
+    floor (``floor_fn(pts (M,2)) -> (M,)`` radius, e.g. the beam corridor
+    across the turn wrap), truncate BOTH chains at the highest floor along
+    the blend so the whole cap stays above it. Returns (lo, hi, raised_to)."""
+    arc = _blend_arc(lo[0], hi[0])
+    floor = np.asarray(floor_fn(arc), dtype=float)
+    r_arc = np.hypot(arc[:, 0], arc[:, 1])
+    if np.all(r_arc >= floor - tol):
+        return lo, hi, None
+    r_new = float(max(floor.max(), np.hypot(*lo[0]), np.hypot(*hi[0])))
+    return _truncate_chain_inner(lo, r_new), _truncate_chain_inner(hi, r_new), r_new
+
+
+def _wall_midline(hgeom: '_HousingGeom', p_lo: np.ndarray, p_hi: np.ndarray,
+                  overlap: float, max_len: float, step: float = 2.5e-4,
+                  d_az: float = np.radians(1.5)) -> Optional[np.ndarray]:
+    """Mid-wall polyline of the housing between the azimuths of two chain
+    tips (CCW from ``p_lo`` to ``p_hi``): at every intermediate azimuth a
+    radial march inward from just above the tips finds the wall's outer and
+    inner surfaces; the point half-way through the wall (or ``overlap`` past
+    the outer surface where the wall is not left again) is taken. None if
+    the wall is missing at any azimuth (an opening between the tips)."""
+    az_lo = np.arctan2(p_lo[1], p_lo[0])
+    az_hi = np.arctan2(p_hi[1], p_hi[0])
+    span = np.mod(az_hi - az_lo, 2.0 * np.pi)
+    n = max(int(np.ceil(span / d_az)) + 1, 3)
+    r_lo_tip, r_hi_tip = float(np.hypot(*p_lo)), float(np.hypot(*p_hi))
+    r_start = max(r_lo_tip, r_hi_tip) + 1e-3
+    # the wall (a spiral) may sit tens of mm deeper at one end of the wedge
+    # than at the other: march far enough to reach it from the higher tip
+    reach = max_len + abs(r_lo_tip - r_hi_tip) + 3e-3
+    pts = []
+    for az in az_lo + np.linspace(0.0, span, n):
+        rs = np.arange(r_start, max(r_start - reach, step), -step)
+        probe = np.column_stack([rs * np.cos(az), rs * np.sin(az)])
+        inside = hgeom.inside(probe)
+        if not inside.any():
+            return None
+        i_in = int(np.argmax(inside))
+        after = np.where(~inside[i_in:])[0]
+        r_enter = float(rs[i_in])
+        r_mid = (0.5 * (r_enter + float(rs[i_in + after[0]])) if len(after)
+                 else r_enter - overlap)
+        pts.append([r_mid * np.cos(az), r_mid * np.sin(az)])
+    return np.asarray(pts)
+
+
+def _cap_ring(cap: np.ndarray) -> np.ndarray:
+    """Boundary polygon (P, 2) of a (K, S, 2) cap grid, same walk as
+    ``_mesh_wedge``: low chain outward, outer arc, high chain inward, inner arc."""
+    K, S = cap.shape[:2]
+    ring = ([(k, 0) for k in range(K)] +
+            [(K - 1, m) for m in range(1, S)] +
+            [(k, S - 1) for k in range(K - 2, -1, -1)] +
+            [(0, m) for m in range(S - 2, 0, -1)])
+    return np.array([cap[k, m] for (k, m) in ring])
+
+
 # ============================================================================
 # Wedge construction + meshing
 # ============================================================================
@@ -853,6 +1052,8 @@ class Wedge:
     chain_hi: np.ndarray      # (K, 2) boundary on the high-azimuth side
     polygon: np.ndarray = None            # closed 2D outline (set at mesh time)
     label: str = ""
+    holes: list = dataclass_field(default_factory=list)   # outlines of holes inside
+                              # ``polygon`` (housing unions; even-odd metal test)
 
 
 @dataclass
@@ -1144,6 +1345,12 @@ def build_gap_electrodes(design_or_cavities,
                          traj_tip_clearance: Optional[float] = None,
                          fillet_radius: Optional[float] = None,
                          voltage_profile=None,
+                         housing=None,
+                         housing_ds: float = 0.003,
+                         housing_wall_dz: Optional[float] = None,
+                         housing_clearance: Optional[float] = None,
+                         spoke_overlap: float = 0.002,
+                         spoke_max: float = 0.020,
                          verbose: bool = True) -> ElectrodeModel:
     """Closed dee/ground solids from a dee system's RF gaps.
 
@@ -1227,6 +1434,43 @@ def build_gap_electrodes(design_or_cavities,
         (vectorized, caller-normalized). Ground and post stay at 0. Recorded
         in ``params['voltage_profile']``; warns if the dee electrodes extend
         beyond a tabulated profile (outermost value held there).
+    housing : (K, 2) array or list of them, optional
+        HOUSING mode: closed midplane outline(s) [m] of the grounded
+        spiral-inflector housing (``inflector.housing_section`` of its STEP
+        file; nested loops are holes). The housing IS the scroll: it replaces
+        the central post / trajectory scroll as the grounded hub, and its
+        wall is the dummy dee of the first gap. Dee chains are cut where they
+        come within ``housing_clearance`` of it (on top of the corridor trim
+        of scroll mode or the ``r_inner`` truncation); every GROUND chain is
+        extended radially inward at its tip azimuth until it ends inside the
+        housing wall (``_spoke_target``: half-way through the wall or
+        ``spoke_overlap`` past its outer surface, at most ``spoke_max`` of
+        march) - such a dummy dee merges contiguously onto the housing. The
+        housing outline and the merged spokes are fused (gmsh/OCC,
+        ``polyprism``) into ONE grounded solid: a 'post' wedge labelled
+        'housing' whose ``polygon`` is the union outline and ``holes`` its
+        interior loops. Ground wedges whose march never reaches the housing
+        (e.g. across the exit opening) stay separate closed wedges. Pass
+        ``trim_trajectory`` (scroll mode) so that the chains and spokes stay
+        below the beam corridor; without it the spokes are only bounded by
+        ``spoke_max`` and cannot know where the beam runs inside the housing.
+        Requires ``post_tip_gap`` (or ``housing_clearance``); exclusive with
+        ``center_post_radius`` / ``post_min_radius``.
+    housing_ds : float
+        Boundary discretisation of the housing / union outline [m] (the
+        input outline is densified to this, never coarsened). The housing is
+        a thin double-sided shell: keep this at or above its wall thickness
+        and the wall rows coarse (``housing_wall_dz``), otherwise the
+        single-layer operator is both large and badly conditioned (a 4 mm
+        shell at 2 mm / 13 rows: 26k elements, 4000 GMRES iterations).
+    housing_wall_dz : float, optional
+        Median-plane wall row height [m] of the housing prism (default
+        2 x ``wall_dz``; rows grow by ``wall_growth`` like the wedges').
+    housing_clearance : float, optional
+        Dee-tip-to-housing clearance [m] (voltage holding); default
+        ``post_tip_gap``.
+    spoke_overlap, spoke_max : float
+        See ``housing``.
     """
     cavities = getattr(design_or_cavities, 'rf_cavities', design_or_cavities)
     v_scale, v_info = _voltage_scale(voltage_profile)
@@ -1290,7 +1534,42 @@ def build_gap_electrodes(design_or_cavities,
         pinches.append(pinch)
     r_inner_auto = max(pinches) if pinches else 0.0
 
-    # --- mode setup: scroll (trajectory-following) or circular post -----------
+    # --- mode setup: housing hub, scroll (trajectory-following) or circular post
+    housing_mode = housing is not None
+    hgeom = None
+    d_house = None
+    if housing_mode:
+        if center_post_radius is not None or post_min_radius is not None:
+            raise ValueError("housing is exclusive with center_post_radius / "
+                             "post_min_radius (the housing IS the hub)")
+        if post_tip_gap is None and housing_clearance is None:
+            raise ValueError("housing requires post_tip_gap or housing_clearance "
+                             "(dee-tip-to-housing voltage gap)")
+        d_house = float(housing_clearance if housing_clearance is not None else post_tip_gap)
+        if d_house < 0.002:
+            raise ValueError("housing_clearance must be >= 2 mm (dee-to-housing "
+                             "voltage holding)")
+        if post_tip_gap is None:
+            post_tip_gap = d_house
+        # The outline that is MESHED is the section coarsened to the mesh
+        # spacing (vertices within 0.15 housing_ds of the chord dropped); all
+        # trimming / spoke decisions use that same outline so that a spoke end
+        # judged 'inside the wall' is inside the meshed wall (the exact
+        # outline is kept for the obstacle raster, params['housing']['loops']).
+        from .polyprism import simplify_polygon, clean_polygon
+        raw_loops = ([housing] if isinstance(housing, np.ndarray) and housing.ndim == 2
+                     else list(housing))
+        housing_exact = [clean_polygon(l) for l in raw_loops]
+        # exact outline: dee clearance (voltage holding) and ground truncation;
+        # meshed outline: spoke march / arc-in-wall decisions and the union
+        hgeom = _HousingGeom(housing_exact, ds=min(housing_ds, 5e-4))
+        hgeom_m = _HousingGeom([simplify_polygon(l, 0.15 * housing_ds) for l in raw_loops],
+                               ds=min(housing_ds, 5e-4))
+        if verbose:
+            print(f"[gap_fields] housing mode: {len(hgeom.loops)} outline(s), r = "
+                  f"{hgeom.r_min * 1000:.1f}-{hgeom.r_max * 1000:.1f} mm, metal area "
+                  f"{hgeom.area * 1e4:.1f} cm2, dee clearance {d_house * 1000:.1f} mm, "
+                  f"spoke overlap {spoke_overlap * 1000:.1f} mm")
     r_post = None
     scroll_mode = trim_trajectory is not None
     if scroll_mode:
@@ -1314,6 +1593,21 @@ def build_gap_electrodes(design_or_cavities,
                 f"minus clearances leaves {r_scroll_min*1000:.1f} mm")
 
         r_inner = r_inner_auto   # reported floor; trims follow the corridor
+        # variable segments the beam never uses / short stubs at the tips put
+        # kinks (field spikes) into the electrode edges: warn, do not modify
+        from .rf_cavity import check_variable_segments
+        for f in check_variable_segments(cavities, trim_trajectory, tip_clearance=d_tip,
+                                         verbose=False):
+            if f['kind'] == 'uncrossed':
+                warnings.warn(f"gap{f['gap']}: the reference trajectory never crosses it",
+                              stacklevel=2)
+            else:
+                warnings.warn(
+                    f"gap{f['gap']} segment {f['segment']} is {f['kind']}: spans "
+                    f"{f['r_lo'] * 1000:.1f}..{f['r_hi'] * 1000:.1f} mm but the tip sits at "
+                    f"{f['r_tip'] * 1000:.1f} mm (first crossing {f['r_first'] * 1000:.1f} mm); "
+                    f"usable extent {f['extent'] * 1000:.1f} mm. Straighten it "
+                    f"(segment_angles / rotations = 0) or constrain its radius.", stacklevel=2)
         if verbose:
             print(f"[gap_fields] scroll mode: turn-1 r "
                   f"{np.min(r1v)*1000:.1f}-{np.max(r1v)*1000:.1f} mm, tip "
@@ -1328,8 +1622,9 @@ def build_gap_electrodes(design_or_cavities,
                              "not both")
         if r_inner is None:
             r_inner = r_inner_auto
-        # central post sizing (may RAISE the truncation to fit the post)
-        if post_tip_gap is not None:
+        # central post sizing (may RAISE the truncation to fit the post);
+        # in housing mode the housing is the hub, no post is sized
+        if post_tip_gap is not None and not housing_mode:
             if post_tip_gap < 0.002:
                 raise ValueError("post_tip_gap must be >= 2 mm (dee-to-post "
                                  "voltage holding; ~60 kV wants >= ~8 mm)")
@@ -1402,7 +1697,11 @@ def build_gap_electrodes(design_or_cavities,
                 p = float(prog_of(ch[:1])[0])
                 if p < 2.0 * np.pi - 0.05:   # exclude wrap-adjacent starts
                     prog_tips = max(prog_tips, p)
-
+        special = None
+        wrap_iw = None
+        step_prog = None
+        prog_J = None
+    if scroll_mode and not housing_mode:
         # spiral polyline over the end-of-turn sector, at the HUB offset
         ps = np.linspace(np.pi, 2.0 * np.pi, 600)
         rs = np.interp(ps, u1, r1v) - d_tip - post_tip_gap
@@ -1518,11 +1817,14 @@ def build_gap_electrodes(design_or_cavities,
     v_offset = 0
     post_arcs = []
     seam_pts = None
+    spoke_rings: List[Tuple[str, np.ndarray]] = []     # housing mode: merged spokes
+    housing_gaps: List[Tuple[str, float]] = []         # housing mode: unmerged ground tips
     for iw, (w, pinch) in enumerate(zip(wedges, pinches)):
         is_special = scroll_mode and special is not None and iw == special[0]
+        merge = False
         if scroll_mode:
             lo, hi = scroll_trims[iw]
-            if not is_special and iw != wrap_iw:
+            if not housing_mode and not is_special and iw != wrap_iw:
                 # keep wedge boundaries out of the hub (a chain sweeping past
                 # the closure would run buried under the outer branch); dees
                 # get the full voltage-gap setback off the closure. The wrap
@@ -1532,7 +1834,7 @@ def build_gap_electrodes(design_or_cavities,
                                              s_dir, prog_J, setback)
                 hi = _clamp_chain_out_of_hub(hi, prog_of, scroll_r, phi0,
                                              s_dir, prog_J, setback)
-            as_spoke = w.kind == 'ground'
+            as_spoke = w.kind == 'ground' and not housing_mode
         else:
             lo = _truncate_chain_inner(w.chain_lo, r_inner) if r_inner > 0 else w.chain_lo
             hi = _truncate_chain_inner(w.chain_hi, r_inner) if r_inner > 0 else w.chain_hi
@@ -1543,6 +1845,55 @@ def build_gap_electrodes(design_or_cavities,
                 # on the post circle, which the hub mesh reuses as its seam)
                 lo = _extend_chain_inner(lo, r_post)
                 hi = _extend_chain_inner(hi, r_post)
+        if housing_mode:
+            # dee tips keep the voltage gap off the housing; ground chains
+            # are cut at its surface and then marched INTO its wall (spoke)
+            clr = d_house if w.kind == 'dee' else 0.0
+            lo = _truncate_chain_clear_of(lo, hgeom.dist, clr)
+            hi = _truncate_chain_clear_of(hi, hgeom.dist, clr)
+            if scroll_mode:
+                # the cap's inner edge (polar blend between the two tips)
+                # must stay above the beam corridor: across the turn wrap
+                # the corridor jumps (injection radius -> end of turn 1)
+                # and a wedge spanning it would otherwise bridge the
+                # housing's exit opening right through the beam
+                off = d_tip if w.kind == 'dee' else d_tip + post_tip_gap
+                lo, hi, raised = _raise_tips_above_floor(
+                    lo, hi, lambda p, _o=off: r1_at(p) - _o)
+                if raised is not None and verbose:
+                    print(f"[gap_fields]   {w.label:>14s}: tips raised to r = "
+                          f"{raised * 1000:.1f} mm (cap edge would cross the beam "
+                          f"corridor across the wrap)")
+            if w.kind == 'ground':
+                r_lo = _spoke_target(lo, hgeom_m, spoke_overlap, spoke_max)
+                r_hi = _spoke_target(hi, hgeom_m, spoke_overlap, spoke_max)
+                why = None
+                if r_lo is None or r_hi is None:
+                    why = "radial march does not enter the wall on both sides"
+                else:
+                    # the merged cap's inner edge FOLLOWS the housing wall
+                    # (mid-wall polyline between the two tip azimuths), so it
+                    # lies inside the metal by construction; a missing wall
+                    # at any azimuth in between is an opening (exit hole,
+                    # plate edge) that the spoke must not bridge
+                    midline = _wall_midline(hgeom_m, lo[0], hi[0], spoke_overlap, spoke_max)
+                    if midline is None:
+                        why = "the wall between the two spoke ends is interrupted (an opening)"
+                    else:
+                        lo = _extend_chain_inner(lo, float(np.hypot(*midline[0])))
+                        hi = _extend_chain_inner(hi, float(np.hypot(*midline[-1])))
+                        spoke_inner = midline
+                        merge = True
+                if not merge:
+                    gap = float(min(hgeom.dist(lo[:1])[0], hgeom.dist(hi[:1])[0]))
+                    housing_gaps.append((w.label, gap))
+                    msg = (f"{w.label}: not merged onto the housing ({why}); left as a "
+                           f"separate ground wedge, tip {gap * 1000:.1f} mm from the housing")
+                    if gap < 0.003:
+                        warnings.warn(msg + " - near-touching surfaces degrade the BEM "
+                                      "conditioning", stacklevel=2)
+                    elif verbose:
+                        print(f"[gap_fields]   {msg}")
         if fillet_radius is not None:
             lo = _fillet_polyline(lo, fillet_radius)
             hi = _fillet_polyline(hi, fillet_radius)
@@ -1550,6 +1901,22 @@ def build_gap_electrodes(design_or_cavities,
         lo_s = _sample_polyline(lo, fr)
         hi_s = _sample_polyline(hi, fr)
         cap = _cap_grid(lo_s, hi_s, arc_ds)
+        if merge:
+            # meshed later as part of the housing union (one grounded solid);
+            # the ring's inner edge (the polar blend of the cap grid) is
+            # replaced by the mid-wall polyline, walked from the high tip
+            # back to the low tip
+            polygon = _cap_ring(cap)
+            S_cols = cap.shape[1]
+            polygon = np.vstack([polygon[:len(polygon) - (S_cols - 2)], spoke_inner[::-1][1:-1]])
+            w.chain_lo, w.chain_hi = lo, hi
+            w.polygon = polygon
+            spoke_rings.append((w.label, polygon))
+            if verbose:
+                print(f"[gap_fields]   {w.label:>14s} ({w.kind:6s}) @ {w.potential:+9.1f} V: "
+                      f"spoke to r = {np.hypot(*lo[0]) * 1000:.1f} / {np.hypot(*hi[0]) * 1000:.1f} mm, "
+                      f"merged onto the housing")
+            continue
         seam_rows = 0
         if is_special:
             # the hub's closing edge follows this wedge's chain from the
@@ -1592,8 +1959,60 @@ def build_gap_electrodes(design_or_cavities,
             print(f"[gap_fields]   {w.label:>14s} ({w.kind:6s}) @ {pot_txt}: "
                   f"{len(tris):5d} tris, cap grid {cap.shape[0]}x{cap.shape[1]}")
 
-    # --- grounded central post hub (stitched to the spokes) --------------------
-    if scroll_mode:
+    # --- grounded hub: housing union, scroll or circular post ------------------
+    housing_info = None
+    if housing_mode:
+        from .polyprism import union_polygons, mesh_prism, signed_area
+        # hgeom_m holds the outline coarsened to the mesh spacing (the spoke
+        # decisions were made against it); union_polygons densifies every
+        # edge to <= housing_ds
+        polys = list(hgeom_m.faces) + [ring for _, ring in spoke_rings]
+        faces = union_polygons(polys, ds=housing_ds, cap_size=max(arc_ds, 4.0 * housing_ds))
+        faces.sort(key=lambda f: -abs(signed_area(f['outer'])))
+        # the union's walls get the coarse housing rows only while it is the
+        # housing alone; once dummy-dee spokes are merged their gap-facing
+        # walls are part of it and need the wedges' fine median-plane rows
+        # (6 mm rows on a 10 mm gap under-resolve the gap field)
+        if spoke_rings:
+            z_levels_h = z_levels
+        else:
+            z_levels_h = _z_levels(height, housing_wall_dz or 2.0 * wall_dz, wall_growth)
+        h_verts, h_tris, _ = mesh_prism(faces, z_levels_h)
+        sliver = (5.0 * housing_ds) ** 2
+        n_holes, n_sliver = 0, 0
+        for fi, face in enumerate(faces):
+            label = 'housing' if fi == 0 else f'housing#{fi + 1}'
+            post = Wedge('post', 0.0, face['outer'], face['outer'], polygon=face['outer'],
+                         label=label, holes=[np.asarray(h) for h in face['holes']])
+            wedges.append(post)
+            n_holes += len(face['holes'])
+            n_sliver += sum(1 for h in face['holes'] if abs(signed_area(h)) < sliver)
+        if n_sliver:
+            warnings.warn(f"housing union has {n_sliver} sliver hole(s) (area < "
+                          f"{sliver * 1e6:.1f} mm2): a spoke end and the housing wall enclose "
+                          f"a vacuum pocket - adjust spoke_overlap / chain widths", stacklevel=2)
+        if len(faces) > 1:
+            warnings.warn(f"housing union fell apart into {len(faces)} faces (a spoke that "
+                          f"does not overlap the housing?)", stacklevel=2)
+        all_verts.append(h_verts)
+        all_tris.append(h_tris + v_offset)
+        all_pots.append(np.zeros(len(h_tris)))
+        v_offset += len(h_verts)
+        housing_info = {'loops': housing_exact, 'meshed_loops': [np.asarray(l) for l in hgeom_m.loops],
+                        'n_loops': len(hgeom.loops), 'r_min': hgeom.r_min, 'r_max': hgeom.r_max,
+                        'area_m2': hgeom.area, 'ds': housing_ds, 'clearance': d_house,
+                        'wall_dz': housing_wall_dz or 2.0 * wall_dz, 'n_z_levels': len(z_levels_h),
+                        'spoke_overlap': spoke_overlap, 'spoke_max': spoke_max,
+                        'spokes': [lbl for lbl, _ in spoke_rings],
+                        'unmerged_ground': housing_gaps, 'union_faces': len(faces),
+                        'holes': n_holes, 'sliver_holes': n_sliver, 'n_elements': len(h_tris)}
+        if verbose:
+            rr = np.hypot(*faces[0]['outer'].T)
+            print(f"[gap_fields]   {'housing':>14s} (post  ) @ {0.0:+9.1f} V: {len(h_tris):5d} tris, "
+                  f"r = {rr.min() * 1000:.1f}-{rr.max() * 1000:.1f} mm, {len(spoke_rings)} spokes "
+                  f"merged, {n_holes} hole(s)"
+                  + (f", {len(housing_gaps)} ground wedge(s) left separate" if housing_gaps else ""))
+    elif scroll_mode:
         post_ds = min(arc_ds, 0.004)
         ring, iwl, se = _scroll_ring(post_arcs, scroll_xy, prog_of, post_ds,
                                      step_prog, seam=seam_pts)
@@ -1635,8 +2054,10 @@ def build_gap_electrodes(design_or_cavities,
         params={'height': height, 'chain_ds': chain_ds, 'arc_ds': arc_ds,
                 'wall_dz': wall_dz, 'wall_growth': wall_growth,
                 'min_metal_width': min_metal_width, 'r_inner': r_inner,
-                'post_mode': ('scroll' if scroll_mode
+                'post_mode': ('housing' if housing_mode else 'scroll' if scroll_mode
                               else 'circle' if r_post is not None else None),
+                'housing': housing_info,
+                'spoke_polygons': [(lbl, ring) for lbl, ring in spoke_rings],
                 'post_radius': r_post, 'post_tip_gap': post_tip_gap,
                 'post_min_radius': post_min_radius,
                 'traj_tip_clearance': d_tip if scroll_mode else None,
@@ -1644,7 +2065,8 @@ def build_gap_electrodes(design_or_cavities,
                                     and special is not None else None),
                 'scroll_junction_prog': (special[4] if scroll_mode
                                          and special is not None else None),
-                'scroll_closure': (('seam' if special is not None else
+                'scroll_closure': ('housing' if housing_mode else
+                                   ('seam' if special is not None else
                                     'wrap-arc' if wrap_iw is not None else
                                     'step') if scroll_mode else None),
                 'fillet_radius': fillet_radius,
@@ -1841,6 +2263,75 @@ class GapFieldSolution:
         ey = -(phi[2 * m:3 * m] - phi[3 * m:4 * m]) / (2 * h)
         return np.column_stack([ex, ey])
 
+    def efield(self, pts: np.ndarray, h: float = 2e-4, chunk: int = 4000) -> np.ndarray:
+        """(Ex, Ey, Ez) [V/m] at (M, 3) points via central differences."""
+        pts = np.atleast_2d(np.asarray(pts, dtype=float))
+        m = len(pts)
+        probe = np.empty((6 * m, 3))
+        for k in range(3):
+            d = np.zeros(3)
+            d[k] = h
+            probe[2 * k * m:(2 * k + 1) * m] = pts + d
+            probe[(2 * k + 1) * m:(2 * k + 2) * m] = pts - d
+        phi = self.potential(probe, chunk=chunk)
+        e = np.empty((m, 3))
+        for k in range(3):
+            e[:, k] = -(phi[2 * k * m:(2 * k + 1) * m]
+                        - phi[(2 * k + 1) * m:(2 * k + 2) * m]) / (2 * h)
+        return e
+
+    def _metal_inside(self, pts_2d: np.ndarray, z: float = 0.0) -> np.ndarray:
+        """Metal mask at (M, 2) midplane points: closed 3D solids for
+        electrodes3d models, wedge footprints for tall-wall 2D models."""
+        if self.model.params.get('dim') == 3 and 'solids' in self.model.params:
+            from .electrodes3d import metal_mask
+            pts = np.column_stack([pts_2d, np.full(len(pts_2d), z)])
+            return metal_mask(self.model, pts)
+        return wedge_metal_mask(self.model.wedges, pts_2d)
+
+    def to_field3d(self, xs, ys, zs, chunk: int = 4000, mask_metal: bool = True,
+                   interpolator_backend: str = 'auto', verbose: bool = True) -> Field:
+        """Evaluate phi on a 3D grid and return E = -grad(phi) as a dim-3 Field.
+
+        Cost is (grid points) x (elements) kernel evaluations: a 2 mm grid
+        over a 250 mm x 60 mm crop is ~4 M points, so prefer 3-4 mm for whole
+        maps and keep 2 mm for planes. With ``mask_metal`` the interior of the
+        closed 3D solids (eroded by two cells, keeping the wall-jump layer) is
+        set to 0; tall-wall 2D models mask the deep wedge interior as
+        ``to_field``.
+        """
+        xs, ys, zs = (np.asarray(a, dtype=float) for a in (xs, ys, zs))
+        gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')
+        pts = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
+        t0 = time.time()
+        phi = self.potential(pts, chunk=chunk, verbose=verbose).reshape(gx.shape)
+        if verbose:
+            print(f"[gap_fields] potential grid {gx.shape} evaluated in {time.time() - t0:.1f} s")
+        ex = -np.gradient(phi, xs, axis=0)
+        ey = -np.gradient(phi, ys, axis=1)
+        ez = -np.gradient(phi, zs, axis=2) if len(zs) > 1 else np.zeros_like(phi)
+        if mask_metal:
+            from scipy.ndimage import binary_erosion
+            if self.model.params.get('dim') == 3 and 'solids' in self.model.params:
+                from .electrodes3d import metal_mask
+                inside = metal_mask(self.model, pts).reshape(gx.shape)
+            else:
+                inside = np.repeat(self._metal_inside(pts[:gx.shape[0] * gx.shape[1], :2]
+                                                      if len(zs) == 1 else
+                                                      np.column_stack([gx[:, :, 0].ravel(), gy[:, :, 0].ravel()])
+                                                      ).reshape(gx.shape[0], gx.shape[1])[:, :, None],
+                                   len(zs), axis=2)
+            deep = binary_erosion(inside, iterations=2)
+            ex[deep] = 0.0
+            ey[deep] = 0.0
+            ez[deep] = 0.0
+        return Field.from_arrays(
+            grid={'x': xs, 'y': ys, 'z': zs},
+            values={'x': ex, 'y': ey, 'z': ez},
+            label="BEM 3D field (static pattern)",
+            interpolator_backend=interpolator_backend,
+        )
+
     def to_field(self,
                  spacing: float = 0.0015,
                  margin: float = 0.02,
@@ -1881,12 +2372,11 @@ class GapFieldSolution:
         ey = -np.gradient(phi, ys, axis=1)
 
         if mask_metal:
-            from matplotlib.path import Path as MplPath
             from scipy.ndimage import binary_erosion
             pts_2d = np.column_stack([gx.ravel(), gy.ravel()])
-            inside = np.zeros(len(pts_2d), dtype=bool)
-            for w in self.model.wedges:
-                inside |= MplPath(w.polygon).contains_points(pts_2d)
+            # tall-wall models: wedge footprints; 3D models: the closed solids
+            # at z = 0 (the dee aperture interior is vacuum there)
+            inside = self._metal_inside(pts_2d)
             # keep the wall-jump layer (see docstring); zero only deep interior
             deep = binary_erosion(inside.reshape(nx, ny), iterations=3)
             ex[deep] = 0.0
@@ -1950,6 +2440,21 @@ def solve_gap_field(model: ElectrodeModel,
         raise ValueError("solver must be 'auto', 'cupy', 'scipy' or 'strong', "
                          f"got {solver!r}")
     bempp = _bempp(device_interface)
+    n = int(model.n_elements)
+    if bempp.DEFAULT_DEVICE_INTERFACE == 'opencl':
+        # the OpenCL device caps single allocations well below host RAM; the
+        # dense matrix must fit in one buffer, else assemble with numba
+        try:
+            from bempp_cl.core.opencl_kernels import default_cpu_device
+            max_alloc = int(default_cpu_device().max_mem_alloc_size)
+        except Exception:
+            max_alloc = None
+        if max_alloc is not None and 8.0 * n * n > 0.9 * max_alloc:
+            if verbose:
+                print(f"[gap_fields] {n} elements: dense matrix {8.0 * n * n / 2**30:.1f} GB "
+                      f"exceeds the OpenCL device's max allocation "
+                      f"({max_alloc / 2**30:.1f} GB); assembling with numba")
+            bempp = _bempp('numba')
     from bempp_cl.api.operators.boundary import laplace as lap_bnd
 
     grid = bempp.Grid(model.vertices.T.copy(),
@@ -1968,7 +2473,11 @@ def solve_gap_field(model: ElectrodeModel,
               f"{t_asm:.1f} s ({backend})")
 
     if restart is None:
-        restart = 1000 if solver == 'strong' else 200
+        # thin-feature meshes (min_metal_width ~ 1 mm) stall at restart 200
+        # where restart 1000 converges; the Krylov basis costs 8 N restart
+        # bytes, i.e. < 0.5 GB up to 60k elements
+        restart = 1000
+    auto = solver == 'auto'
     if solver in ('auto', 'cupy'):
         fits, why = _gpu_fits(n, restart)
         if solver == 'cupy' and not fits:
@@ -1978,20 +2487,31 @@ def solve_gap_field(model: ElectrodeModel,
             if verbose and not fits:
                 print(f"[gap_fields] cupy solver not used: {why}")
 
-    t0 = time.time()
-    if solver == 'strong':
-        from bempp_cl.api.linalg import gmres
-        neumann, info, residuals, n_iter = gmres(
-            slp, dirichlet, tol=tol, maxiter=maxiter, restart=restart,
-            use_strong_form=True, return_residuals=True,
-            return_iteration_count=True)
-        residuals = list(residuals)
-    else:
+    def run(which):
+        if which == 'strong':
+            from bempp_cl.api.linalg import gmres
+            neu, inf, res, it = gmres(
+                slp, dirichlet, tol=tol, maxiter=maxiter, restart=restart,
+                use_strong_form=True, return_residuals=True,
+                return_iteration_count=True)
+            return neu, int(inf), list(res), int(it)
         rhs = dirichlet.projections(slp.dual_to_range)
-        x, info, residuals, n_iter = _gmres_jacobi(
-            weak, rhs, tol=tol, restart=restart, maxiter=maxiter,
-            use_gpu=(solver == 'cupy'))
-        neumann = bempp.GridFunction(space, coefficients=x)
+        x, inf, res, it = _gmres_jacobi(weak, rhs, tol=tol, restart=restart,
+                                        maxiter=maxiter, use_gpu=(which == 'cupy'))
+        return bempp.GridFunction(space, coefficients=x), int(inf), res, int(it)
+
+    t0 = time.time()
+    neumann, info, residuals, n_iter = run(solver)
+    if info != 0 and auto and solver != 'strong':
+        # the Jacobi weak form occasionally stalls on badly conditioned
+        # meshes where the mass-matrix strong form grinds through
+        last = residuals[-1] if len(residuals) else float('nan')
+        if verbose:
+            print(f"[gap_fields] GMRES ({solver}) stalled at residual {last:.1e} after "
+                  f"{time.time() - t0:.0f} s; retrying with the strong form")
+        solver = 'strong'
+        t0 = time.time()
+        neumann, info, residuals, n_iter = run('strong')
     dt = time.time() - t0
     if info != 0:
         last = residuals[-1] if len(residuals) else float('nan')
