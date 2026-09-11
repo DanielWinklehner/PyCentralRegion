@@ -15,7 +15,7 @@ from . import diagnostics
 from . import gap_fields
 from .gap_fields import VoltageProfile
 from . import electrodes3d
-from .electrodes3d import (HeightProfiles, Bar, Post, ExtraSolid, build_electrodes_3d,
+from .electrodes3d import (HeightProfiles, Bar, Post, Patch, ExtraSolid, build_electrodes_3d,
                            auto_bars, bar_clearances, midplane_obstacles, raster_obstacles,
                            combine_obstacles, check_trajectory_clearance)
 from . import polyprism

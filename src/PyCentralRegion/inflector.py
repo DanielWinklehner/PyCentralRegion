@@ -348,14 +348,20 @@ class InflectorModel:
         return raster_obstacles(loops, spacing=spacing, extent=extent, beam_halfwidth=beam_halfwidth,
                                 verbose=self.verbose)
 
-    def extra_solid(self, potential: float = 0.0, name: Optional[str] = None):
-        """The housing as an ``electrodes3d.ExtraSolid`` (3D builder)."""
+    def extra_solid(self, potential: float = 0.0, name: Optional[str] = None,
+                    fuse: bool = True, crop: bool = True):
+        """The housing as an ``electrodes3d.ExtraSolid`` (3D builder).
+
+        ``fuse=False`` keeps the grounded housing a separate body instead of
+        putting its B-rep through the OCC fuse of all ground parts (minutes
+        instead of tens of minutes); ``crop=False`` also skips the crop
+        against the model cylinder. See ``electrodes3d.ExtraSolid``."""
         from .electrodes3d import ExtraSolid
         if self.housing_path is None:
             raise ValueError(f"{self.name}: no housing given")
         return ExtraSolid(self.housing_path, potential=potential, scale=self.housing_scale,
                           rotation_deg=self.rotation_deg, mirror_z=self.housing_flip_z,
-                          name=name or f"{self.name}-housing")
+                          name=name or f"{self.name}-housing", fuse=fuse, crop=crop)
 
     def clearance(self, trajectory, z: float = 0.0, skip_deg: float = 0.0) -> dict:
         """Minimum in-plane distance [m] from a trajectory (N, >= 2) to the

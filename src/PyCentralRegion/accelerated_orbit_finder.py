@@ -137,7 +137,8 @@ def make_beam_from_cylindrical(species, r, theta_deg, z, p_r, p_theta, p_z) -> P
 # against the post-collimator population.
 DEFAULT_LS_WEIGHTS = {'energy': 4.0, 'center': 1.0, 'smooth': 0.5,
                       'envelope': 0.5, 'survival': 4.0, 'phase': 0.5,
-                      'collimated': 4.0}
+                      'collimated': 4.0, 'spread': 0.0}
+SPREAD_SCALE = 0.05          # relative energy spread (std / mean) per residual unit
 DEFAULT_SKIP_TURNS = 2
 
 # Extra revolution periods of tracking budget beyond max_turns. The callback
@@ -295,7 +296,9 @@ class AcceleratedOrbitFinder:
                  verbose: bool = True,
                  checkpoint_file: Optional[str] = None,
                  gap_model: str = 'thin',
-                 reference_centroid: bool = True):
+                 reference_centroid: bool = True,
+                 dimensionality: str = '2D',
+                 z_max: float = 0.1):
 
         self.design = design
         self.target_energy_mev = target_energy_mev
@@ -306,6 +309,14 @@ class AcceleratedOrbitFinder:
         self.checkpoint_file = checkpoint_file
         self.gap_model = gap_model
         self.reference_centroid = reference_centroid
+        # '3D': the tracker also loses particles beyond |z| > z_max; the fields
+        # are whatever the design carries (gridded 3D maps for real 3D tracking:
+        # fields3d), the metal test may be a 3D one (electrodes3d.stacked_obstacles).
+        # The compiled single-particle fast path only exists for 2D fields.
+        if dimensionality not in ('2D', '3D'):
+            raise ValueError("dimensionality must be '2D' or '3D'")
+        self.dimensionality = dimensionality
+        self.z_max = float(z_max)
         self.bem_solution = None
 
         if not design.is_valid(verbose=False):
@@ -328,6 +339,10 @@ class AcceleratedOrbitFinder:
         # (tracking.MetalTerminator). A virtual reference particle is exempt
         # but its contacts are reported in the result metadata ('obstacles').
         self.obstacle_mask = None
+        # Optional callable(finder, initial_beam, dt, max_turns) run by
+        # objective_residuals BEFORE the beam is prepared: e.g. lay out the
+        # bar terminators (obstacle_mask) around the current design orbit.
+        self.pre_track_hook = None
         self._obstacle_terminator = None
         # Spiral inflector attached with attach_inflector(): its housing is a
         # second obstacle test (kept apart from obstacle_mask so callers may
@@ -353,7 +368,8 @@ class AcceleratedOrbitFinder:
         self.last_fast_path = None
 
         self.engine = TrackingEngine(
-            design, algorithm=algorithm, dimensionality='2D', use_rf=True,
+            design, algorithm=algorithm, dimensionality=dimensionality, use_rf=True,
+            z_max=z_max,
             max_radius_m=max_radius_m, verbose=False, gap_model=gap_model,
         )
 
@@ -462,7 +478,8 @@ class AcceleratedOrbitFinder:
 
     def attach_inflector(self, inflector, field: bool = True, obstacle: bool = True,
                          obstacle_spacing: float = 5e-4, beam_halfwidth: float = 0.0,
-                         obstacle_extent: Optional[float] = None, z: float = 0.0) -> dict:
+                         obstacle_extent: Optional[float] = None, z: float = 0.0,
+                         field_dim: int = 2) -> dict:
         """Put the spiral inflector (``inflector.InflectorModel``) into the
         tracking model: its static E-field (midplane slice at ``z``, E_z
         dropped) is superposed on the design's RF field - now and after
@@ -475,7 +492,13 @@ class AcceleratedOrbitFinder:
         Returns the inflector summary."""
         self.inflector = inflector
         if field:
-            self.static_efields = [inflector.midplane_field(z=z)] if inflector.has_field else []
+            if not inflector.has_field:
+                self.static_efields = []
+            elif int(field_dim) == 3:
+                # full 3D tracking: the inflector map as it is (E_z included)
+                self.static_efields = [inflector.field]
+            else:
+                self.static_efields = [inflector.midplane_field(z=z)]
             self._install_efield(None)
         if obstacle and inflector.has_housing:
             self.housing_obstacle = inflector.obstacle(
@@ -1084,6 +1107,13 @@ class AcceleratedOrbitFinder:
         For multiparticle beams (numpart > 1) two extra blocks are appended:
           - envelope:  sqrt(w_v) * std_r_i / 0.005 m       per kept turn.
           - survival:  sqrt(w_u) * lost_fraction_i         per turn (no skip).
+          - spread:    sqrt(w_sp) * (std_E / mean_E)_i / 0.05 per kept turn,
+                       only when ls_weights['spread'] > 0 (the survivors'
+                       relative energy spread - keeps transmission from
+                       being bought with a low-energy tail).
+        ``pre_track_hook`` (attribute), if set, is called first with
+        (finder, initial_beam, dt, max_turns) - after the RF parameters
+        of this evaluation are applied - e.g. to rebuild obstacle rasters.
         """
         self.iteration += 1
         self.last_energy_mev = 0.0
@@ -1095,6 +1125,8 @@ class AcceleratedOrbitFinder:
         wv = np.sqrt(ls_weights.get('envelope', DEFAULT_LS_WEIGHTS['envelope']))
         wu = np.sqrt(ls_weights.get('survival', DEFAULT_LS_WEIGHTS['survival']))
         wp = np.sqrt(ls_weights.get('phase', DEFAULT_LS_WEIGHTS['phase']))
+        w_spread = float(ls_weights.get('spread', DEFAULT_LS_WEIGHTS['spread']))
+        wsp = np.sqrt(w_spread)
         C_SCALE, ENV_SCALE, PHASE_SCALE = 0.02, 0.005, 15.0
         skip = max(0, min(int(skip_turns), max_turns))
         n_s = max(max_turns - 1 - skip, 0)       # kept turn separations
@@ -1122,6 +1154,7 @@ class AcceleratedOrbitFinder:
         p_kept = np.full(n_p, PHASE_SCALE)
         env_turns = np.full(max_turns, ENV_SCALE)
         surv_turns = np.ones(max_turns)          # default: everything lost
+        spread_turns = np.full(max_turns, SPREAD_SCALE)
 
         vals = self._unpack(params, optimize_params)
         if 'bunch_phase' in vals:
@@ -1130,6 +1163,12 @@ class AcceleratedOrbitFinder:
             self.design.set_rf_frequency(vals['rf_freq'])
 
         coll = None
+        if self.pre_track_hook is not None:
+            try:
+                self.pre_track_hook(self, initial_beam, dt, max_turns)
+            except Exception as e:
+                if self.verbose:
+                    print(f"    Iter {self.iteration}: pre_track_hook failed: {e}")
         try:
             # The beam is prepared first so _make_collimator knows whether a
             # virtual reference particle is present (it must not be collimated).
@@ -1199,6 +1238,11 @@ class AcceleratedOrbitFinder:
                         # pad with the last observed loss (early stop on target
                         # energy must not read as "everything lost")
                         surv_turns[n_turns:] = frac_lost[-1]
+                    rel = np.array([t.std_energy_mev / max(t.mean_energy_mev, 1e-9)
+                                    for t in turn_stats], dtype=float)
+                    spread_turns[:min(n_turns, max_turns)] = rel[:max_turns]
+                    if n_turns < max_turns:
+                        spread_turns[n_turns:] = rel[-1]
 
                 self.last_energy_mev = float(energies[-1])
                 self.last_n_turns = n_turns
@@ -1220,6 +1264,8 @@ class AcceleratedOrbitFinder:
         if is_multi:
             blocks['envelope'] = wv * env_turns[skip:] / ENV_SCALE
             blocks['survival'] = wu * surv_turns
+            if w_spread > 0:
+                blocks['spread'] = wsp * spread_turns[skip:] / SPREAD_SCALE
             if coll is not None:
                 wk = np.sqrt(ls_weights.get(
                     'collimated', DEFAULT_LS_WEIGHTS['collimated']))

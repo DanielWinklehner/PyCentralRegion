@@ -19,8 +19,12 @@ them with gmsh, and returns an ``ElectrodeModel`` that
   * GROUND: hill wedges with the hill gap h_g(r), the scroll / central post as
     a full-height solid, grounded POSTS (vertical cylinders), and the valley
     ROOF (liner / valley floor at +-valley_height/2) over everything that is
-    not hill or scroll. All ground pieces are fused into one solid so no
-    interior faces reach the mesh.
+    not hill or scroll. The ground is ONE solid by construction: the crop
+    cylinder minus the valley prism (a 2D boolean of the footprints,
+    extruded) minus the hill-gap solid of revolution; bars are notches in
+    the gap / aperture tools. No OCC fuse is involved (fusing ~30 parts with
+    coincident faces cost minutes per call); only grounded external STEP
+    solids are fused in, optionally (``ExtraSolid.fuse``).
   * CROP: cylinder r <= r_cut, |z| <= z_cut (open truncation - the field is
     trustworthy about one pole gap inside r_cut; keep the seam annulus there).
 
@@ -116,8 +120,9 @@ class Bar:
     (the wedge's low- / high-azimuth gap chain) with the radial interval
     [r_from, r_to] [m] along that chain, or side 'tip' for the wedge's whole
     INNER edge (the trimmed tip front; r_from / r_to unused); bar width [m]
-    measured into the wedge. Dee bars are clipped to the dee height and
-    fused into the dee, ground bars are fused into the ground.
+    measured into the wedge. Bars are notches in the aperture (dee) / hill
+    gap (ground) tools, so they close the aperture over its full height and
+    are part of their electrode by construction (no fuse).
     """
     wedge: str
     side: str
@@ -132,6 +137,22 @@ class Post:
     x: float
     y: float
     radius: float = 0.005
+
+
+@dataclass
+class Patch:
+    """Extra metal block: a footprint polygon (K, 2) [m] extruded between z0
+    and z1 [m], added as its OWN closed solid (grounded by default, or a
+    powered electrode). It may overlap other metal - overlapping bodies are
+    fine for the Dirichlet BEM, exactly coincident faces are not - so let a
+    patch penetrate its neighbours by ~0.5-1 mm rather than touch them.
+    Used for junction fillets / bridges, e.g. between the inflector housing
+    plate and the bar of the neighbouring dummy dee."""
+    polygon: np.ndarray
+    z0: float
+    z1: float
+    potential: float = 0.0
+    name: str = ''
 
 
 @dataclass
@@ -150,6 +171,18 @@ class ExtraSolid:
                  files -> machine frame; commutes with the z rotation).
     translation  (dx, dy, dz) [m] applied last.
     name         label (default: the file stem).
+    fuse         grounded solids only: True (default) puts the solid into the
+                 one OCC fuse of all ground parts; False keeps it a separate
+                 grounded body (no boolean with the other parts). Use False
+                 for a complex B-rep such as the housing STEP (~1400 faces
+                 with splines and tiny edges), where the general fuse takes
+                 20+ min. Overlapping metal is allowed: faces inside a
+                 grounded region carry no charge in the Dirichlet BEM, they
+                 only cost a few elements.
+    crop         False skips the crop against the model cylinder (r_cut,
+                 z_cut) for this solid, i.e. it keeps whatever sticks out of
+                 the model volume; with fuse=False that also avoids the
+                 second expensive boolean on the B-rep.
     """
     path: str
     potential: float = 0.0
@@ -158,6 +191,8 @@ class ExtraSolid:
     translation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     name: str = ''
     mirror_z: bool = False
+    fuse: bool = True
+    crop: bool = True
 
 
 # ============================================================================
@@ -188,6 +223,23 @@ def _prism(occ, poly_m: np.ndarray, z0_mm: float, z1_mm: float) -> int:
     if len(vols) != 1:
         raise RuntimeError("extrusion did not produce exactly one volume")
     return vols[0]
+
+
+def _face(occ, poly_m: np.ndarray, z_mm: float, holes: Sequence[np.ndarray] = ()) -> int:
+    """Plane surface at height z from a closed polygon (m) with optional hole
+    polygons (m); returns the surface tag."""
+    loops = []
+    for ring in (poly_m, *holes):
+        pts = _dedupe_ring(np.asarray(ring, dtype=float)) * MM
+        if len(pts) < 3:
+            raise ValueError("face polygon degenerates to fewer than 3 points")
+        p_tags = [occ.addPoint(x, y, z_mm) for x, y in pts]
+        l_tags = [occ.addLine(p_tags[i], p_tags[(i + 1) % len(p_tags)]) for i in range(len(p_tags))]
+        loops.append(occ.addCurveLoop(l_tags))
+    return occ.addPlaneSurface(loops)
+
+
+BAR_OVERSHOOT = 0.0005      # [m] notch tools reach this far outside their wedge edge
 
 
 def _prism_with_hole(occ, outer_m: np.ndarray, inner_m: np.ndarray, z0_mm: float, z1_mm: float) -> int:
@@ -284,12 +336,15 @@ def _inner_edge(wedge: Wedge) -> np.ndarray:
     return seg
 
 
-def _bar_footprint(wedge: Wedge, bar: Bar) -> np.ndarray:
-    """Closed strip polygon (m) of a bar along a wedge chain interval or its inner edge."""
+def _bar_footprint(wedge: Wedge, bar: Bar, overshoot: float = 0.0) -> np.ndarray:
+    """Closed strip polygon (m) of a bar along a wedge chain interval or its
+    inner edge; ``overshoot`` [m] extends the strip OUTWARD past the wedge
+    edge (used for the notch tools so no face coincides with a wedge wall)."""
     if bar.side == 'tip':
         seg = _inner_edge(wedge)
         off = offset_polyline(seg, +bar.width)          # left of travel = into the wedge
-        return np.vstack([seg, off[::-1]])
+        outer = offset_polyline(seg, -overshoot) if overshoot else seg
+        return np.vstack([outer, off[::-1]])
     if bar.side not in ('lo', 'hi'):
         raise ValueError("Bar.side must be 'lo', 'hi' or 'tip'")
     chain = np.asarray(wedge.chain_lo if bar.side == 'lo' else wedge.chain_hi, dtype=float)
@@ -305,7 +360,8 @@ def _bar_footprint(wedge: Wedge, bar: Bar) -> np.ndarray:
     seg = np.column_stack([np.interp(s_pts, s, chain[:, 0]), np.interp(s_pts, s, chain[:, 1])])
     sign = +1.0 if bar.side == 'lo' else -1.0          # into the wedge (see gap_fields)
     off = offset_polyline(seg, sign * bar.width)
-    return np.vstack([seg, off[::-1]])
+    outer = offset_polyline(seg, -sign * overshoot) if overshoot else seg
+    return np.vstack([outer, off[::-1]])
 
 
 def _wedge(model2d: ElectrodeModel, label: str) -> Wedge:
@@ -322,6 +378,15 @@ def _densify(polyline: np.ndarray, ds: float = 5e-4) -> Tuple[np.ndarray, np.nda
     n = max(2, int(np.ceil(s[-1] / ds)) + 1)
     ss = np.linspace(0.0, s[-1], n)
     return np.column_stack([np.interp(ss, s, pl[:, 0]), np.interp(ss, s, pl[:, 1])]), ss
+
+
+def _nearest_trajectory_radius(pts: np.ndarray, trajectory) -> np.ndarray:
+    """Radius [m] of the trajectory sample nearest to each point (KD-tree)."""
+    from scipy.spatial import cKDTree
+    xy = np.asarray(trajectory, dtype=float)[:, :2]
+    pts = np.atleast_2d(np.asarray(pts, dtype=float))
+    _, k = cKDTree(xy).query(pts)
+    return np.hypot(xy[k, 0], xy[k, 1])
 
 
 def _distance_to_trajectory(pts: np.ndarray, trajectory) -> np.ndarray:
@@ -373,7 +438,8 @@ def bar_clearances(model2d: ElectrodeModel, bars: Sequence[Bar], trajectory) -> 
 def auto_bars(model2d: ElectrodeModel, design_or_cavities, trajectory,
               margin: float = 0.008, r_max: float = 0.20, width: float = 0.010,
               tip: bool = True, ground: bool = True, tip_width: float = 0.003,
-              beam_halfwidth: float = 0.0) -> List[Bar]:
+              beam_halfwidth: float = 0.0, margin_inner: Optional[float] = None,
+              min_length: Optional[float] = None) -> List[Bar]:
     """Bars between the beam crossings, IBA style, from a reference trajectory.
 
     A bar goes on every interval of a gap chain (dee wedges and, with
@@ -389,15 +455,24 @@ def auto_bars(model2d: ElectrodeModel, design_or_cavities, trajectory,
     clearance (``traj_tip_clearance`` in build_gap_electrodes) or the
     injection radius, not the bar. ``design_or_cavities`` is accepted for
     API compatibility; the intervals follow from the trajectory distance.
+    ``margin_inner`` (default ``margin``) replaces ``margin`` on the INNER
+    side of every opening - chain points whose radius is below that of the
+    nearest trajectory point - so an opening can be widened toward the axis
+    only (particles off the design phase gain less and run further in).
+    ``min_length`` (default 2 * width) drops shorter free intervals.
     Use ``bar_clearances`` / ``check_trajectory_clearance`` to verify.
     """
+    min_len = 2.0 * width if min_length is None else float(min_length)
     clearance = margin + beam_halfwidth
+    clearance_in = (margin if margin_inner is None else margin_inner) + beam_halfwidth
     ds_chain = 5e-4
     n_f = max(3, int(np.ceil(width / 1e-3)) + 1)          # samples across the strip
     # the strip is sampled at ds_chain along the chain and width/(n_f-1) across
     # it; add half of the coarser spacing so the bar footprints (checked with
     # bar_clearances) never fall short of the requested clearance
-    clearance_eff = clearance + 0.5 * max(ds_chain, width / (n_f - 1))
+    pad = 0.5 * max(ds_chain, width / (n_f - 1))
+    clearance_eff = clearance + pad
+    clearance_in_eff = clearance_in + pad
     bars: List[Bar] = []
     notes = []
     for w in model2d.wedges:
@@ -413,10 +488,11 @@ def auto_bars(model2d: ElectrodeModel, design_or_cavities, trajectory,
                 d_min = np.full(len(pts), np.inf)
                 for f in np.linspace(0.0, 1.0, n_f):
                     d_min = np.minimum(d_min, _distance_to_trajectory(pts + f * (off - pts), trajectory))
-                free = (d_min >= clearance_eff) & (r <= r_max)
+                inner = r < _nearest_trajectory_radius(pts, trajectory)
+                free = (d_min >= np.where(inner, clearance_in_eff, clearance_eff)) & (r <= r_max)
                 for a, b in _runs(free):
                     r_from, r_to = float(r[a:b + 1].min()), float(r[a:b + 1].max())
-                    if r_to - r_from >= 2.0 * width:
+                    if r_to - r_from >= min_len:
                         bars.append(Bar(w.label, side, r_from, r_to, width))
         if w.kind == 'dee' and tip:
             bar = Bar(w.label, 'tip', 0.0, 0.0, tip_width)
@@ -463,6 +539,7 @@ def build_electrodes_3d(model2d: ElectrodeModel,
                         bars: Sequence[Bar] = (),
                         posts: Sequence[Post] = (),
                         extra_solids: Sequence[ExtraSolid] = (),
+                        patches: Sequence[Patch] = (),
                         scroll_thickness: Optional[float] = None,
                         size_min: float = 0.002,
                         size_max: float = 0.012,
@@ -488,6 +565,9 @@ def build_electrodes_3d(model2d: ElectrodeModel,
         External STEP solids (e.g. the spiral-inflector housing) placed with
         their own scale / rotation / shift; grounded ones are fused into the
         ground solid, others become separate electrodes.
+    patches : sequence of Patch
+        Extra metal blocks (footprint polygon x z-range), each its own solid;
+        grounded ones join the ground group, others are separate electrodes.
     scroll_thickness : float, optional
         Make the scroll / central post a RING of this wall thickness [m]
         instead of a filled prism, so that a housing placed inside it (see
@@ -535,80 +615,80 @@ def build_electrodes_3d(model2d: ElectrodeModel,
     zp = zc + 1.0          # prisms overshoot the crop: coincident cap faces break OCC's intersect
     r_tool = r_cut + 0.010
 
-    # ---- 1. full-height prisms of every footprint --------------------------------
-    prisms: Dict[str, List[int]] = {}
+    # ---- 1. tools --------------------------------------------------------------------
+    # Everything is CUT from a few simple solids (crop cylinder, prisms, solids
+    # of revolution): no per-part crop, no bar fuses, no N-part ground fuse.
+    # OCC's general fuse of many parts sharing coincident faces cost minutes
+    # per call; cuts of simple solids cost well under a second. The bars are
+    # NOTCHES in the aperture tools: what the aperture cut leaves standing in
+    # a notch is the bar, joined to the plates by construction. Bars overshoot
+    # their wedge edge outward by BAR_OVERSHOOT so no notch face coincides
+    # with a wedge wall.
     known_wedges = {w.label for w in dee_wedges + hill_wedges}
     for b in bars:
         if b.wedge not in known_wedges:
             raise ValueError(f"Bar on unknown wedge {b.wedge!r}; wedges: {sorted(known_wedges)}")
-    for w in dee_wedges + hill_wedges:
-        prisms[w.label] = [_prism(occ, w.polygon, -zp, zp)]
-        for j, bar in enumerate([b for b in bars if b.wedge == w.label]):
-            prisms[f"{w.label}#bar{j}"] = [_prism(occ, _bar_footprint(w, bar), -zp, zp)]
-    uncropped: Dict[str, List[int]] = {}
-    hub_keys: List[str] = []
+    dee_bars = [(w, b) for w in dee_wedges for b in bars if b.wedge == w.label]
+    ground_bars = [(w, b) for w in hill_wedges for b in bars if b.wedge == w.label]
+    if dee_bars and h_d is None:
+        warnings.warn("dee bars ignored: the dees have no aperture (solid plates)", stacklevel=2)
+        dee_bars = []
+    if ground_bars and h_g is None:
+        warnings.warn("ground bars ignored: the hills have no gap (solid wedges)", stacklevel=2)
+        ground_bars = []
     housing_mode = model2d.params.get('post_mode') == 'housing'
-    if housing_mode:
-        # the 2D hub is the housing OUTLINE fused with the dummy-dee spokes: a
-        # tall-wall stand-in. In 3D the spokes are extruded and the housing
-        # itself should come from its STEP file (a grounded ExtraSolid);
-        # without one the outline is extruded, with a warning.
-        for j, (lbl, ring) in enumerate(model2d.params.get('spoke_polygons', [])):
-            key = f"spoke#{j}:{lbl}"
-            prisms[key] = [_prism(occ, np.asarray(ring), -zp, zp)]
-            hub_keys.append(key)
-        if not any(float(ex.potential) == 0.0 for ex in extra_solids):
-            warnings.warn("housing-mode 2D model without a grounded ExtraSolid: the housing "
-                          "outline is extruded as a tall-wall prism (pass the housing STEP "
-                          "as ExtraSolid(potential=0) for the real shape)", stacklevel=2)
-            for w in post_wedges:
-                body = _prism(occ, np.asarray(w.polygon), -zp, zp)
-                for h in w.holes:
-                    out, _ = occ.cut([(3, body)], [(3, _prism(occ, np.asarray(h), -zp - 1.0, zp + 1.0))],
-                                     removeObject=True, removeTool=True)
-                    body = [t for d, t in out if d == 3][0]
-                prisms[w.label] = [body]
-                hub_keys.append(w.label)
-    for w in ([] if housing_mode else post_wedges):
-        hub_keys.append(w.label)
-        if scroll_thickness:
-            # OCC's intersect drops this toroidal solid against the crop
-            # cylinder; it lies inside the crop anyway, so build it at the
-            # exact crop height and skip the crop
-            uncropped[w.label] = [_prism_with_hole(occ, np.asarray(w.polygon),
-                                                   _offset_ring(np.asarray(w.polygon), scroll_thickness),
-                                                   -zc, zc)]
-        else:
-            prisms[w.label] = [_prism(occ, w.polygon, -zp, zp)]
-    for j, p in enumerate(posts):
-        prisms[f"post#{j}"] = [occ.addCylinder(p.x * MM, p.y * MM, -zp, 0, 0, 2 * zp, p.radius * MM)]
-    extra_keys: List[Tuple[str, float]] = []
-    for j, ex in enumerate(extra_solids):
-        name = ex.name or f"extra#{j}"
-        prisms[name] = _import_step(occ, gmsh, ex)
-        extra_keys.append((name, float(ex.potential)))
-
-    # ---- 2. crop everything (one boolean) -----------------------------------------
     crop = occ.addCylinder(0, 0, -zc, 0, 0, 2 * zc, r_cut * MM)
-    solids = _boolean(occ, occ.intersect, prisms, crop)
-    for k, vols in solids.items():
-        if not vols:
-            raise RuntimeError(f"{k}: nothing left after the crop (r_cut {r_cut} m, z_cut {z_cut} m)")
-    solids.update(uncropped)
+    t_lap = [time.time()]
 
-    # ---- 3. dees: outer height, aperture, fillet, bars ----------------------------
-    dee_keys = [w.label for w in dee_wedges]
-    bar_keys = [k for k in solids if '#bar' in k and k.split('#')[0] in dee_keys]
-    ground_bar_keys = [k for k in solids if '#bar' in k and k.split('#')[0] not in dee_keys]
+    def lap(label):
+        if verbose:
+            now = time.time()
+            print(f"[electrodes3d] {label}: {now - t_lap[0]:.1f} s")
+            t_lap[0] = now
+
+    def one_volume(out, what):
+        vols = [t for d, t in out if d == 3]
+        if len(vols) != 1:
+            raise RuntimeError(f"{what}: expected one solid, got {len(vols)}")
+        return vols[0]
+
+    def notched(profile, pairs, keep=()):
+        """Solid of revolution |z| <= profile(r)/2 minus the bar prisms
+        (notches) and minus the ``keep`` prisms (regions that must stay full
+        height, e.g. the scroll / posts)."""
+        tool = _revolved(occ, profile, r_tool)
+        tools = [(3, _prism(occ, _bar_footprint(w, b, overshoot=BAR_OVERSHOOT), -zp, zp)) for w, b in pairs]
+        tools += [(3, t) for t in keep]
+        if tools:
+            out, _ = occ.cut([(3, tool)], tools, removeObject=True, removeTool=True)
+            tool = one_volume(out, "aperture tool with notches")
+        return tool
+
+    # ---- 2. dees: prism ∩ (crop ∩ outer height) - (aperture - bar notches) ------------
+    dee_tool = occ.copy([(3, crop)])[0][1]
     if H_d is not None:
-        clipped = _boolean(occ, occ.intersect, {k: solids[k] for k in dee_keys + bar_keys}, _revolved(occ, H_d, r_tool))
-        solids.update(clipped)
-    if h_d is not None:
-        hollowed = _boolean(occ, occ.cut, {k: solids[k] for k in dee_keys}, _revolved(occ, h_d, r_tool))
-        solids.update(hollowed)
-    for k in dee_keys:
-        if not solids[k]:
-            raise RuntimeError(f"{k}: no metal left after the height / aperture booleans")
+        out, _ = occ.intersect([(3, dee_tool)], [(3, _revolved(occ, H_d, r_tool))],
+                               removeObject=True, removeTool=True)
+        dee_tool = one_volume(out, "dee crop/height tool")
+    aperture_tool = notched(h_d, dee_bars) if h_d is not None else None
+    solids: Dict[str, List[int]] = {}
+    for w in dee_wedges:
+        body = _prism(occ, w.polygon, -zp, zp)
+        out, _ = occ.intersect([(3, body)], [(3, occ.copy([(3, dee_tool)])[0][1])],
+                               removeObject=True, removeTool=True)
+        bodies = [t for d, t in out if d == 3]
+        if aperture_tool is not None and bodies:
+            out, _ = occ.cut([(3, t) for t in bodies], [(3, occ.copy([(3, aperture_tool)])[0][1])],
+                             removeObject=True, removeTool=True)
+            bodies = [t for d, t in out if d == 3]
+        if not bodies:
+            raise RuntimeError(f"{w.label}: no metal left after the crop / height / aperture booleans")
+        solids[w.label] = bodies
+    occ.remove([(3, dee_tool)], recursive=True)
+    if aperture_tool is not None:
+        occ.remove([(3, aperture_tool)], recursive=True)
+    lap(f"{len(dee_wedges)} dees (crop, outer height, aperture with {len(dee_bars)} bar notches)")
+    dee_keys = [w.label for w in dee_wedges]
     if edge_fillet:
         occ.synchronize()
         for k in dee_keys:
@@ -627,45 +707,95 @@ def build_electrodes_3d(model2d: ElectrodeModel,
                     warnings.warn(f"{k}: edge fillet failed ({exc}); continuing without", stacklevel=2)
                     filleted.append(body)
             solids[k] = filleted
-    for k in bar_keys:
-        dee = k.split('#')[0]
-        out, _ = occ.fuse([(3, b) for b in solids[dee]], [(3, b) for b in solids[k]],
-                          removeObject=True, removeTool=True)
-        solids[dee] = [t for d, t in out if d == 3]
-        del solids[k]
+        lap('edge fillets')
 
-    # ---- 4. ground: hill gap, roof, fuse ----------------------------------------
-    hill_keys = [w.label for w in hill_wedges]
-    scroll_keys = list(hub_keys)
-    post_keys = [k for k in solids if k.startswith('post#')]
-    roof_parts: List[int] = []
-    if profiles.valley_height is not None:
-        zv = 0.5 * profiles.valley_height * MM
-        blockers = [occ.copy([(3, t)])[0][1] for k in hill_keys + scroll_keys for t in solids[k]]
-        for z0, z1 in ((zv, zc), (-zc, -zv)):
-            slab = occ.addCylinder(0, 0, z0, 0, 0, z1 - z0, r_cut * MM)
-            tools = [(3, occ.copy([(3, b)])[0][1]) for b in blockers]
-            out, _ = occ.cut([(3, slab)], tools, removeObject=True, removeTool=True)
-            roof_parts.extend(t for d, t in out if d == 3)
-        occ.remove([(3, b) for b in blockers], recursive=True)
-    if h_g is not None:
-        gapped = _boolean(occ, occ.cut, {k: solids[k] for k in hill_keys}, _revolved(occ, h_g, r_tool))
-        solids.update(gapped)
-    grounded_extra = [k for k, pot in extra_keys if pot == 0.0]
-    ground_parts = ([t for k in hill_keys + ground_bar_keys + scroll_keys + post_keys + grounded_extra
-                     for t in solids[k]] + roof_parts)
-    if verbose:
-        for k in scroll_keys + post_keys + grounded_extra + ground_bar_keys:
-            print(f"[electrodes3d]   {k:14s} {sum(occ.getMass(3, t) for t in solids[k]) / MM**3 * 1e6:9.1f} cm3 "
-                  f"in {len(solids[k])} piece(s) @ 0 V (ground part)")
-    occ.synchronize()
-    known = {t for d, t in gmsh.model.getEntities(3)}
-    owners = {t: k for k in hill_keys + scroll_keys + post_keys + grounded_extra for t in solids[k]}
-    owners.update({t: 'roof' for t in roof_parts})
-    missing = [(t, owners[t]) for t in ground_parts if t not in known]
-    if missing:
-        raise RuntimeError(f"ground parts vanished before the fuse: {missing}; "
-                           f"solids = { {k: v for k, v in solids.items()} }")
+    # ---- 3. ground: crop cylinder - valley prism - (hill gap - bar notches - hub) ------
+    # The valley footprint is a 2D boolean (disk minus the hill / hub / post
+    # footprints), extruded to the valley height (or through the whole crop
+    # when there is no roof); hills, hub and posts are what the cut leaves.
+    hubs: List[Tuple[np.ndarray, List[np.ndarray]]] = []      # (outer polygon, holes) at full height
+    if housing_mode:
+        # the 2D hub is the housing OUTLINE fused with the dummy-dee spokes: a
+        # tall-wall stand-in. In 3D the merged dummy dees are ordinary ground
+        # (hill) wedges - their polygons already run into the housing wall and
+        # they get the hill profile like every other dummy dee - and the
+        # housing itself should come from its STEP file (a grounded
+        # ExtraSolid); without one the outline is extruded, with a warning.
+        if not any(float(ex.potential) == 0.0 for ex in extra_solids):
+            warnings.warn("housing-mode 2D model without a grounded ExtraSolid: the housing "
+                          "outline is extruded as a tall-wall prism (pass the housing STEP "
+                          "as ExtraSolid(potential=0) for the real shape)", stacklevel=2)
+            hubs += [(np.asarray(w.polygon, dtype=float), [np.asarray(h, dtype=float) for h in w.holes])
+                     for w in post_wedges]
+    else:
+        for w in post_wedges:
+            poly = np.asarray(w.polygon, dtype=float)
+            hubs.append((poly, [_offset_ring(poly, scroll_thickness)] if scroll_thickness else []))
+    roof = profiles.valley_height is not None
+    zv = 0.5 * profiles.valley_height * MM if roof else zp
+    blockers = [(2, _face(occ, w.polygon, -zv)) for w in hill_wedges]
+    blockers += [(2, _face(occ, poly, -zv, holes)) for poly, holes in hubs]
+    blockers += [(2, occ.addDisk(p.x * MM, p.y * MM, -zv, p.radius * MM, p.radius * MM)) for p in posts]
+    disk = occ.addDisk(0, 0, -zv, (r_cut + 0.001) * MM, (r_cut + 0.001) * MM)
+    if blockers:
+        out, _ = occ.cut([(2, disk)], blockers, removeObject=True, removeTool=True)
+        valley_faces = [t for d, t in out if d == 2]
+    else:
+        valley_faces = [disk]
+    valley = [t for d, t in occ.extrude([(2, f) for f in valley_faces], 0.0, 0.0, 2 * zv) if d == 3]
+    out, _ = occ.cut([(3, occ.copy([(3, crop)])[0][1])], [(3, v) for v in valley],
+                     removeObject=True, removeTool=True)
+    ground_body = [t for d, t in out if d == 3]
+    if h_g is not None and ground_body:
+        keep = [_prism(occ, poly, -zp, zp) for poly, _ in hubs]
+        keep += [occ.addCylinder(p.x * MM, p.y * MM, -zp, 0, 0, 2 * zp, p.radius * MM) for p in posts]
+        gap_tool = notched(h_g, ground_bars, keep)
+        out, _ = occ.cut([(3, t) for t in ground_body], [(3, gap_tool)], removeObject=True, removeTool=True)
+        ground_body = [t for d, t in out if d == 3]
+    if not ground_body:
+        raise RuntimeError("no ground metal left after the valley / hill-gap booleans")
+    lap(f"ground block (valley over {len(blockers)} footprints, hill gap with {len(ground_bars)} bar notches)")
+
+    # ---- 4. external solids: crop, fuse grounded ones into the ground (optional) -----
+    extra_keys: List[Tuple[str, float]] = []
+    separate_extra: List[str] = []              # grounded, kept out of the ground fuse
+    to_crop: Dict[str, List[int]] = {}
+    for j, ex in enumerate(extra_solids):
+        name = ex.name or f"extra#{j}"
+        t_imp = time.time()
+        bodies = _import_step(occ, gmsh, ex)
+        if getattr(ex, 'crop', True):
+            to_crop[name] = bodies
+        else:
+            solids[name] = bodies
+        extra_keys.append((name, float(ex.potential)))
+        if float(ex.potential) == 0.0 and not getattr(ex, 'fuse', True):
+            separate_extra.append(name)
+        if verbose:
+            occ.synchronize()
+            n_f = len({f for d, f in gmsh.model.getBoundary([(3, b) for b in bodies], oriented=False,
+                                                            recursive=False)})
+            print(f"[electrodes3d]   {name}: {len(bodies)} body(ies), {n_f} faces imported in "
+                  f"{time.time() - t_imp:.1f} s ({'cropped' if getattr(ex, 'crop', True) else 'uncropped'}, "
+                  f"{'fused' if name not in separate_extra else 'separate'})")
+    for j, pa in enumerate(patches):
+        name = pa.name or f"patch#{j}"
+        if name in solids:
+            raise ValueError(f"duplicate solid name {name!r}")
+        solids[name] = [_prism(occ, np.asarray(pa.polygon, dtype=float), float(pa.z0) * MM, float(pa.z1) * MM)]
+        if float(pa.potential) == 0.0:
+            separate_extra.append(name)          # own grounded body, no boolean
+        else:
+            extra_keys.append((name, float(pa.potential)))
+    if to_crop:
+        solids.update(_boolean(occ, occ.intersect, to_crop, occ.copy([(3, crop)])[0][1]))
+        for k in to_crop:
+            if not solids[k]:
+                raise RuntimeError(f"{k}: nothing left after the crop (r_cut {r_cut} m, z_cut {z_cut} m)")
+        lap(f"crop of {len(to_crop)} external solid(s)")
+    occ.remove([(3, crop)], recursive=True)
+    fused_extra = [k for k, pot in extra_keys if pot == 0.0 and k not in separate_extra]
+    ground_parts = list(ground_body) + [t for k in fused_extra for t in solids[k]]
     if len(ground_parts) > 1:
         # OCC's fuse fails on pieces touching along exactly coincident faces
         # (it returns nothing). Fall back to the un-fused parts: interior
@@ -682,8 +812,10 @@ def build_electrodes_3d(model2d: ElectrodeModel,
             warnings.warn("OCC could not fuse the ground parts; keeping them separate "
                           "(interior faces are harmless for the Dirichlet BEM)", stacklevel=2)
             ground_solids = list(ground_parts)
+        lap(f"ground fuse of {len(ground_parts)} parts ({', '.join(fused_extra)})")
     else:
         ground_solids = list(ground_parts)
+    ground_solids += [t for k in separate_extra for t in solids[k]]     # un-fused grounded extras
     dee_solids: List[Tuple[str, float, List[int]]] = [
         (w.label, float(w.potential), solids[w.label]) for w in dee_wedges]
     dee_solids += [(k, pot, solids[k]) for k, pot in extra_keys if pot != 0.0]   # powered extras
@@ -701,10 +833,12 @@ def build_electrodes_3d(model2d: ElectrodeModel,
                              fixDegenerated=True, fixSmallEdges=True, fixSmallFaces=True,
                              sewFaces=False, makeSolids=False)
         ground_solids = [t for d, t in out if d == 3] or ground_solids
+        lap('healShapes')
     occ.synchronize()
     if verbose:
-        print(f"[electrodes3d] solids: {len(dee_solids)} dee, {len(ground_solids)} ground "
-              f"(fused from {len(ground_parts)} parts) in {time.time() - t_start:.1f} s")
+        print(f"[electrodes3d] solids: {len(dee_solids)} dee, {len(ground_solids)} ground"
+              + (f" ({len(separate_extra)} separate)" if separate_extra else '')
+              + f" in {time.time() - t_start:.1f} s")
         for name, pot, bodies in dee_solids:
             vol = sum(occ.getMass(3, t) for t in bodies) / MM**3 * 1e6
             print(f"[electrodes3d]   {name:14s} {vol:9.1f} cm3 in {len(bodies)} piece(s) @ {pot:+9.1f} V")
@@ -765,8 +899,14 @@ def build_electrodes_3d(model2d: ElectrodeModel,
     for i, (name, pot, bodies) in enumerate(dee_solids):
         tag = gmsh.model.addPhysicalGroup(2, faces_of(bodies), tag=10 + i)
         groups.append((name, pot, tag))
-    tag = gmsh.model.addPhysicalGroup(2, gnd_faces, tag=1)
+    # un-fused grounded extras are their own solids (they may overlap the
+    # fused ground; per-solid outlines let the obstacle rasters OR them)
+    separate_bodies = {t for k in separate_extra for t in solids[k]}
+    tag = gmsh.model.addPhysicalGroup(2, faces_of([t for t in ground_solids if t not in separate_bodies]), tag=1)
     groups.append(('ground', 0.0, tag))
+    for j, k in enumerate(separate_extra):
+        tag = gmsh.model.addPhysicalGroup(2, faces_of(solids[k]), tag=2 + j)
+        groups.append((k, 0.0, tag))
 
     # ---- 6. mesh + export -----------------------------------------------------------
     t0 = time.time()
@@ -826,6 +966,65 @@ def build_electrodes_3d(model2d: ElectrodeModel,
 # ============================================================================
 # Diagnostics
 # ============================================================================
+def _mesh_groups(model: ElectrodeModel) -> List[dict]:
+    """Triangle groups of a model: its solids (3D builder) or, for any other
+    ElectrodeModel, one group per distinct potential."""
+    if model.params.get('solids'):
+        return [dict(s) for s in model.params['solids']]
+    pots = np.asarray(model.potentials, dtype=float)
+    groups = []
+    for v in np.unique(pots):
+        idx = np.flatnonzero(pots == v)
+        groups.append({'name': f"{v:+.0f} V", 'potential': float(v), 'indices': idx})
+    return groups
+
+
+def show_model(model: ElectrodeModel, title: str = 'electrodes', write: Optional[str] = None,
+               run_gui: bool = True) -> None:
+    """Load a finished electrode mesh (2D or 3D ``ElectrodeModel``) into a
+    fresh gmsh session as discrete surfaces - one per solid / potential, named
+    physical groups, coloured per group - optionally write it (``write`` =
+    .msh / .vtk / .stl ... path, any format gmsh writes) and open the gmsh
+    GUI (``run_gui``). Coordinates are shown in mm."""
+    import gmsh
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    gmsh.model.add(title)
+    verts = np.asarray(model.vertices, dtype=float) * MM
+    tris = np.asarray(model.triangles, dtype=np.int64)
+    node_tags = np.arange(1, len(verts) + 1, dtype=np.uint64)
+    next_elem = 1
+    first = True
+    for g in _mesh_groups(model):
+        if 'indices' in g:
+            sel = tris[g['indices']]
+        else:
+            n0, n1 = g['tri_range']
+            sel = tris[n0:n1]
+        if len(sel) == 0:
+            continue
+        tag = gmsh.model.addDiscreteEntity(2)
+        if first:                                   # nodes are global; attach them once
+            gmsh.model.mesh.addNodes(2, tag, node_tags, verts.ravel())
+            first = False
+        etags = np.arange(next_elem, next_elem + len(sel), dtype=np.uint64)
+        next_elem += len(sel)
+        gmsh.model.mesh.addElementsByType(tag, 2, etags, (sel + 1).astype(np.uint64).ravel())
+        pg = gmsh.model.addPhysicalGroup(2, [tag])
+        pot = g.get('potential')
+        gmsh.model.setPhysicalName(2, pg, f"{g['name']}" + (f" ({pot:+.0f} V)" if pot is not None else ''))
+    gmsh.option.setNumber("Mesh.SurfaceFaces", 1)
+    gmsh.option.setNumber("Mesh.SurfaceEdges", 1)
+    gmsh.option.setNumber("Mesh.ColorCarousel", 2)      # colour by physical group
+    gmsh.option.setNumber("Mesh.Light", 1)
+    gmsh.option.setNumber("General.Axes", 1)
+    if write:
+        gmsh.write(str(write))
+    if run_gui:
+        gmsh.fltk.run()
+    gmsh.finalize()
+
+
 def solid_meshes(model: ElectrodeModel):
     """{name: trimesh.Trimesh} of the closed solids of a 3D electrode model."""
     import trimesh
@@ -979,6 +1178,8 @@ def combine_obstacles(*tests: Callable[[np.ndarray], np.ndarray]) -> Callable[[n
         return out
 
     inside.parts = tests
+    # a 3D part (ndim = 3) needs z: tracking.MetalTerminator reads this
+    inside.ndim = max(int(getattr(t, 'ndim', 2)) for t in tests)
     return inside
 
 
@@ -996,7 +1197,32 @@ def midplane_obstacles(model: ElectrodeModel, spacing: float = 5e-4, z: float = 
     (``spacing`` well below the thinnest wall, ``beam_halfwidth`` dilation)."""
     ext = float(extent if extent is not None else model.extent())
     if model.params.get('dim') == 3 and 'solids' in model.params:
-        outlines = section_loops(model, z=z)
+        # even-odd per solid (holes), OR across solids: separate grounded
+        # bodies (an un-fused housing) may overlap the fused ground
+        tests = []
+        for name, m in solid_meshes(model).items():
+            loops = loops_from_mesh(m, z=z, name=name)
+            if loops:
+                tests.append(raster_obstacles(loops, spacing=spacing, extent=ext,
+                                              beam_halfwidth=beam_halfwidth, verbose=verbose))
+        if len(tests) > 1:
+            grid = np.logical_or.reduce([t.grid for t in tests])
+            xs, h, n = tests[0].xs, tests[0].spacing, len(tests[0].xs)
+
+            def inside(xy):
+                xy = np.atleast_2d(np.asarray(xy, dtype=float))
+                i = np.rint((xy[:, 0] + ext) / h).astype(int)
+                j = np.rint((xy[:, 1] + ext) / h).astype(int)
+                ok = (i >= 0) & (i < n) & (j >= 0) & (j < n)
+                out = np.zeros(len(xy), dtype=bool)
+                out[ok] = grid[i[ok], j[ok]]
+                return out
+
+            inside.grid, inside.xs, inside.spacing = grid, xs, h
+            return inside
+        outlines = [] if not tests else None
+        if tests:
+            return tests[0]
     elif model.params.get('post_mode') == 'housing':
         # the union hub also holds the hill spokes (flown through between the
         # plates): only the housing outline is an obstacle
@@ -1009,6 +1235,69 @@ def midplane_obstacles(model: ElectrodeModel, spacing: float = 5e-4, z: float = 
                 outlines.extend(np.asarray(h, dtype=float) for h in getattr(w, 'holes', ()))
     return raster_obstacles(outlines, spacing=spacing, extent=ext,
                             beam_halfwidth=beam_halfwidth, verbose=verbose)
+
+
+def stacked_obstacles(model: ElectrodeModel, z_levels, spacing: float = 5e-4, extent: Optional[float] = None,
+                      beam_halfwidth: float = 0.0, verbose: bool = False) -> Callable[[np.ndarray], np.ndarray]:
+    """3D metal test ``inside(xyz) -> bool`` for tracking: the plane sections
+    of every solid at each of ``z_levels`` [m] (sorted, evenly spaced)
+    rasterised as in ``midplane_obstacles`` and stacked; a point is tested on
+    the nearest plane, so the test is exact to half a cell in x-y and half a
+    level spacing in z. Beyond the first / last level (and off the grid) the
+    space is vacuum - bound it with the tracker's vertical limit. (N, 2)
+    input is taken at z = 0. The dee plates, hill faces, bars, patches and an
+    un-fused housing solid all become real 3D apertures. The callable
+    carries ``grid`` (nx, ny, nz), ``xs``, ``zs``, ``spacing`` and
+    ``ndim = 3`` (read by ``tracking.MetalTerminator``)."""
+    if not (model.params.get('dim') == 3 and 'solids' in model.params):
+        raise ValueError("stacked_obstacles needs a 3D electrode model (build_electrodes_3d)")
+    zs = np.sort(np.asarray(z_levels, dtype=float).ravel())
+    if len(zs) < 2 or np.ptp(np.diff(zs)) > 1e-9 * max(abs(zs).max(), 1e-3):
+        raise ValueError("z_levels must be >= 2 evenly spaced heights")
+    ext = float(extent if extent is not None else model.extent())
+    meshes = solid_meshes(model)
+    t0 = time.time()
+    grid = None
+    xs = h = None
+    for k, z in enumerate(zs):
+        plane = None
+        for name, m in meshes.items():
+            loops = loops_from_mesh(m, z=float(z), name=name)
+            if not loops:
+                continue
+            t = raster_obstacles(loops, spacing=spacing, extent=ext, beam_halfwidth=beam_halfwidth)
+            plane = t.grid if plane is None else (plane | t.grid)
+            xs, h = t.xs, t.spacing
+        if grid is None:
+            if xs is None:
+                n = int(np.ceil(2.0 * ext / spacing)) + 1
+                xs = np.linspace(-ext, ext, n)
+                h = float(xs[1] - xs[0])
+            grid = np.zeros((len(xs), len(xs), len(zs)), dtype=bool)
+        if plane is not None:
+            grid[:, :, k] = plane
+    n = len(xs)
+    dz = float(zs[1] - zs[0])
+    z0 = float(zs[0])
+    if verbose:
+        print(f"[electrodes3d] stacked obstacles {n}x{n}x{len(zs)} at {h * 1e3:.2f} mm x {dz * 1e3:.1f} mm, "
+              f"z {zs[0] * 1e3:.0f}..{zs[-1] * 1e3:.0f} mm ({100 * grid.mean():.1f}% metal) in {time.time() - t0:.0f} s")
+
+    def inside(pts):
+        p = np.atleast_2d(np.asarray(pts, dtype=float))
+        i = np.rint((p[:, 0] + ext) / h).astype(int)
+        j = np.rint((p[:, 1] + ext) / h).astype(int)
+        if p.shape[1] >= 3:
+            k = np.rint((p[:, 2] - z0) / dz).astype(int)
+        else:
+            k = np.full(len(p), int(round(-z0 / dz)))
+        ok = (i >= 0) & (i < n) & (j >= 0) & (j < n) & (k >= 0) & (k < len(zs))
+        out = np.zeros(len(p), dtype=bool)
+        out[ok] = grid[i[ok], j[ok], k[ok]]
+        return out
+
+    inside.grid, inside.xs, inside.zs, inside.spacing, inside.ndim = grid, xs, zs, h, 3
+    return inside
 
 
 def check_trajectory_clearance(model_or_inside, trajectory, beam_halfwidth: float = 0.0,

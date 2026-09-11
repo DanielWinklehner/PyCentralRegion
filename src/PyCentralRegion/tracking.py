@@ -236,6 +236,7 @@ class MetalTerminator(Terminator):
 
     def reset(self):
         self.hits = []
+        self.hits_z = []          # z [m] of every entry of hits (3D runs)
         self.ref_hits = []
 
     def update(self, step, r_prev, v_prev, r, v, active, t):
@@ -244,7 +245,9 @@ class MetalTerminator(Terminator):
         idx = np.flatnonzero(active)
         if len(idx) == 0:
             return active
-        hit = np.asarray(self.inside(r[idx, :2]), dtype=bool)
+        # 3D tests (electrodes3d.stacked_obstacles, fields3d.Raster3D) carry ndim = 3
+        cols = 3 if getattr(self.inside, 'ndim', 2) == 3 else 2
+        hit = np.asarray(self.inside(r[idx, :cols]), dtype=bool)
         for p in idx[hit]:
             p = int(p)
             if self.exempt_ref and p == self.ref_particle:
@@ -253,6 +256,7 @@ class MetalTerminator(Terminator):
             active[p] = False
             self.hits.append((p - self.index_offset, int(step),
                               float(r[p, 0]), float(r[p, 1])))
+            self.hits_z.append(float(r[p, 2]))
         return active
 
 
@@ -331,7 +335,8 @@ class TrackingEngine:
                  use_rf: bool = False,
                  max_radius_m: float = 0.5,
                  verbose: bool = True,
-                 gap_model: str = 'thin'):
+                 gap_model: str = 'thin',
+                 z_max: float = 0.1):
         if gap_model not in ('thin', 'bem2d'):
             raise ValueError(f"gap_model must be 'thin' or 'bem2d', got {gap_model!r}")
         self.design = design
@@ -339,6 +344,9 @@ class TrackingEngine:
         self.dim = dimensionality
         self.use_rf = use_rf
         self.r_max = max_radius_m
+        # 3D: |z| beyond this is lost (RadialVerticalTerminator); the metal
+        # test (MetalTerminator with a 3D inside) handles the real apertures
+        self.z_max = float(z_max)
         self.verbose = verbose
         self.gap_model = gap_model
 
@@ -378,7 +386,7 @@ class TrackingEngine:
             interactions.append(RFCavityInteraction(self.design, self.pusher))
 
         if self.dim == '3D':
-            terminators = [RadialVerticalTerminator(self.r_max)]
+            terminators = [RadialVerticalTerminator(self.r_max, z_max=self.z_max)]
         else:
             terminators = [RadialBoundaryTerminator(self.r_max)]
         for tm in self.extra_terminators:

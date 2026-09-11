@@ -35,6 +35,9 @@ class TurnStatistics:
     mean_y: float
     emittance_r: float = 0.0
     n_active: int = 0  # surviving particles at this turn
+    mean_z: float = 0.0     # m (3D tracking; 0 for midplane runs)
+    std_z: float = 0.0
+    max_abs_z: float = 0.0
 
 
 class PoincareAnalyzer:
@@ -395,7 +398,10 @@ class BeamStatisticsCollector:
             mean_x=np.mean(r_active[:, 0]),
             mean_y=np.mean(r_active[:, 1]),
             emittance_r=0.0,  # TODO: calculate properly
-            n_active=int(len(r_active))
+            n_active=int(len(r_active)),
+            mean_z=float(np.mean(r_active[:, 2])) if len(r_active) else 0.0,
+            std_z=float(np.std(r_active[:, 2])) if len(r_active) else 0.0,
+            max_abs_z=float(np.max(np.abs(r_active[:, 2]))) if len(r_active) else 0.0,
         )
 
         self.turn_stats.append(stats)
