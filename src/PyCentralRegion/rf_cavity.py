@@ -819,6 +819,95 @@ def create_four_cavity_system(r_min: float,
     return dees.gaps
 
 
+def gap_crossing_radii(cav, trajectory, merge_tol: float = 1e-3) -> np.ndarray:
+    """Sorted radii [m] where a tracked trajectory crosses a gap's segments
+    (grazing near-duplicates within ``merge_tol`` merged)."""
+    xy = np.asarray(trajectory, dtype=float)[:, :2]
+    crossed, t_cross, _ = cav.check_crossings_batch(xy[:-1], xy[1:])
+    idx = np.where(crossed)[0]
+    if len(idx) == 0:
+        return np.zeros(0)
+    pts = xy[idx] + t_cross[idx, None] * (xy[idx + 1] - xy[idx])
+    crossings = np.sort(np.hypot(pts[:, 0], pts[:, 1]))
+    keep = [crossings[0]]
+    for r in crossings[1:]:
+        if r - keep[-1] > merge_tol:
+            keep.append(r)
+    return np.asarray(keep)
+
+
+def check_variable_segments(design_or_cavities, trajectory,
+                            tip_clearance: float = 0.0,
+                            min_extent: Optional[float] = None,
+                            verbose: bool = True) -> List[dict]:
+    """Flag variable segments the beam never uses, or that leave a short stub.
+
+    For every gap with variable segments the radii where ``trajectory``
+    crosses the gap are extracted (as in ``snap_nodes_between_turns``). The
+    electrode tip sits at ``r_first - tip_clearance`` (the scroll trim rule of
+    ``gap_fields.build_gap_electrodes``), and a segment spanning
+    [r_lo, r_hi] is flagged as
+
+    * ``'unused'`` when r_hi lies below the tip: the whole segment is inside
+      the first orbit crossing. The electrode build trims it away, so it does
+      no harm to the field, but it is a wasted optimizer parameter (and with
+      a non-zero rotation its bridge jog can survive at the tip);
+    * ``'stub'`` when the part of the segment above the tip is shorter than
+      ``min_extent`` (default: twice the gap width at r_hi): a radially short
+      stub between the tip and the joint, i.e. a kink - a field spike - right
+      where the beam crosses. This is the harmful case.
+
+    A gap the trajectory never crosses is reported as ``'uncrossed'``. Nothing
+    is modified; fix a finding by straightening the segment
+    (``cav.update_geometry(segment_angles=[0]*n, segment_rotations=[0]*n)``)
+    or by constraining its radius in the optimizer. Returns a list of dicts
+    with keys gap, segment, kind, r_lo, r_hi, r_first, r_tip, extent [m].
+    """
+    cavities = getattr(design_or_cavities, 'rf_cavities', design_or_cavities)
+    findings: List[dict] = []
+    for gi, cav in enumerate(cavities):
+        if cav.n_variable_segments == 0:
+            continue
+        crossings = gap_crossing_radii(cav, trajectory)
+        if len(crossings) == 0:
+            findings.append({'gap': gi, 'segment': None, 'kind': 'uncrossed',
+                             'r_lo': None, 'r_hi': None, 'r_first': None, 'r_tip': None,
+                             'extent': None})
+            continue
+        r_first = float(crossings[0])
+        r_tip = r_first - tip_clearance
+        for si, seg in enumerate(s for s in cav.segments if s['type'] == 'variable'):
+            r_lo, r_hi = float(seg['r_min']), float(seg['r_max'])
+            straight = (abs(cav.segment_angles[si]) < 1e-9
+                        and (not cav.segment_rotations or abs(cav.segment_rotations[si]) < 1e-9))
+            if straight:
+                continue                       # collinear with its neighbours: no kink
+            extent = r_hi - max(r_lo, r_tip)
+            need = (min_extent if min_extent is not None
+                    else 2.0 * float(cav.gap_width_at(min(r_hi, cav.r_max))))
+            kind = None
+            if r_hi <= r_tip:
+                kind = 'unused'
+            elif extent < need:
+                kind = 'stub'
+            if kind:
+                findings.append({'gap': gi, 'segment': si, 'kind': kind, 'r_lo': r_lo,
+                                 'r_hi': r_hi, 'r_first': r_first, 'r_tip': r_tip,
+                                 'extent': extent})
+    if verbose:
+        for f in findings:
+            if f['kind'] == 'uncrossed':
+                print(f"[segments] gap{f['gap']} ({cavities[f['gap']].base_angle:.1f} deg): "
+                      f"trajectory never crosses it")
+            else:
+                print(f"[segments] gap{f['gap']} ({cavities[f['gap']].base_angle:.1f} deg) "
+                      f"segment {f['segment']} is {f['kind'].upper()}: spans "
+                      f"{f['r_lo'] * 1000:.1f}..{f['r_hi'] * 1000:.1f} mm, first crossing "
+                      f"{f['r_first'] * 1000:.1f} mm, tip {f['r_tip'] * 1000:.1f} mm, usable "
+                      f"extent {f['extent'] * 1000:.1f} mm")
+    return findings
+
+
 def snap_nodes_between_turns(design_or_cavities, trajectory,
                              verbose: bool = True):
     """Shift each gap's segment node radii midway between its turn crossings.

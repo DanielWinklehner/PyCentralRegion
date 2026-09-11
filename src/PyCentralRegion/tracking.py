@@ -208,6 +208,82 @@ class RadialSlitCollimator(Terminator):
         return active
 
 
+class MetalTerminator(Terminator):
+    """Lose particles that enter metal.
+
+    ``inside(xy) -> bool array`` is any midplane obstacle test, e.g.
+    ``electrodes3d.midplane_obstacles(model)`` (the 3D solids rasterised at
+    z = 0, optionally dilated by a beam half-width). The tall-wall 2D
+    footprints are NOT obstacles - the beam flies through the dee and hill
+    wedges between their plates - only the scroll / central post is.
+
+    Interceptions are logged in ``hits`` as (particle, step, x_m, y_m) with
+    ``index_offset`` removed (see RadialSlitCollimator). A virtual reference
+    particle (``exempt_ref``) is never removed - losing it would end turn
+    counting - but its contacts are logged in ``ref_hits`` as (step, x, y) so
+    the caller can fail loudly. ``every`` thins the test to every n-th step.
+    ``reset()`` is called by TrackingEngine before every run.
+    """
+
+    def __init__(self, inside, index_offset=0, ref_particle=0, exempt_ref=False,
+                 every=1):
+        self.inside = inside
+        self.index_offset = int(index_offset)
+        self.ref_particle = int(ref_particle)
+        self.exempt_ref = bool(exempt_ref)
+        self.every = max(1, int(every))
+        self.reset()
+
+    def reset(self):
+        self.hits = []
+        self.ref_hits = []
+
+    def update(self, step, r_prev, v_prev, r, v, active, t):
+        if step % self.every:
+            return active
+        idx = np.flatnonzero(active)
+        if len(idx) == 0:
+            return active
+        hit = np.asarray(self.inside(r[idx, :2]), dtype=bool)
+        for p in idx[hit]:
+            p = int(p)
+            if self.exempt_ref and p == self.ref_particle:
+                self.ref_hits.append((int(step), float(r[p, 0]), float(r[p, 1])))
+                continue
+            active[p] = False
+            self.hits.append((p - self.index_offset, int(step),
+                              float(r[p, 0]), float(r[p, 1])))
+        return active
+
+
+class TimedRelease(Interaction):
+    """Staggered launch: particle i starts moving at its birth step.
+
+    ``birth_step[i]`` is the first step in which particle i is pushed. The
+    particles with birth_step 0 must be alive in the initial distribution;
+    the others start with ``alive = False`` - frozen where they are, since the
+    tracker pushes, kicks and tests only active particles - and are released
+    here at the end of step ``birth_step - 1``. Built by
+    ``AcceleratedOrbitFinder.track_with_rf`` from
+    ``ParticleDistribution.birth_time`` (see ``handoff.make_beam_from_handoff``);
+    the clock starts at the earliest birth, the bunch centre is born at t = 0.
+    Not for the Boris pusher (its half-step start would be skipped for late
+    particles). ``released`` counts the particles released so far.
+    """
+
+    def __init__(self, birth_step):
+        self.birth_step = np.asarray(birth_step, dtype=int)
+        self.released = int(np.sum(self.birth_step == 0))
+
+    def apply(self, step, r_prev, v_prev, r, v, active, t, dt):
+        due = self.birth_step == step + 1
+        if np.any(due):
+            active = active.copy()
+            active[due] = True
+            self.released += int(due.sum())
+        return r, v, active
+
+
 class CallbackRecorder(Recorder):
     """Adapt a legacy callback(step, r, v, active, t) -> terminate into a Recorder."""
 
@@ -271,8 +347,10 @@ class TrackingEngine:
 
         # Extra terminators (e.g. RadialSlitCollimator) appended to the
         # boundary terminator on every run; stateful ones exposing
-        # reset() are reset per run.
+        # reset() are reset per run. Extra interactions (e.g. TimedRelease)
+        # run BEFORE the RF kicks.
         self.extra_terminators = []
+        self.extra_interactions = []
 
         # Temporary ParticleDistribution for calculations
         self.pd_temp = ParticleDistribution(species=design.species)
@@ -295,7 +373,9 @@ class TrackingEngine:
     def _build_hooks(self, callback):
         """Assemble interaction / terminator / recorder hooks for this config."""
         use_kicks = self.use_rf and self.gap_model == 'thin'
-        interactions = [RFCavityInteraction(self.design, self.pusher)] if use_kicks else []
+        interactions = list(self.extra_interactions)
+        if use_kicks:
+            interactions.append(RFCavityInteraction(self.design, self.pusher))
 
         if self.dim == '3D':
             terminators = [RadialVerticalTerminator(self.r_max)]
@@ -315,13 +395,15 @@ class TrackingEngine:
                             n_steps: int,
                             callback: Optional[Callable] = None,
                             callback_frequency: int = 1,
-                            show_progress: bool = True) -> TrackingResult:
+                            show_progress: bool = True,
+                            t0: float = 0.0) -> TrackingResult:
         """
         Track multiple particles via the centralized Tracker.
 
         The callback signature is unchanged: callback(step, r, v, active, t) -> bool
         (return True to terminate). It is invoked every ``callback_frequency`` steps
-        with the post-step time, exactly as before.
+        with the post-step time, exactly as before. ``t0`` is the clock at the
+        start (negative for a staggered launch whose bunch centre is born at 0).
         """
         interactions, terminators, recorders = self._build_hooks(callback)
 
@@ -335,7 +417,7 @@ class TrackingEngine:
 
         # sync_back=False preserves the legacy contract of not mutating pd_init;
         # the alive mask is still returned in the result.
-        res = tracker.run(pd_init, dt, n_steps,
+        res = tracker.run(pd_init, dt, n_steps, t0=float(t0),
                           record_every=callback_frequency,
                           show_progress=show_progress, sync_back=False)
 
