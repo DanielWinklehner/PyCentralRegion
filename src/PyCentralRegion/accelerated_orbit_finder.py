@@ -26,6 +26,7 @@ from .tracking import TrackingEngine
 from .diagnostics import (PoincareAnalyzer, calculate_turn_metrics,
                           BeamStatisticsCollector, TurnStatistics)
 from PyPATools.particles import ParticleDistribution
+from PyPATools.field import Field
 from PyPATools.global_variables import CLIGHT
 
 
@@ -322,6 +323,34 @@ class AcceleratedOrbitFinder:
         self.n_particles = 1
         self.is_multiparticle = False
         self._n_ref = 0
+        # Optional midplane obstacle test inside(xy) -> bool array (see
+        # electrodes3d.midplane_obstacles): particles entering metal are lost
+        # (tracking.MetalTerminator). A virtual reference particle is exempt
+        # but its contacts are reported in the result metadata ('obstacles').
+        self.obstacle_mask = None
+        self._obstacle_terminator = None
+        # Spiral inflector attached with attach_inflector(): its housing is a
+        # second obstacle test (kept apart from obstacle_mask so callers may
+        # swap that one freely) and its static E-field is superposed on
+        # whatever RF field the design carries (re-applied by
+        # attach_bem_field after every re-solve).
+        self.inflector = None
+        self.housing_obstacle = None
+        self.static_efields = []
+        self._base_efield = None
+        # Launch mode for beams that carry birth times (handoff files):
+        # 'timed' (default) releases every particle at its own crossing time,
+        # the bunch centre (virtual reference) at t = 0; 'snapshot' ignores
+        # the birth times and launches everything at once.
+        self.launch = 'timed'
+        self.last_launch = None
+        # Compiled single-particle fast path (fast_track.py): used for one
+        # physical particle with rk4_rel on 2D gridded fields (thin-gap kicks
+        # or a bem2d TimedField), the same callback replays the recorded
+        # steps, so the diagnostics are identical. Set False to force the
+        # general PyPATools Tracker path; last_fast_path says what happened.
+        self.fast_path = True
+        self.last_fast_path = None
 
         self.engine = TrackingEngine(
             design, algorithm=algorithm, dimensionality='2D', use_rf=True,
@@ -397,9 +426,104 @@ class AcceleratedOrbitFinder:
         timed, solution = make_bem_efield(
             self.design, build_kwargs=build_kwargs, solve_kwargs=solve_kwargs,
             field_kwargs=field_kwargs, verbose=self.verbose)
-        self.design.set_electric_field(timed)
+        self._install_efield(timed)
         self.bem_solution = solution
         return timed
+
+    def _install_efield(self, rf_field):
+        """Install the design's BASE E-field (``rf_field``, a TimedField from
+        a BEM solve, or - when None - the field the design had before any
+        static field was attached: the zero field of the thin-gap model or the
+        last TimedField) superposed with the attached static fields
+        (``static_efields``: the inflector's map) as ``design.efield``."""
+        from .inflector import superpose_efield
+        if rf_field is not None:
+            self._base_efield = rf_field
+        elif self._base_efield is None:
+            self._base_efield = self.design.efield
+        base = self._base_efield
+        if self.static_efields:
+            self.design.set_electric_field(superpose_efield(base, self.static_efields))
+        elif base is not None:
+            self.design.set_electric_field(base)
+
+    def attach_inflector(self, inflector, field: bool = True, obstacle: bool = True,
+                         obstacle_spacing: float = 5e-4, beam_halfwidth: float = 0.0,
+                         obstacle_extent: Optional[float] = None, z: float = 0.0) -> dict:
+        """Put the spiral inflector (``inflector.InflectorModel``) into the
+        tracking model: its static E-field (midplane slice at ``z``, E_z
+        dropped) is superposed on the design's RF field - now and after
+        every ``attach_bem_field`` re-solve - and its housing outline becomes
+        a particle-terminating obstacle (``housing_obstacle``; the virtual
+        reference is exempt but its contacts are reported). Neither needs a
+        re-solve when the bunch phase / RF frequency / geometry change. The
+        BEM electrodes themselves get the housing through
+        ``attach_bem_field(build_kwargs={'housing': inflector.housing_polygon()})``.
+        Returns the inflector summary."""
+        self.inflector = inflector
+        if field:
+            self.static_efields = [inflector.midplane_field(z=z)] if inflector.has_field else []
+            self._install_efield(None)
+        if obstacle and inflector.has_housing:
+            self.housing_obstacle = inflector.obstacle(
+                spacing=obstacle_spacing, beam_halfwidth=beam_halfwidth,
+                extent=obstacle_extent, z=z)
+        elif obstacle:
+            self.housing_obstacle = None
+        return inflector.summary()
+
+    def detach_inflector(self):
+        """Remove the inflector's field and housing from the tracking model."""
+        self.inflector = None
+        self.housing_obstacle = None
+        self.static_efields = []
+        if self._base_efield is not None:
+            self.design.set_electric_field(self._base_efield)
+
+    def _run_fast_path(self, args, callback, dt, t0):
+        """Run the compiled kernel and replay its recorded steps through the
+        finder's callback. Returns a TrackingResult, or None when the kernel's
+        own stop decision and the callback's disagree (caller falls back)."""
+        from .fast_track import run_kernel
+        from .tracking import TrackingResult
+        t_start = time.time()
+        (r_hist, v_hist, active_hist, n_done, lost_step, lost_reason,
+         n_cross, stop_reason) = run_kernel(args)
+        active = np.array([True])
+        stopped = False
+        n_used = n_done
+        for step in range(n_done):
+            active[0] = bool(active_hist[step])
+            if callback(step, r_hist[step:step + 1], v_hist[step:step + 1], active,
+                        t0 + (step + 1) * dt):
+                stopped = True
+                n_used = step + 1
+                break
+            if not active[0]:
+                n_used = step + 1
+                break
+        if stop_reason in (2, 3) and not stopped:
+            self.last_fast_path = {'used': False, 'reason': 'kernel/callback stop mismatch'}
+            return None
+        obs = self._obstacle_terminator
+        if obs is not None:
+            obs.reset()
+            if lost_reason == 2:
+                obs.hits.append((0, int(lost_step), float(r_hist[lost_step, 0]), float(r_hist[lost_step, 1])))
+        self.last_fast_path = {'used': True, 'steps': int(n_used), 'kernel_steps': int(n_done),
+                               'crossings': int(n_cross), 'stop_reason': int(stop_reason),
+                               'seconds': time.time() - t_start}
+        r_final = r_hist[n_used - 1:n_used].copy()
+        v_final = v_hist[n_used - 1:n_used].copy()
+        active_final = np.array([bool(active_hist[n_used - 1])])
+        t_final = t0 + n_used * dt
+        if not active_final[0]:
+            return TrackingResult(False, n_used, r_final, v_final, active_final,
+                                  {'termination': 'all_lost', 'time': t_final})
+        if stopped:
+            return TrackingResult(True, n_used, r_final, v_final, active_final,
+                                  {'termination': 'turns_or_energy_reached', 'time': t_final})
+        return TrackingResult(True, n_used, r_final, v_final, active_final, {'time': t_final})
 
     def _rf_base_frequency(self) -> float:
         """Base (orbital) frequency stored on the cavities [Hz]."""
@@ -418,9 +542,16 @@ class AcceleratedOrbitFinder:
         self.n_particles = int(beam.numpart) - self._n_ref
         self.is_multiparticle = self.n_particles > 1
 
+    _BEAM_EXTRAS = ('birth_time', 'reference_state', 'handoff_meta', 'macro_charge_c')
+
     def _copy_beam(self, beam: ParticleDistribution) -> ParticleDistribution:
-        return ParticleDistribution(species=self.design.species,
-                                    x_vec=beam.x_vec.copy(), p_vec=beam.p_vec.copy())
+        pd = ParticleDistribution(species=self.design.species,
+                                  x_vec=beam.x_vec.copy(), p_vec=beam.p_vec.copy())
+        for name in self._BEAM_EXTRAS:            # hand-off extras (see handoff.py)
+            if hasattr(beam, name):
+                val = getattr(beam, name)
+                setattr(pd, name, val.copy() if isinstance(val, np.ndarray) else val)
+        return pd
 
     def _with_reference_particle(self, pd: ParticleDistribution) -> Tuple[ParticleDistribution, int]:
         """Prepend the bunch centroid as a VIRTUAL particle 0.
@@ -442,10 +573,27 @@ class AcceleratedOrbitFinder:
         """
         if not self.reference_centroid or int(pd.numpart) < 2:
             return pd, 0
-        x = np.vstack([pd.x_vec.mean(axis=0), pd.x_vec])
-        p = np.vstack([pd.p_vec.mean(axis=0), pd.p_vec])
-        return ParticleDistribution(species=self.design.species,
-                                    x_vec=x, p_vec=p), 1
+        ref = getattr(pd, 'reference_state', None)
+        if ref is not None:
+            # hand-off beams name their reference (design particle or centroid
+            # at the plane, born at t = 0 = the bunch centre's crossing time)
+            x_ref = np.asarray(ref[0], dtype=float).reshape(1, 3)
+            tmp = ParticleDistribution(species=self.design.species, x_vec=x_ref.copy(),
+                                       p_vec=np.zeros((1, 3)))
+            tmp.set_p_from_v_vec(np.asarray(ref[1], dtype=float).reshape(1, 3))
+            x = np.vstack([x_ref, pd.x_vec])
+            p = np.vstack([tmp.p_vec, pd.p_vec])
+        else:
+            x = np.vstack([pd.x_vec.mean(axis=0), pd.x_vec])
+            p = np.vstack([pd.p_vec.mean(axis=0), pd.p_vec])
+        out = ParticleDistribution(species=self.design.species, x_vec=x, p_vec=p)
+        birth = getattr(pd, 'birth_time', None)
+        if birth is not None:
+            out.birth_time = np.concatenate([[0.0], np.asarray(birth, dtype=float)])
+        for name in ('handoff_meta', 'macro_charge_c'):
+            if hasattr(pd, name):
+                setattr(out, name, getattr(pd, name))
+        return out, 1
 
     def _prepare_beam(self, initial_beam, r0=None, pr0=None,
                       r0_mode='offset') -> Tuple[ParticleDistribution, int]:
@@ -481,6 +629,15 @@ class AcceleratedOrbitFinder:
         if pr0:
             bg = pr0 / np.sqrt(CLIGHT ** 2 - pr0 ** 2)
             pd.add_mean_momentum(float(bg * r_hat[0]), float(bg * r_hat[1]), 0.0)
+        ref = getattr(pd, 'reference_state', None)
+        if ref is not None:                      # move the named reference with the beam
+            x_ref = np.asarray(ref[0], dtype=float).reshape(3).copy()
+            v_ref = np.asarray(ref[1], dtype=float).reshape(3).copy()
+            if r0:
+                x_ref += r0 * r_hat
+            if pr0:
+                v_ref += pr0 * r_hat
+            pd.reference_state = (x_ref, v_ref)
         return self._with_reference_particle(pd)
 
     @staticmethod
@@ -540,6 +697,31 @@ class AcceleratedOrbitFinder:
             ref_particle=int(cfg.get('ref_particle', 0)),
             exempt_ref=bool(self._n_ref), index_offset=self._n_ref)
 
+    def _terminators(self, coll):
+        """Extra terminators for one run: the collimator (if any) plus the
+        metal test when ``obstacle_mask`` is set. Call after _prepare_beam
+        (both need to know whether a virtual reference particle is present)."""
+        terms = [coll] if coll is not None else []
+        self._obstacle_terminator = None
+        from .electrodes3d import combine_obstacles
+        mask = combine_obstacles(self.obstacle_mask, self.housing_obstacle)
+        if mask is not None:
+            from .tracking import MetalTerminator
+            self._obstacle_terminator = MetalTerminator(
+                mask, index_offset=self._n_ref, ref_particle=0,
+                exempt_ref=bool(self._n_ref))
+            terms.append(self._obstacle_terminator)
+        return terms
+
+    def _obstacle_report(self):
+        """Result metadata for the metal test of the last run (None if unset)."""
+        obs = self._obstacle_terminator
+        if obs is None:
+            return None
+        return {'n_lost': len(obs.hits), 'hits': list(obs.hits[:1000]),
+                'reference_contacts': len(obs.ref_hits),
+                'first_reference_contact': obs.ref_hits[0] if obs.ref_hits else None}
+
     def track_with_rf(self,
                       pd_init: ParticleDistribution,
                       dt: float,
@@ -586,6 +768,34 @@ class AcceleratedOrbitFinder:
         # See TURN_BUDGET_MARGIN: the abort below fires the moment the last turn
         # is logged, so the margin is only ever consumed when actually needed.
         n_steps = (max_turns + TURN_BUDGET_MARGIN) * self.steps_per_turn
+
+        # Staggered launch (hand-off plane): the particles carry birth times
+        # relative to the bunch centre, the virtual reference, born at t = 0.
+        # The clock starts at the EARLIEST birth, so the RF phase at t = 0 -
+        # the bunch-phase parameter - belongs to the bunch centre, not to the
+        # first particle released. Unborn particles are frozen on the plane
+        # (the tracker pushes, kicks and tests only active particles).
+        birth = getattr(pd_init, 'birth_time', None)
+        t0 = 0.0
+        birth_step = np.zeros(int(pd_init.numpart), dtype=int)
+        release = None
+        if self.launch == 'timed' and birth is not None and np.any(np.asarray(birth) != 0.0):
+            if 'boris' in str(getattr(self.engine, 'algorithm', '')).lower():
+                raise ValueError("timed release needs a non-staggered pusher (rk4 / rk4_rel): "
+                                 "the Boris half-step start would be skipped for late-born particles")
+            birth = np.asarray(birth, dtype=float)
+            t0 = float(min(0.0, birth.min()))
+            birth_step = np.rint((birth - t0) / dt).astype(int)
+            n_steps += int(np.ceil(-t0 / dt))
+            pd_init.alive = birth_step == 0
+            from .tracking import TimedRelease
+            release = TimedRelease(birth_step)
+        self.engine.extra_interactions = [release] if release is not None else []
+        self.last_launch = {
+            'mode': 'timed' if release is not None else 'snapshot', 't0_s': t0,
+            'reference_birth_step': int(birth_step[0]) if len(birth_step) else 0,
+            'n_released_later': int(np.sum(birth_step > 0)),
+            'birth_quantization_s': 0.5 * dt if release is not None else 0.0}
         full_beam = (np.full((n_steps, self.n_particles, 6), np.nan)
                      if save_full_beam else None)
 
@@ -596,9 +806,10 @@ class AcceleratedOrbitFinder:
             if n_ref:
                 real = active.copy()
                 real[:n_ref] = False
-                if not np.any(real):
-                    # Physical beam gone; the virtual reference alone would keep
-                    # logging turns over an empty bunch.
+                if not np.any(real) and not np.any(birth_step[n_ref:] > step + 1):
+                    # Physical beam gone (none alive, none still to be born);
+                    # the virtual reference alone would keep logging turns
+                    # over an empty bunch.
                     return True
             else:
                 real = active
@@ -627,7 +838,11 @@ class AcceleratedOrbitFinder:
                 # step 0 compares the post-step position with itself, so no
                 # crossing can be logged there; that is what keeps a launch
                 # exactly on the section from registering immediately.
-                r_prev = r_array[0] if step == 0 else callback.r_prev
+                # first active step (step 0, or the reference's birth step in
+                # a staggered launch): compare with itself, no crossing
+                r_prev = getattr(callback, 'r_prev', None)
+                if r_prev is None:
+                    r_prev = r_array[0]
                 crossed, t_frac = poincare.check_crossing(r_prev, r_array[0])
 
                 if crossed:
@@ -660,16 +875,50 @@ class AcceleratedOrbitFinder:
                 callback.r_prev = r_array[0].copy()
             return False
 
+        fast = None
+        self.last_fast_path = None
+        if self.fast_path and release is None and n_ref == 0 and int(pd_init.numpart) == 1:
+            from .fast_track import build_kernel_args, FastPathUnavailable
+            try:
+                fast = build_kernel_args(self, pd_init, dt, n_steps, t0, section_angle, max_turns)
+            except FastPathUnavailable as exc:
+                self.last_fast_path = {'used': False, 'reason': str(exc)}
         try:
-            result = self.engine.track_multiparticle(
-                pd_init, dt=dt, n_steps=n_steps, callback=callback,
-                callback_frequency=1, show_progress=False,
-            )
+            result = None
+            if fast is not None:
+                result = self._run_fast_path(fast, callback, dt, t0)
+                if result is None:
+                    # kernel and callback disagreed on the stop: redo the
+                    # run on the general path (diagnostics restart clean)
+                    for lst in (trajectory_storage, std_r_storage, turn_ids):
+                        lst.clear()
+                    turn_counter[0] = 0
+                    energy_reached[0] = False
+                    poincare.crossings.clear()
+                    poincare._armed = poincare.arm_angle <= 0.0
+                    poincare._azimuth_travelled = 0.0
+                    beam_stats_collector.__init__(self.design.species, save_frequency=1)
+                    if hasattr(callback, 'r_prev'):
+                        del callback.r_prev
+            if result is None:
+                result = self.engine.track_multiparticle(
+                    pd_init, dt=dt, n_steps=n_steps, callback=callback,
+                    callback_frequency=1, show_progress=False, t0=t0,
+                )
         except Exception as e:
             if self.verbose:
                 print(f"    Tracking exception: {e}")
             return (False, [], [], np.array([]), [[]],
                     np.array([]), [], None)
+        finally:
+            self.engine.extra_interactions = []
+        if (release is not None and result.metadata.get('termination') == 'all_lost'
+                and np.any(birth_step > result.n_steps)):
+            raise RuntimeError(
+                f"staggered launch: every released particle was lost by step {result.n_steps} "
+                f"while {int(np.sum(birth_step > result.n_steps))} were still to be born - the "
+                f"tracker stops when nothing is alive; check the first-born particles against "
+                f"the obstacles / boundary before the bunch centre is even released")
 
         # Distinguish "aborted on turns/energy" from "ran out of clock": the
         # tracker reports success either way, which is how a silently lost final
@@ -875,7 +1124,7 @@ class AcceleratedOrbitFinder:
                                            vals.get('vr0'), r0_mode)
             self._set_beam_meta(pd, n_ref)
             coll = self._make_collimator(vals)
-            self.engine.extra_terminators = [coll] if coll is not None else []
+            self.engine.extra_terminators = self._terminators(coll)
             (success, turn_stats, _, traj_ref, poincare_all,
              _, turn_ids, _) = self.track_with_rf(pd, dt, max_turns)
 
@@ -1110,7 +1359,7 @@ class AcceleratedOrbitFinder:
 
         # fixed-config collimator (self.collimator), if any
         coll = self._make_collimator({})
-        self.engine.extra_terminators = [coll] if coll is not None else []
+        self.engine.extra_terminators = self._terminators(coll)
         try:
             result = self.track_with_rf(pd, dt, max_turns,
                                         save_full_beam=save_full_beam)
@@ -1122,6 +1371,12 @@ class AcceleratedOrbitFinder:
         if pr0 is not None:
             vals['vr0'] = pr0
         meta_extra = {'mode': 'single_run'}
+        obs = self._obstacle_report()
+        if obs is not None:
+            meta_extra['obstacles'] = obs
+            if self.verbose and (obs['n_lost'] or obs['reference_contacts']):
+                print(f"    obstacles: {obs['n_lost']} particles lost on metal, "
+                      f"reference contacts {obs['reference_contacts']}")
         if coll is not None:
             meta_extra['collimator'] = {
                 'azimuth_deg': float(np.degrees(coll.azimuth_rad)),
@@ -1160,6 +1415,16 @@ class AcceleratedOrbitFinder:
             'reference_centroid': bool(self._n_ref),
             'budget_exhausted': bool(self.last_budget_exhausted),
             'resid_blocks_best': dict(self.best_resid_blocks),
+            # staggered launch bookkeeping (mode, clock start, reference birth step)
+            'launch': dict(self.last_launch) if self.last_launch else None,
+            # compiled single-particle path: used / why not, kernel steps, time
+            'fast_path': dict(self.last_fast_path) if self.last_fast_path else None,
+            # spiral inflector in the model (attach_inflector): files, frame,
+            # what was installed
+            'inflector': ({**self.inflector.summary(),
+                           'field_installed': bool(self.static_efields),
+                           'housing_obstacle': self.housing_obstacle is not None}
+                          if self.inflector is not None else None),
         }
         if metadata_extra:
             meta.update(metadata_extra)

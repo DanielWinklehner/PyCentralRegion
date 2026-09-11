@@ -195,6 +195,26 @@ class CavityGeometryOptimizer:
     corridor, not on wedges that are corridor-limited anyway. In parallel
     mode the worker builder must construct the optimizer with the SAME
     pinch settings (as with dee_system and optimize_opening_angle).
+
+    ``housing_outline`` (opt-in) adds a keep-out of the spiral-inflector
+    housing (closed midplane outline(s) [m], ``InflectorModel.housing_polygon``)
+    for the thin-gap search: every gap line is sampled and the intrusion of
+    the housing's ``housing_clearance_m`` band, integrated along the line and
+    normalised by the clearance (an effective length [m]), is appended as
+    one residual scaled by ``housing_weight``. Without it a thin-gap kick may
+    land inside the housing metal, where the BEM build later truncates the
+    electrode and the kick vanishes. ``housing_keepout_r_min`` (scalar or
+    per gap) excludes the inner part of each line, where the electrodes are
+    truncated anyway and every radial line crosses the housing spiral: set it
+    to (turn-1 radius at the gap's azimuth - tip clearance - margin) from a
+    reference orbit. The worker builder must pass the same settings.
+
+    ``frozen_gaps`` (opt-in) holds the listed gaps' segment geometry as set on
+    the cavities at construction (e.g. a first gap fitted parallel to the
+    inflector housing's exit plate) and drops them from the parameter vector;
+    the other gaps, the opening delta and the RF parameters are optimized as
+    usual. The worker builder must apply the same geometry and freeze the same
+    gaps.
     """
 
     def __init__(self,
@@ -215,7 +235,12 @@ class CavityGeometryOptimizer:
                  bem_field_kwargs: Optional[Dict] = None,
                  pinch_target_r_m: Optional[float] = None,
                  pinch_metal_width_m: Optional[float] = None,
-                 pinch_weight: float = 50.0):
+                 pinch_weight: float = 50.0,
+                 housing_outline=None,
+                 housing_clearance_m: float = 0.005,
+                 housing_weight: float = 100.0,
+                 housing_keepout_r_min=0.0,
+                 frozen_gaps=None):
         if getattr(orbit_finder, 'gap_model', 'thin') not in ('thin', 'bem2d'):
             raise ValueError(f"unsupported gap_model "
                              f"'{getattr(orbit_finder, 'gap_model', 'thin')}'")
@@ -304,6 +329,45 @@ class CavityGeometryOptimizer:
         self.pinch_metal_width_m = float(pinch_metal_width_m)
         self.pinch_weight = float(pinch_weight)
 
+        # Opt-in housing keep-out (see class docstring): signed-distance
+        # geometry of the housing outline, checked on gap-line samples below
+        # its outer radius + clearance.
+        self._housing = None
+        self.housing_clearance_m = float(housing_clearance_m)
+        self.housing_weight = float(housing_weight)
+        if housing_outline is not None:
+            from .gap_fields import _HousingGeom
+            self._housing = _HousingGeom(housing_outline)
+            self._housing_r_check = self._housing.r_max + 3.0 * self.housing_clearance_m
+        # per-gap radius below which a gap line is NOT checked against the
+        # housing: the electrodes are truncated there anyway (tips follow the
+        # beam corridor), and every radial line crosses the housing spiral at
+        # small radius. Scalar or one value per gap (creation order).
+        r_min = np.atleast_1d(np.asarray(housing_keepout_r_min, dtype=float))
+        if r_min.size == 1:
+            r_min = np.full(self.n_gaps, float(r_min[0]))
+        if r_min.size != self.n_gaps:
+            raise ValueError(f"housing_keepout_r_min must be a scalar or have {self.n_gaps} entries")
+        self._housing_r_min = r_min
+
+        # Frozen gaps: their segment geometry (angles / radii / rotations as
+        # found on the cavities NOW) is held and excluded from the parameter
+        # vector; base angles still follow the opening delta if that is
+        # optimized. The worker builder must apply the same geometry before
+        # constructing the optimizer with the same frozen_gaps.
+        self.frozen_gaps = sorted({int(g) for g in (frozen_gaps or [])})
+        for g in self.frozen_gaps:
+            if not 0 <= g < self.n_gaps:
+                raise ValueError(f"frozen gap index {g} out of range (0..{self.n_gaps - 1})")
+        self._free_gaps = [g for g in range(self.n_gaps) if g not in self.frozen_gaps]
+        self._frozen_geom = {}
+        for g in self.frozen_gaps:
+            cav = orbit_finder.design.rf_cavities[g]
+            self._frozen_geom[g] = (
+                [float(a) for a in cav.segment_angles],
+                [float(r) for r in cav.segment_radii],
+                [float(r) for r in (cav.segment_rotations or [0.0] * self.n_segments)])
+
         # BEM-in-the-loop state (gap_model='bem2d' finders only).
         self.bem_build_kwargs = bem_build_kwargs
         self.bem_solve_kwargs = bem_solve_kwargs
@@ -369,7 +433,8 @@ class CavityGeometryOptimizer:
 
     @property
     def _n_geo(self) -> int:
-        return self.n_gaps * self._blk
+        """Geometry entries in the parameter vector (free gaps only)."""
+        return len(getattr(self, '_free_gaps', range(self.n_gaps))) * self._blk
 
     @property
     def _rf_offset(self) -> int:
@@ -390,8 +455,17 @@ class CavityGeometryOptimizer:
         blk = self._blk
         angles_per_gap, radii_per_gap = [], []
         rotations_per_gap = [] if self.rotatable_segments else None
+        free = getattr(self, '_free_gaps', list(range(self.n_gaps)))
+        frozen = getattr(self, '_frozen_geom', {})
         for g in range(self.n_gaps):
-            base = g * blk
+            if g in frozen:
+                a, r, rot = frozen[g]
+                angles_per_gap.append(list(a))
+                radii_per_gap.append(list(r))
+                if self.rotatable_segments:
+                    rotations_per_gap.append(list(rot))
+                continue
+            base = free.index(g) * blk
             angles_per_gap.append(list(params[base:base + n]))
             radii_per_gap.append(list(params[base + n:base + 2 * n]))
             if self.rotatable_segments:
@@ -542,6 +616,38 @@ class CavityGeometryOptimizer:
                     viol += required + (dphi - np.pi) * r
         return viol
 
+    def _housing_violation(self, ds: float = 1e-3) -> float:
+        """Intrusion of the gap lines into the housing's clearance band [m].
+
+        Every segment of every gap is sampled at ``ds``; where its signed
+        distance ``d`` to the housing metal is below ``housing_clearance_m``
+        the deficit (clearance - d) is integrated along the line and divided
+        by the clearance, so a segment running through the housing counts
+        roughly its length. Smooth in the parameters; 0 when clear. Call
+        AFTER the candidate geometry has been applied to the cavities."""
+        if self._housing is None:
+            return 0.0
+        clr = self.housing_clearance_m
+        viol = 0.0
+        for g, cav in enumerate(self.orbit_finder.design.rf_cavities):
+            r_min = float(self._housing_r_min[g])
+            for seg in cav.segments:
+                p1 = np.asarray(seg['p1'][:2], dtype=float)
+                p2 = np.asarray(seg['p2'][:2], dtype=float)
+                if min(np.hypot(*p1), np.hypot(*p2)) > self._housing_r_check:
+                    continue
+                n = max(int(np.ceil(np.hypot(*(p2 - p1)) / ds)), 1)
+                t = (np.arange(n) + 0.5) / n
+                pts = p1[None, :] + t[:, None] * (p2 - p1)[None, :]
+                rr = np.hypot(pts[:, 0], pts[:, 1])
+                pts = pts[(rr <= self._housing_r_check) & (rr >= r_min)]
+                if len(pts) == 0:
+                    continue
+                d = self._housing.dist(pts)
+                deficit = np.maximum(0.0, clr - d)
+                viol += float(deficit.sum()) * (np.hypot(*(p2 - p1)) / n) / clr
+        return viol
+
     def _pinch_excess(self) -> float:
         """Total pinch-radius excess [m] above ``pinch_target_r_m``.
 
@@ -647,12 +753,20 @@ class CavityGeometryOptimizer:
         violation += self._clearance_violation()
         pinch_resid = (self.pinch_weight * self._pinch_excess()
                        if self.pinch_target_r_m is not None else None)
+        housing_resid = (self.housing_weight * self._housing_violation()
+                         if self._housing is not None else None)
+        # geometry tail of the residual vector: violation, [pinch], [housing]
+        tail = [w_violation * violation]
+        if pinch_resid is not None:
+            tail.append(pinch_resid)
+        if housing_resid is not None:
+            tail.append(housing_resid)
 
         if self._is_bem and not self._attach_bem_for_current_geometry():
             # Unbuildable candidate (electrode build/solve failure or the
             # max_r_inner guard): graded fallback, worse than any tracked
-            # geometry, keeping the clearance (and pinch) terms for a slope
-            # back toward feasibility. Sized from the last successful
+            # geometry, keeping the clearance (pinch, housing) terms for a
+            # slope back toward feasibility. Sized from the last successful
             # evaluation.
             if self._n_resid is None:
                 raise RuntimeError(
@@ -660,11 +774,7 @@ class CavityGeometryOptimizer:
                     f"the penalty residual): {self._bem_last_error}")
             self.orbit_finder.iteration += 1
             resid = np.full(self._n_resid, 10.0)
-            if pinch_resid is not None:
-                resid[-2] = max(w_violation * violation, 10.0)
-                resid[-1] = max(pinch_resid, 10.0)
-            else:
-                resid[-1] = max(w_violation * violation, 10.0)
+            resid[-len(tail):] = np.maximum(tail, 10.0)
             self._write_checkpoint(angles_per_gap, radii_proj, rf_vals,
                                    float(np.sum(resid ** 2)), 0.0, 0, False,
                                    opening_delta=opening_delta,
@@ -674,9 +784,7 @@ class CavityGeometryOptimizer:
         resid = self.orbit_finder.objective_residuals(
             rf_params, initial_beam, dt, max_turns, ls_weights, rf_param_names,
             r0_mode, skip_turns=skip_turns)
-        resid = np.append(resid, w_violation * violation)
-        if pinch_resid is not None:
-            resid = np.append(resid, pinch_resid)
+        resid = np.append(resid, tail)
         self._n_resid = len(resid)
 
         cost = float(np.sum(resid ** 2))
@@ -701,10 +809,15 @@ class CavityGeometryOptimizer:
             self.best_resid_blocks['violation'] = float((w_violation * violation) ** 2)
             if pinch_resid is not None:
                 self.best_resid_blocks['pinch'] = float(pinch_resid ** 2)
+            if housing_resid is not None:
+                self.best_resid_blocks['housing'] = float(housing_resid ** 2)
             if self.verbose:
                 pinch_note = ("" if pinch_resid is None else
                               f", pinch excess "
                               f"{pinch_resid / self.pinch_weight * 1000:.2f} mm")
+                if housing_resid is not None:
+                    pinch_note += (f", housing intrusion "
+                                   f"{housing_resid / self.housing_weight * 1000:.2f} mm")
                 shares = ", ".join(f"{k} {v:.3f}" for k, v in
                                    self.best_resid_blocks.items() if v > 0.0)
                 print(f"    eval {self.orbit_finder.iteration}: NEW BEST "
@@ -802,7 +915,7 @@ class CavityGeometryOptimizer:
         of = self.orbit_finder
         r_spacing = (self.max_r - self.r_min) / (self.n_segments + 1)
         geo_bounds, geo_x0, geo_names = [], [], []
-        for g in range(self.n_gaps):
+        for g in getattr(self, '_free_gaps', list(range(self.n_gaps))):
             r_max_cav = of.design.rf_cavities[g].r_max
             for i in range(self.n_segments):
                 geo_names.append(f'gap{g}_seg{i}_angle')
@@ -943,7 +1056,7 @@ class CavityGeometryOptimizer:
                                            rf_vals.get('vr0'), r0_mode)
         of._set_beam_meta(pd_final, n_ref)
         coll = of._make_collimator(rf_vals)
-        of.engine.extra_terminators = [coll] if coll is not None else []
+        of.engine.extra_terminators = of._terminators(coll)
         try:
             result = of.track_with_rf(pd_final, dt, max_turns, save_full_beam=True)
         finally:
@@ -1328,8 +1441,8 @@ class CavityGeometryOptimizer:
             for i, (E, ph, f) in enumerate(picked):
                 s = np.asarray(x0, dtype=float).copy()
                 if i > 0 and geometry_jitter_deg > 0:
-                    for g in range(self.n_gaps):
-                        base = g * self._blk
+                    for k in range(len(self._free_gaps)):
+                        base = k * self._blk
                         s[base:base + self.n_segments] += rng.uniform(
                             -geometry_jitter_deg, geometry_jitter_deg, self.n_segments)
                 seed_closed = collimator_seed is not None and i % 2 == 1
