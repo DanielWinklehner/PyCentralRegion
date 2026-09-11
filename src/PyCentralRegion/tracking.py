@@ -10,12 +10,15 @@ All of the actual integration loop, Boris half-step handling, and the canonical
 cylindrical pieces:
 
   * RFCavityInteraction      - an Interaction hook wrapping RFCavity crossing+kick
+  * SpaceChargeKick          - an Interaction hook: Poisson solve of the live bunch
+                               every n steps, q (E + v x B) dt applied every step
   * RadialBoundaryTerminator - a Terminator hook (2D radial loss)
   * RadialVerticalTerminator - a Terminator hook (3D radial + vertical loss)
   * CallbackRecorder         - a Recorder adapting the legacy callback(step,r,v,active,t)
 
 Part of: PyCentralRegion module
 """
+import time
 import numpy as np
 from typing import Tuple, Optional, Callable
 from dataclasses import dataclass
@@ -282,6 +285,235 @@ class TimedRelease(Interaction):
             active[due] = True
             self.released += int(due.sum())
         return r, v, active
+
+
+class SpaceChargeKick(Interaction):
+    """Space-charge kick of the live bunch from an open-boundary Poisson solve.
+
+    Every ``resolve_every`` steps the ACTIVE particles - born (TimedRelease),
+    not lost, and carrying charge (the virtual reference particle carries
+    none) - deposit their macro-charges and ``solver.solve_eb(positions,
+    charges, velocities)`` returns E (and B) at each of them. The solver is
+    typically ``PyPATools.poisson_fft.FFTPoissonSolver``: free space, no
+    electrode images, non-relativistic today; when its relativistic version
+    lands (rest-frame boost, B = v x E / c^2) the B it returns is applied here
+    without any further change. The per-particle field is then applied as the
+    impulse q (E + v x B) dt at EVERY step until the next solve, i.e. the
+    field travels with the particle instead of staying where the bunch was
+    when it was solved. Particles released between two solves receive the
+    last solve's field gathered at their own position (``solver.gather``).
+
+    Momentum update (the RF kick's total-speed bookkeeping):
+        u = gamma v;   u += (q/m) (E + v x B) dt;   v = u / sqrt(1 + u^2/c^2)
+    ``kick_z=False`` (default) drops E_z: the midplane tracker carries z but
+    does not push it, so a vertical kick would only distort vz.
+
+    Macro-charge per particle, in order of precedence: ``macro_charge_c``;
+    ``bunch_current_a`` with ``bunch_frequency_hz`` (Q = I / f shared by the
+    real particles, the handoff.py convention; the frequency defaults to the
+    beam's hand-off RF frequency, then to the RF frequency of cavity 0); the
+    beam's own ``macro_charge_c`` (set by ``handoff.make_beam_from_handoff``:
+    the file's weights, total charge preserved under sub-sampling). All of it
+    times ``charge_scale``. With zero total charge the hook is a strict no-op,
+    so a 0 mA run reproduces the plain tracking bit for bit.
+
+    ``prepare(beam, n_ref, species, ...)`` is called by
+    ``AcceleratedOrbitFinder.track_with_rf`` before every run (sizes the
+    per-particle arrays, resets the counters); ``report()`` is what the finder
+    stores in the result metadata under 'space_charge': solve count, timing,
+    mean and max |E_sc| on the bunch, the bunch rms size at each solve (cells
+    per sigma is the resolution check) and the solver's own summary.
+    """
+
+    def __init__(self, solver, resolve_every: int = 8, macro_charge_c: Optional[float] = None,
+                 bunch_current_a: Optional[float] = None, bunch_frequency_hz: Optional[float] = None,
+                 charge_scale: float = 1.0, kick_z: bool = False, min_particles: int = 2,
+                 exempt_ref: bool = True, verbose: bool = False, log_limit: int = 20000):
+        if not hasattr(solver, 'solve_eb'):
+            raise TypeError("solver must provide solve_eb(positions, charges, velocities) -> (E, B)")
+        self.solver = solver
+        self.every = max(1, int(resolve_every))
+        self.macro_charge_c = macro_charge_c
+        self.bunch_current_a = bunch_current_a
+        self.bunch_frequency_hz = bunch_frequency_hz
+        self.charge_scale = float(charge_scale)
+        self.kick_z = bool(kick_z)
+        self.min_particles = max(1, int(min_particles))
+        # the virtual reference particle (finder index 0) never deposits; with
+        # exempt_ref it is not kicked either, so the centroid orbit that defines
+        # the Poincare section and the turn count is the same at every current
+        self.exempt_ref = bool(exempt_ref)
+        self.verbose = bool(verbose)
+        self.log_limit = int(log_limit)
+        self.charges = None
+        self.q_over_m = None
+        self._reset_state(0)
+
+    def _reset_state(self, n):
+        self.E = np.zeros((n, 3))
+        self.B = np.zeros((n, 3))
+        self.has_field = np.zeros(n, dtype=bool)
+        self.kick_mask = np.ones(n, dtype=bool)
+        self.deposit_mask = np.zeros(n, dtype=bool)
+        self.n_solves = 0
+        self.n_skipped = 0
+        self.n_kick_steps = 0
+        self.solve_time = 0.0
+        self.log = []                 # per solve: step, t, n_deposit, mean|E|, max|E|, wall, sx, sy, sz
+        self.bunch_charge_c = 0.0
+        self.n_charged = 0
+        self.noop = True
+
+    def resolve_macro_charge(self, beam, n_real: int, default_frequency_hz: Optional[float] = None) -> float:
+        """Charge per real macro-particle [C] (before ``charge_scale``)."""
+        if self.macro_charge_c is not None:
+            return float(self.macro_charge_c)
+        if self.bunch_current_a is not None:
+            f = self.bunch_frequency_hz
+            if f is None:
+                meta = getattr(beam, 'handoff_meta', None) or {}
+                f = meta.get('rf_frequency_hz')
+            if f is None:
+                f = default_frequency_hz
+            if f is None or f <= 0:
+                raise ValueError("bunch_current_a needs bunch_frequency_hz (bunch repetition frequency)")
+            return float(self.bunch_current_a) / float(f) / max(int(n_real), 1)
+        q = getattr(beam, 'macro_charge_c', None)
+        if q is None:
+            raise ValueError("no charge: give macro_charge_c or bunch_current_a, or a beam with macro_charge_c")
+        return float(q)
+
+    def prepare(self, beam: ParticleDistribution, n_ref: int = 0, species=None,
+                default_frequency_hz: Optional[float] = None):
+        """Size the per-particle state for ``beam`` (with ``n_ref`` virtual
+        reference particles prepended) and reset the counters."""
+        n = int(beam.numpart)
+        n_ref = int(n_ref)
+        self._reset_state(n)
+        if species is None:
+            species = getattr(beam, 'species', None)
+        if species is None:
+            raise ValueError("species needed for q/m")
+        self.q_over_m = float(species.charge) / float(species.mass_kg)
+        q_macro = self.resolve_macro_charge(beam, n - n_ref, default_frequency_hz) * self.charge_scale
+        self.charges = np.full(n, q_macro)
+        self.charges[:n_ref] = 0.0
+        self.deposit_mask = self.charges != 0.0
+        if self.exempt_ref:
+            self.kick_mask[:n_ref] = False
+        self.n_charged = int(self.deposit_mask.sum())
+        self.bunch_charge_c = float(self.charges.sum())
+        self.noop = self.bunch_charge_c == 0.0 or self.n_charged == 0
+        if self.verbose:
+            print(f"    space charge: {self.n_charged} charged particles x {q_macro:.4e} C = "
+                  f"{self.bunch_charge_c:.4e} C, solve every {self.every} steps"
+                  + (" (zero charge: no-op)" if self.noop else ""))
+
+    # ------------------------------------------------------------------ core
+    def _solve(self, step, r, v, active, t):
+        dep = active & self.deposit_mask
+        n_dep = int(dep.sum())
+        self.E[:] = 0.0
+        self.B[:] = 0.0
+        self.has_field[:] = False
+        if n_dep < self.min_particles:
+            self.n_skipped += 1
+            return
+        t0 = time.perf_counter()
+        E_dep, B_dep = self.solver.solve_eb(r[dep], self.charges[dep], v[dep])
+        self.E[dep] = E_dep
+        self.B[dep] = B_dep
+        self.has_field[dep] = True
+        # charged-less particles that are kicked (a non-exempt reference): the field at their position
+        others = active & ~dep & self.kick_mask
+        if np.any(others) and hasattr(self.solver, 'gather'):
+            self.E[others] = self.solver.gather(r[others])
+            self.has_field[others] = True
+        wall = time.perf_counter() - t0
+        self.solve_time += wall
+        self.n_solves += 1
+        e_abs = np.linalg.norm(E_dep, axis=1)
+        if not self.kick_z:
+            e_abs = np.hypot(E_dep[:, 0], E_dep[:, 1])
+        sig = r[dep].std(axis=0)
+        row = [int(step), float(t), n_dep, float(e_abs.mean()), float(e_abs.max()), float(wall),
+               float(sig[0]), float(sig[1]), float(sig[2])]
+        if len(self.log) < self.log_limit:
+            self.log.append(row)
+        if self.verbose and (self.n_solves == 1 or self.n_solves % 200 == 0):
+            print(f"    SC solve {self.n_solves:5d} @ step {step:6d}: {n_dep:6d} live, |E_sc| mean {row[3]:.3e} / "
+                  f"max {row[4]:.3e} V/m, rms size {1e3 * sig[0]:.2f} x {1e3 * sig[1]:.2f} x {1e3 * sig[2]:.2f} mm, "
+                  f"{1e3 * wall:.1f} ms", flush=True)
+
+    def _kick(self, v, mask, dt):
+        E = self.E[mask]
+        B = self.B[mask]
+        if not self.kick_z:
+            E = E.copy()
+            E[:, 2] = 0.0
+        # only particles with a non-zero field: keeps E == 0 runs bit-identical
+        nz = np.any(E != 0.0, axis=1) | np.any(B != 0.0, axis=1)
+        if not np.any(nz):
+            return
+        idx = np.flatnonzero(mask)[nz]
+        E, B = E[nz], B[nz]
+        vv = v[idx]
+        gamma = 1.0 / np.sqrt(1.0 - np.sum(vv * vv, axis=1) / CLIGHT ** 2)
+        u = gamma[:, None] * vv
+        force = E
+        if np.any(B != 0.0):
+            force = E + np.cross(vv, B)
+        u = u + (self.q_over_m * dt) * force
+        gamma_new = np.sqrt(1.0 + np.sum(u * u, axis=1) / CLIGHT ** 2)
+        v[idx] = u / gamma_new[:, None]
+        self.n_kick_steps += 1
+
+    def apply(self, step, r_prev, v_prev, r, v, active, t, dt):
+        if self.charges is None or len(self.charges) != len(r):
+            raise RuntimeError("SpaceChargeKick.prepare(beam, ...) must be called for this beam first")
+        if self.noop or not np.any(active):
+            return r, v, active
+        if step % self.every == 0:
+            self._solve(step, r, v, active, t)
+        else:
+            fresh = active & ~self.has_field & self.deposit_mask
+            if np.any(fresh) and self.n_solves > 0 and hasattr(self.solver, 'gather'):
+                # released since the last solve: the field of the last solve at their position
+                self.E[fresh] = self.solver.gather(r[fresh])
+                self.has_field[fresh] = True
+        kick = active & self.kick_mask & self.has_field
+        if np.any(kick):
+            self._kick(v, kick, dt)
+        return r, v, active
+
+    # ---------------------------------------------------------------- report
+    def report(self) -> dict:
+        """Solve count, timings and field statistics of the last run."""
+        log = np.asarray(self.log, dtype=float).reshape(-1, 9)
+        out = {
+            'n_solves': int(self.n_solves), 'n_skipped': int(self.n_skipped),
+            'n_kick_steps': int(self.n_kick_steps),
+            'resolve_every': int(self.every), 'kick_z': self.kick_z, 'exempt_ref': self.exempt_ref,
+            'charge_scale': self.charge_scale, 'noop': bool(self.noop),
+            'n_charged': int(self.n_charged), 'bunch_charge_c': float(self.bunch_charge_c),
+            'macro_charge_c': (float(self.charges[self.deposit_mask][0])
+                               if self.charges is not None and self.n_charged else 0.0),
+            'solve_time_s': float(self.solve_time),
+            'mean_solve_ms': float(1e3 * self.solve_time / self.n_solves) if self.n_solves else 0.0,
+            'max_solve_ms': float(1e3 * log[:, 5].max()) if len(log) else 0.0,
+            # time-mean over the solves of the mean |E_sc| on the depositing particles
+            'mean_abs_e_v_per_m': float(log[:, 3].mean()) if len(log) else 0.0,
+            'max_abs_e_v_per_m': float(log[:, 4].max()) if len(log) else 0.0,
+            'n_deposit_min_max': [int(log[:, 2].min()), int(log[:, 2].max())] if len(log) else None,
+            'rms_size_mm_first_last': ([list(np.round(1e3 * log[0, 6:9], 3)), list(np.round(1e3 * log[-1, 6:9], 3))]
+                                       if len(log) else None),
+            'log_columns': ['step', 't_s', 'n_deposit', 'mean_abs_e', 'max_abs_e', 'wall_s',
+                            'sigma_x_m', 'sigma_y_m', 'sigma_z_m'],
+            'log': log,
+        }
+        if hasattr(self.solver, 'summary'):
+            out['solver'] = self.solver.summary()
+        return out
 
 
 class CallbackRecorder(Recorder):

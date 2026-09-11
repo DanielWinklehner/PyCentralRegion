@@ -351,6 +351,13 @@ class AcceleratedOrbitFinder:
         # general PyPATools Tracker path; last_fast_path says what happened.
         self.fast_path = True
         self.last_fast_path = None
+        # Space charge: a tracking.SpaceChargeKick (wrapping e.g.
+        # PyPATools.poisson_fft.FFTPoissonSolver) attached to every run of
+        # track_with_rf / track_once / optimize; None = no space charge. It is
+        # prepared per run from the beam (macro charge, virtual reference) and
+        # its solve count, timings and mean |E_sc| land in the result metadata
+        # under 'space_charge'. Disables the single-particle fast path.
+        self.space_charge = None
 
         self.engine = TrackingEngine(
             design, algorithm=algorithm, dimensionality='2D', use_rf=True,
@@ -803,7 +810,15 @@ class AcceleratedOrbitFinder:
             pd_init.alive = birth_step == 0
             from .tracking import TimedRelease
             release = TimedRelease(birth_step)
-        self.engine.extra_interactions = [release] if release is not None else []
+        extras = [release] if release is not None else []
+        if self.space_charge is not None:
+            # after the release (newly born particles deposit in the same step),
+            # before the RF kicks
+            cav0 = self.design.rf_cavities[0]
+            self.space_charge.prepare(pd_init, n_ref=n_ref, species=self.design.species,
+                                      default_frequency_hz=float(cav0.omega) / (2.0 * np.pi))
+            extras.append(self.space_charge)
+        self.engine.extra_interactions = extras
         self.last_launch = {
             'mode': 'timed' if release is not None else 'snapshot', 't0_s': t0,
             'reference_birth_step': int(birth_step[0]) if len(birth_step) else 0,
@@ -890,7 +905,9 @@ class AcceleratedOrbitFinder:
 
         fast = None
         self.last_fast_path = None
-        if self.fast_path and release is None and n_ref == 0 and int(pd_init.numpart) == 1:
+        if self.fast_path and self.space_charge is not None:
+            self.last_fast_path = {'used': False, 'reason': 'space charge attached'}
+        elif self.fast_path and release is None and n_ref == 0 and int(pd_init.numpart) == 1:
             from .fast_track import build_kernel_args, FastPathUnavailable
             try:
                 fast = build_kernel_args(self, pd_init, dt, n_steps, t0, section_angle, max_turns)
@@ -1432,6 +1449,10 @@ class AcceleratedOrbitFinder:
             'launch': dict(self.last_launch) if self.last_launch else None,
             # compiled single-particle path: used / why not, kernel steps, time
             'fast_path': dict(self.last_fast_path) if self.last_fast_path else None,
+            # space charge (tracking.SpaceChargeKick): solve count, timing,
+            # mean / max |E_sc| on the bunch, per-solve log; None if none attached
+            'space_charge': (self.space_charge.report()
+                             if self.space_charge is not None else None),
             # spiral inflector in the model (attach_inflector): files, frame,
             # what was installed
             'inflector': ({**self.inflector.summary(),
