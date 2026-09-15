@@ -2436,8 +2436,8 @@ def solve_gap_field(model: ElectrodeModel,
     comfortable: field accuracy is mesh-limited at ~0.3%, well above the
     residual.
     """
-    if solver not in ('auto', 'cupy', 'scipy', 'strong'):
-        raise ValueError("solver must be 'auto', 'cupy', 'scipy' or 'strong', "
+    if solver not in ('auto', 'cupy', 'scipy', 'strong', 'dense'):
+        raise ValueError("solver must be 'auto', 'cupy', 'scipy', 'strong' or 'dense', "
                          f"got {solver!r}")
     bempp = _bempp(device_interface)
     n = int(model.n_elements)
@@ -2488,6 +2488,23 @@ def solve_gap_field(model: ElectrodeModel,
                 print(f"[gap_fields] cupy solver not used: {why}")
 
     def run(which):
+        if which == 'dense':
+            # 2026-09-15: direct LU of the dense weak-form matrix on the CPU (LAPACK, in place). For meshes where
+            # both iterative forms grind (the 50 mm-aperture model, 70k elements: weak Jacobi GMRES stalled, strong
+            # form reached 1.9e-4 in 20000 iterations / 6.5 h), the factorization is minutes at 8 N^2 bytes of RAM
+            # (39 GB at 70k). The matrix is overwritten by its factors, so no residual is reported (n_reported = 1).
+            import scipy.linalg as sla
+            a = _dense_matrix(weak)
+            if a is None:
+                raise RuntimeError("solver='dense' needs the dense weak-form matrix (dense assembly only)")
+            rhs = dirichlet.projections(slp.dual_to_range)
+            if verbose:
+                print(f"[gap_fields] dense LU of the {a.shape[0]} x {a.shape[1]} matrix "
+                      f"({8.0 * a.shape[0] * a.shape[1] / 2**30:.1f} GB, in place)", flush=True)
+            lu, piv = sla.lu_factor(a, overwrite_a=True, check_finite=False)
+            x = sla.lu_solve((lu, piv), np.asarray(rhs, dtype=float), check_finite=False)
+            del lu
+            return bempp.GridFunction(space, coefficients=np.asarray(x).ravel()), 0, [float('nan')], 1
         if which == 'strong':
             from bempp_cl.api.linalg import gmres
             neu, inf, res, it = gmres(
