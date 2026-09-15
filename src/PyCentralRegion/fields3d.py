@@ -291,6 +291,13 @@ class RadialBlendField(FieldBase):
     def __call__(self, pts: np.ndarray) -> np.ndarray:
         pts = np.atleast_2d(np.asarray(pts, dtype=float))
         w = self.weights(pts)
+        # 2026-09-15 (profile of the 3D bunch tracking: this wrapper was 12 % of a step): a bunch entirely outside the
+        # seam is the common case from turn 3 on; hand it straight to the outer field. Bit-identical to the general
+        # path (w = 1 exactly there, and 1.0 * x added to zeros is x).
+        if w.min() >= 1.0:
+            return np.asarray(self.outer(pts), dtype=float)
+        if w.max() <= 0.0:
+            return np.asarray(self.inner(pts), dtype=float)
         out = np.zeros((len(pts), 3))
         mi = w < 1.0
         mo = w > 0.0
@@ -304,6 +311,49 @@ class RadialBlendField(FieldBase):
         return (f"RadialBlendField(inner < {self.r0 * 1e3:.0f} mm: {getattr(self.inner, 'label', self.inner)}; "
                 f"outer > {self.r1 * 1e3:.0f} mm: {getattr(self.outer, 'label', self.outer)})")
 
+
+
+class RadialTaperField(FieldBase):
+    """``inner_scale`` times the wrapped field inside r0, the bare field outside r1, the
+    factor smoothstepped between (radius in the x-y plane). Used to lift the cavity map's
+    central voltage (65 -> 70 kV, Daniel 2026-09-15) and merge it smoothly into the map's
+    own rising V(R) where that already exceeds the lifted value."""
+
+    def __init__(self, field: FieldBase, inner_scale: float, r0: float, r1: float, label: str = 'radial taper'):
+        if not r1 > r0 >= 0.0:
+            raise ValueError("need 0 <= r0 < r1")
+        self.field = field
+        self.inner_scale = float(inner_scale)
+        self.r0, self.r1 = float(r0), float(r1)
+        self._label = label
+
+    @property
+    def label(self) -> str:
+        return self._label
+
+    def factor(self, pts: np.ndarray) -> np.ndarray:
+        rr = np.hypot(pts[:, 0], pts[:, 1])
+        t = np.clip((rr - self.r0) / (self.r1 - self.r0), 0.0, 1.0)
+        w = t * t * (3.0 - 2.0 * t)                 # 0 inside r0, 1 outside r1
+        return self.inner_scale + (1.0 - self.inner_scale) * w
+
+    def __call__(self, pts: np.ndarray) -> np.ndarray:
+        pts = np.atleast_2d(np.asarray(pts, dtype=float))
+        out = np.asarray(self.field(pts), dtype=float)
+        rr = np.hypot(pts[:, 0], pts[:, 1])
+        if rr.max() <= self.r0:
+            return out * self.inner_scale
+        if rr.min() >= self.r1:
+            return out
+        return out * self.factor(pts)[:, None]
+
+    def __getattr__(self, name):
+        # grid / metadata queries fall through to the wrapped field (e.g. _grid, scaling)
+        return getattr(self.field, name)
+
+    def __str__(self):
+        return (f"RadialTaperField(x{self.inner_scale:.4f} inside {self.r0 * 1e3:.0f} mm, x1 beyond "
+                f"{self.r1 * 1e3:.0f} mm: {getattr(self.field, 'label', self.field)})")
 
 # ============================================================================
 # 3D BEM solution -> gridded Field

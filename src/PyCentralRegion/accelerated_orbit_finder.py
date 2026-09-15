@@ -902,7 +902,7 @@ class AcceleratedOrbitFinder:
         birth_step = np.zeros(int(pd_init.numpart), dtype=int)
         release = None
         if self.launch == 'timed' and birth is not None and np.any(np.asarray(birth) != 0.0):
-            if 'boris' in str(getattr(self.engine, 'algorithm', '')).lower():
+            if str(getattr(self.engine, 'algorithm', '')).lower() == 'boris':   # boris_rel is synchronized, fine
                 raise ValueError("timed release needs a non-staggered pusher (rk4 / rk4_rel): "
                                  "the Boris half-step start would be skipped for late-born particles")
             birth = np.asarray(birth, dtype=float)

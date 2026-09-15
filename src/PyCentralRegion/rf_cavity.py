@@ -446,9 +446,29 @@ class RFCavity:
         t_cross = np.zeros(n_particles)
         segment_ids = np.full(n_particles, -1, dtype=int)
 
-        r1_2d = r_old_array[:, :2]
-        r2_2d = r_new_array[:, :2]
+        r1_all = r_old_array[:, :2]
+        r2_all = r_new_array[:, :2]
+        # 2026-09-15 (audit S-5): a chord can only cross a segment of this cavity if its bounding box overlaps the
+        # cavity's; with 8 cavities at most one is ever in reach of a chord, so the exact line-intersection solve
+        # below runs on the few candidates instead of every particle for every cavity. The subset gives exactly the
+        # same crossings (a chord that meets a segment overlaps its bounding box), so the results are unchanged.
+        pts = np.array([[seg['p1'][0], seg['p1'][1]] for seg in self.segments] +
+                       [[seg['p2'][0], seg['p2'][1]] for seg in self.segments], dtype=float)
+        if len(pts) == 0:
+            return crossed_mask, t_cross, segment_ids
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        cand = ((np.maximum(r1_all[:, 0], r2_all[:, 0]) >= lo[0]) & (np.minimum(r1_all[:, 0], r2_all[:, 0]) <= hi[0]) &
+                (np.maximum(r1_all[:, 1], r2_all[:, 1]) >= lo[1]) & (np.minimum(r1_all[:, 1], r2_all[:, 1]) <= hi[1]))
+        idx = np.flatnonzero(cand)
+        if len(idx) == 0:
+            return crossed_mask, t_cross, segment_ids
+        r1_2d = r1_all[idx]
+        r2_2d = r2_all[idx]
         d_part = r2_2d - r1_2d
+        n_cand = len(idx)
+        c_mask = np.zeros(n_cand, dtype=bool)
+        c_t = np.zeros(n_cand)
+        c_seg = np.full(n_cand, -1, dtype=int)
 
         # Check each segment
         for seg_id, seg in enumerate(self.segments):
@@ -470,8 +490,8 @@ class RFCavity:
             det_t_cav = -det_t_cav
             det_s_part = d_cav[0] * b[:, 1] - d_cav[1] * b[:, 0]
 
-            t_cav = np.zeros(n_particles)
-            s_part = np.zeros(n_particles)
+            t_cav = np.zeros(n_cand)
+            s_part = np.zeros(n_cand)
 
             t_cav[valid_mask] = det_t_cav[valid_mask] / det[valid_mask]
             # Cramer's rule for A = [d_cav, -d_part]: det(A) = -det (the sign
@@ -488,11 +508,14 @@ class RFCavity:
                             (s_part >= 0.0) & (s_part <= 1.0))
 
             # Only record first crossing per particle
-            new_crossings = this_crossed & ~crossed_mask
-            crossed_mask[new_crossings] = True
-            t_cross[new_crossings] = s_part[new_crossings]
-            segment_ids[new_crossings] = seg_id
+            new_crossings = this_crossed & ~c_mask
+            c_mask[new_crossings] = True
+            c_t[new_crossings] = s_part[new_crossings]
+            c_seg[new_crossings] = seg_id
 
+        crossed_mask[idx] = c_mask
+        t_cross[idx] = c_t
+        segment_ids[idx] = c_seg
         return crossed_mask, t_cross, segment_ids
 
     def apply_kicks_batch(self,
