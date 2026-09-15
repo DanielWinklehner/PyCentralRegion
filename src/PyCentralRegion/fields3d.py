@@ -309,19 +309,34 @@ class RadialBlendField(FieldBase):
 # 3D BEM solution -> gridded Field
 # ============================================================================
 def bem_field3d(sol, xs, ys, zs, metal: Optional[Callable] = None, chunk: int = 4000, erode: int = 2,
-                backend: str = 'numba', label: str = 'BEM 3D gap field', verbose: bool = True) -> Field:
+                backend: str = 'numba', label: str = 'BEM 3D gap field', r_max: Optional[float] = None,
+                verbose: bool = True) -> Field:
     """E = -grad(phi) of a ``GapFieldSolution`` on the (xs, ys, zs) grid [m]
     as a dim-3 Field. ``metal(xyz) -> bool`` (e.g. ``electrodes3d.stacked_obstacles``)
     zeroes the field ``erode`` cells deep inside metal (the wall jump layer is
     kept so particles feel the field up to the surface); trimesh ``contains``
-    on millions of points is avoided."""
+    on millions of points is avoided.
+
+    ``r_max`` [m] evaluates the potential only inside that cylinder and leaves the rest
+    of the box at zero: the corners of a square grid are 21 % of its points and a radial
+    blend (``RadialBlendField``) never reads them. Two extra cells are evaluated beyond
+    ``r_max`` so the central-difference gradient inside it is still exact."""
     xs, ys, zs = (np.asarray(a, dtype=float) for a in (xs, ys, zs))
     gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')
     pts = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
     t0 = time.time()
-    phi = sol.potential(pts, chunk=chunk, verbose=verbose).reshape(gx.shape)
+    if r_max is None:
+        phi = sol.potential(pts, chunk=chunk, verbose=verbose).reshape(gx.shape)
+        n_eval = len(pts)
+    else:
+        keep = np.hypot(pts[:, 0], pts[:, 1]) <= float(r_max) + 2.0 * float(np.max(np.abs(np.diff(xs))))
+        flat = np.zeros(len(pts))
+        flat[keep] = sol.potential(pts[keep], chunk=chunk, verbose=verbose)
+        phi = flat.reshape(gx.shape)
+        n_eval = int(keep.sum())
     if verbose:
-        print(f"[fields3d] BEM potential on {gx.shape} ({pts.shape[0] / 1e6:.2f} M points) in {time.time() - t0:.0f} s")
+        print(f"[fields3d] BEM potential on {gx.shape} ({n_eval / 1e6:.2f} of "
+              f"{pts.shape[0] / 1e6:.2f} M points) in {time.time() - t0:.0f} s")
     ex = -np.gradient(phi, xs, axis=0)
     ey = -np.gradient(phi, ys, axis=1)
     ez = -np.gradient(phi, zs, axis=2) if len(zs) > 1 else np.zeros_like(phi)
