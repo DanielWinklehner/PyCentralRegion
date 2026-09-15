@@ -30,6 +30,78 @@ from PyPATools.field import Field
 from PyPATools.global_variables import CLIGHT
 
 
+class SparseBeamRecord:
+    """Full-beam states (x, y, z, vx, vy, vz per particle) at a few chosen clock
+    times only, plus the first and the last recorded step.
+
+    The dense ``full_beam`` buffer is (n_steps, n_particles, 6) float64: at 2000
+    steps per turn a 30-turn run of the complete 48,843-particle hand-off needs
+    140 GB, a 15-turn run of 4000 particles already 5.8 GB. Turn-end snapshots
+    need a dozen of those steps. ``track_with_rf(save_times_s=[...])`` records
+    only the steps nearest to the requested clock times (the same clock as the
+    ``launch`` metadata: t = 0 is the bunch centre's birth, the run starts at the
+    earliest birth ``t0_s``), the first step and, rolling, the latest step.
+
+    Indexing mimics the dense array where the data exist: ``rec[0]``, ``rec[-1]``
+    (the last recorded step), ``rec[k]`` for a recorded step ``k``, ``len(rec)`` =
+    number of steps recorded so far. ``rec.at_time(t_s)`` returns
+    ``(step, state)`` for a requested time. Anything else raises ``IndexError``.
+    """
+
+    def __init__(self, times_s, n_particles: int, t0_s: float, dt_s: float):
+        self.times_s = [float(t) for t in times_s]
+        self.t0_s = float(t0_s)
+        self.dt_s = float(dt_s)
+        self.step_of_time = {t: int(round((t - self.t0_s) / self.dt_s)) for t in self.times_s}
+        self.wanted = set(self.step_of_time.values())
+        self.states: Dict[int, np.ndarray] = {}
+        self.first: Optional[np.ndarray] = None
+        self._last = np.full((int(n_particles), 6), np.nan)
+        self.n_steps = 0
+
+    def record(self, step: int, r_array: np.ndarray, v_array: np.ndarray):
+        self._last[:, :3] = r_array
+        self._last[:, 3:] = v_array
+        if self.first is None:
+            self.first = self._last.copy()
+        if step in self.wanted:
+            self.states[int(step)] = self._last.copy()
+        self.n_steps = max(self.n_steps, int(step) + 1)
+
+    @property
+    def last(self) -> np.ndarray:
+        return self._last
+
+    @property
+    def steps(self) -> List[int]:
+        return sorted(self.states)
+
+    def at_time(self, t_s: float) -> Tuple[int, np.ndarray]:
+        """(step, state) at the requested clock time; the step is computed with
+        the run's own t0 and dt, so it matches what was recorded."""
+        k = int(round((float(t_s) - self.t0_s) / self.dt_s))
+        if k not in self.states:
+            raise IndexError(f"no state recorded at t = {t_s * 1e9:.1f} ns (step {k}); recorded steps {self.steps}")
+        return k, self.states[k]
+
+    def __len__(self):
+        return self.n_steps
+
+    def __getitem__(self, k):
+        if isinstance(k, (int, np.integer)):
+            k = int(k)
+            if k == -1 or k == self.n_steps - 1:
+                return self._last
+            if k == 0:
+                if self.first is None:
+                    raise IndexError("nothing recorded yet")
+                return self.first
+            if k in self.states:
+                return self.states[k]
+            raise IndexError(f"step {k} not recorded (sparse record: first, last and steps {self.steps})")
+        raise IndexError("SparseBeamRecord supports integer indexing only")
+
+
 # ============================================================================
 # Initial-beam construction helpers (spiral-inflector hand-off)
 # ============================================================================
@@ -770,8 +842,15 @@ class AcceleratedOrbitFinder:
                       dt: float,
                       max_turns: int,
                       save_full_beam: bool = False,
-                      section_angle: Optional[float] = None) -> Tuple:
+                      section_angle: Optional[float] = None,
+                      save_times_s: Optional[List[float]] = None) -> Tuple:
         """Track particle(s) with RF and collect diagnostics (single or multi).
+
+        ``save_full_beam`` keeps every step of every particle (the dense
+        (n_steps, n_particles, 6) buffer). ``save_times_s`` instead keeps only
+        the steps nearest to these clock times, plus the first and the last
+        step, in a ``SparseBeamRecord`` (see there); the result's ``full_beam``
+        is then that record. The two are exclusive; the sparse form wins.
 
         ``section_angle`` [rad] fixes the Poincare section. The default (None)
         puts it on the reference particle's LAUNCH azimuth, so ``turn N`` means
@@ -847,8 +926,11 @@ class AcceleratedOrbitFinder:
             'reference_birth_step': int(birth_step[0]) if len(birth_step) else 0,
             'n_released_later': int(np.sum(birth_step > 0)),
             'birth_quantization_s': 0.5 * dt if release is not None else 0.0}
-        full_beam = (np.full((n_steps, self.n_particles, 6), np.nan)
-                     if save_full_beam else None)
+        if save_times_s is not None:
+            full_beam = SparseBeamRecord(save_times_s, self.n_particles, t0, dt)
+        else:
+            full_beam = (np.full((n_steps, self.n_particles, 6), np.nan)
+                         if save_full_beam else None)
 
         def callback(step, r_array, v_array, active, t):
             if not np.any(active):
@@ -880,7 +962,9 @@ class AcceleratedOrbitFinder:
             else:
                 std_r_storage.append(0.0)
 
-            if full_beam is not None:
+            if isinstance(full_beam, SparseBeamRecord):
+                full_beam.record(step, r_array[n_ref:], v_array[n_ref:])
+            elif full_beam is not None:
                 full_beam[step, :, :3] = r_array[n_ref:]
                 full_beam[step, :, 3:] = v_array[n_ref:]
             n_recorded[0] = step + 1
@@ -988,7 +1072,7 @@ class AcceleratedOrbitFinder:
         turn_statistics = beam_stats_collector.get_statistics()
         poincare_all = [list(poincare.crossings)]
         success = result.success or energy_reached[0]
-        if full_beam is not None:
+        if full_beam is not None and not isinstance(full_beam, SparseBeamRecord):
             full_beam = full_beam[:n_recorded[0]]
 
         return (success, turn_statistics, rf_crossings, trajectory_ref,
@@ -1424,8 +1508,12 @@ class AcceleratedOrbitFinder:
                    r0: Optional[float] = None,
                    pr0: Optional[float] = None,
                    r0_mode: str = 'offset',
-                   save_full_beam: bool = False) -> OptimizedOrbit:
-        """Single deterministic tracking run (no optimization) of ``initial_beam``."""
+                   save_full_beam: bool = False,
+                   save_times_s: Optional[List[float]] = None) -> OptimizedOrbit:
+        """Single deterministic tracking run (no optimization) of ``initial_beam``.
+
+        ``save_times_s``: keep the full beam only at these clock times (plus the
+        first and last step) - see ``track_with_rf`` / ``SparseBeamRecord``."""
         self.design.set_bunch_phase(bunch_phase_deg)
         self.design.set_rf_frequency(rf_freq_mhz * 1e6)
 
@@ -1438,7 +1526,8 @@ class AcceleratedOrbitFinder:
         self.engine.extra_terminators = self._terminators(coll)
         try:
             result = self.track_with_rf(pd, dt, max_turns,
-                                        save_full_beam=save_full_beam)
+                                        save_full_beam=save_full_beam,
+                                        save_times_s=save_times_s)
         finally:
             self.engine.extra_terminators = []
         vals = {'bunch_phase': bunch_phase_deg, 'rf_freq': rf_freq_mhz * 1e6}
