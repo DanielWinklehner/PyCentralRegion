@@ -65,12 +65,37 @@ def _pool_init(builder, builder_args, checkpoint_base):
     _WORKER_GEO = geo
 
 
+# Hand-off beams carry more than positions and momenta (see handoff.py /
+# AcceleratedOrbitFinder._BEAM_EXTRAS): the birth times of the timed release,
+# the named reference particle, the macro charge. The pool tasks ship them
+# next to (x_vec, p_vec); a worker that rebuilt the beam without them would
+# optimize a DIFFERENT problem (snapshot launch, centroid reference, no bar
+# hook - observed 2026-09-13: worker cost 16 vs 28 for the same point).
+_POOL_BEAM_EXTRAS = ('birth_time', 'reference_state', 'macro_charge_c', 'handoff_meta')
+
+
+def _beam_extras(beam) -> dict:
+    out = {}
+    for name in _POOL_BEAM_EXTRAS:
+        if hasattr(beam, name):
+            val = getattr(beam, name)
+            out[name] = np.asarray(val).copy() if isinstance(val, np.ndarray) else val
+    return out
+
+
+def _pool_beam(species, x_vec, p_vec, extras=None):
+    from PyPATools.particles import ParticleDistribution
+    beam = ParticleDistribution(species=species, x_vec=np.asarray(x_vec), p_vec=np.asarray(p_vec))
+    for name, val in (extras or {}).items():
+        setattr(beam, name, np.asarray(val).copy() if isinstance(val, np.ndarray) else val)
+    return beam
+
+
 def _pool_track_once(task):
     """Stage-A grid point: (phase, freq) with the given frozen geometry."""
     try:
         (phase_deg, freq_hz, x_vec, p_vec, spt, max_turns, r0_mode,
-         angles_per_gap, radii_per_gap) = task
-        from PyPATools.particles import ParticleDistribution
+         angles_per_gap, radii_per_gap, extras) = task
         geo = _WORKER_GEO
         of = geo.orbit_finder
         of.steps_per_turn = int(spt)
@@ -81,8 +106,7 @@ def _pool_track_once(task):
         # geometry-keyed attach solves once per worker and then no-ops.
         if geo._is_bem and not geo._attach_bem_for_current_geometry():
             return None
-        beam = ParticleDistribution(species=of.design.species,
-                                    x_vec=np.asarray(x_vec), p_vec=np.asarray(p_vec))
+        beam = _pool_beam(of.design.species, x_vec, p_vec, extras)
         res = of.track_once(beam, bunch_phase_deg=float(phase_deg),
                             rf_freq_mhz=float(freq_hz) / 1e6,
                             max_turns=int(max_turns), r0_mode=r0_mode)
@@ -101,13 +125,11 @@ def _pool_verify(task):
     """
     try:
         (x, x_vec, p_vec, spt, max_turns, ls_weights, rf_optimize_params,
-         r0_mode, skip_turns, f0_hz) = task
-        from PyPATools.particles import ParticleDistribution
+         r0_mode, skip_turns, f0_hz, extras) = task
         geo = _WORKER_GEO
         of = geo.orbit_finder
         of.steps_per_turn = int(spt)
-        beam = ParticleDistribution(species=of.design.species,
-                                    x_vec=np.asarray(x_vec), p_vec=np.asarray(p_vec))
+        beam = _pool_beam(of.design.species, x_vec, p_vec, extras)
         dt = of._estimate_timestep(float(f0_hz))
         resid = geo.residuals_with_geometry(
             np.asarray(x, dtype=float), beam, dt, int(max_turns),
@@ -124,17 +146,15 @@ def _pool_dfols(task):
     """Stage-B multi-start: one full DFO-LS run; returns a compact result."""
     try:
         import dfols
-        from PyPATools.particles import ParticleDistribution
         (seed_x0, lower, upper, x_vec, p_vec, spt, max_turns, ls_weights,
-         rf_optimize_params, r0_mode, skip_turns, maxfun, f0_hz) = task
+         rf_optimize_params, r0_mode, skip_turns, maxfun, f0_hz, extras) = task
         geo = _WORKER_GEO
         of = geo.orbit_finder
         of.steps_per_turn = int(spt)
         of.iteration = 0
         of.best_cost = np.inf
         geo.best_cost = np.inf
-        beam = ParticleDistribution(species=of.design.species,
-                                    x_vec=np.asarray(x_vec), p_vec=np.asarray(p_vec))
+        beam = _pool_beam(of.design.species, x_vec, p_vec, extras)
         lower = np.asarray(lower, dtype=float)
         upper = np.asarray(upper, dtype=float)
         margin = 1e-6 * (upper - lower)
@@ -1233,7 +1253,8 @@ class CavityGeometryOptimizer:
                         n_starts: Optional[int] = None,
                         geometry_jitter_deg: float = 1.0,
                         collimator_seed: Optional[tuple] = None,
-                        seed_from_current_geometry: bool = False) -> OptimizedOrbit:
+                        seed_from_current_geometry: bool = False,
+                        stage_a_objective: bool = False) -> OptimizedOrbit:
         """Three-stage optimization:
 
         A. Coarse RF scan (geometry frozen straight): grid over bunch phase x
@@ -1267,7 +1288,7 @@ class CavityGeometryOptimizer:
                 phase_grid, freq_fracs, maxfun, r0_mode, skip_turns,
                 workers, worker_builder, worker_builder_args,
                 n_starts, geometry_jitter_deg, collimator_seed,
-                seed_from_current_geometry)
+                seed_from_current_geometry, stage_a_objective)
 
         of = self.orbit_finder
         of._set_beam_meta(initial_beam)
@@ -1347,7 +1368,8 @@ class CavityGeometryOptimizer:
                                   worker_builder_args, n_starts,
                                   geometry_jitter_deg,
                                   collimator_seed=None,
-                                  seed_from_current_geometry: bool = False) -> OptimizedOrbit:
+                                  seed_from_current_geometry: bool = False,
+                                  stage_a_objective: bool = False) -> OptimizedOrbit:
         """Parallel staged optimization (see optimize_staged docstring).
 
         ``collimator_seed``: optional (azimuth_deg, aperture_mm) applied
@@ -1387,6 +1409,7 @@ class CavityGeometryOptimizer:
 
         x_vec = np.array(initial_beam.x_vec, dtype=float)
         p_vec = np.array(initial_beam.p_vec, dtype=float)
+        extras = _beam_extras(initial_beam)      # timed release, reference, charge
 
         if self.verbose:
             print("\n" + "=" * 70)
@@ -1413,22 +1436,49 @@ class CavityGeometryOptimizer:
                           self.checkpoint_file)) as pool:
 
             # ---- Stage A: parallel RF grid scan, geometry frozen at x0.
-            tasks_a = [(float(ph), float(f0 * ff), x_vec, p_vec, search_spt,
-                        search_turns, r0_mode, angles0, radii0)
-                       for ph in phase_grid for ff in freq_fracs]
-            futs = [pool.submit(_pool_track_once, t) for t in tasks_a]
+            if stage_a_objective:
+                # the real objective at every grid point (geometry x0): score = -cost
+                order_a = ['bunch_phase', 'rf_freq', 'r0', 'vr0', 'coll_azimuth', 'coll_aperture']
+                grid_pts = [(float(ph), float(f0 * ff)) for ph in phase_grid for ff in freq_fracs]
+                tasks_a = []
+                for ph, fr in grid_pts:
+                    xa = np.asarray(x0, dtype=float).copy()
+                    k = self._rf_offset
+                    for name in order_a:
+                        if name in rf_optimize_params:
+                            if name == 'bunch_phase':
+                                xa[k] = ph
+                            elif name == 'rf_freq':
+                                xa[k] = fr
+                            k += 1
+                    tasks_a.append((xa.tolist(), x_vec, p_vec, search_spt, search_turns,
+                                    dict(ls_weights), tuple(rf_optimize_params), r0_mode,
+                                    int(skip_turns), float(f0), extras))
+                futs = [pool.submit(_pool_verify, t) for t in tasks_a]
+            else:
+                tasks_a = [(float(ph), float(f0 * ff), x_vec, p_vec, search_spt,
+                            search_turns, r0_mode, angles0, radii0, extras)
+                           for ph in phase_grid for ff in freq_fracs]
+                futs = [pool.submit(_pool_track_once, t) for t in tasks_a]
             bar = (tqdm(total=len(futs), desc="Stage A (RF scan)", ncols=100)
                    if (self.verbose and tqdm) else None)
             scan = []
             best_e = -np.inf
-            for fut in as_completed(futs):
+            for i_fut, fut in enumerate(as_completed(futs)):
                 s = fut.result()
+                if stage_a_objective:
+                    # map the verify result back to its grid point via the future
+                    s = None if (s is None or 'error' in s) else s
+                    if s is not None:
+                        j = futs.index(fut)
+                        s = (-float(s['obj']), grid_pts[j][0], grid_pts[j][1])
                 if s is not None:
                     scan.append(s)
                     best_e = max(best_e, s[0])
                 if bar:
                     bar.update(1)
-                    bar.set_postfix_str(f"best E={best_e:.3f} MeV")
+                    bar.set_postfix_str(f"best cost={-best_e:.3f}" if stage_a_objective
+                                        else f"best E={best_e:.3f} MeV")
             if bar:
                 bar.close()
             if not scan:
@@ -1439,12 +1489,16 @@ class CavityGeometryOptimizer:
                 t_a = time.time() - t_start
                 print(f"Stage A done in {t_a:.0f}s; top basins:")
                 for E, ph, f in scan[:min(n_starts, 5)]:
-                    print(f"  E={E:.3f} MeV @ phase={ph:.0f} deg, f={f / 1e6:.3f} MHz")
+                    if stage_a_objective:
+                        print(f"  cost={-E:.3f} @ phase={ph:.0f} deg, f={f / 1e6:.3f} MHz")
+                    else:
+                        print(f"  E={E:.3f} MeV @ phase={ph:.0f} deg, f={f / 1e6:.3f} MHz")
 
             # ---- Seeds: distinct VIABLE phase basins (>= 25% of the best
             # stage-A energy), then jittered clones of the good basins. Seeding
             # non-accelerating phases wastes whole DFO-LS starts.
-            e_min = 0.25 * scan[0][0]
+            # objective mode: scores are -cost (negative); every finite point is viable
+            e_min = -np.inf if stage_a_objective else 0.25 * scan[0][0]
             picked = []
             for E, ph, f in scan:
                 if len(picked) >= n_starts:
@@ -1488,7 +1542,7 @@ class CavityGeometryOptimizer:
             # ---- Stage B: multi-start DFO-LS in parallel.
             tasks_b = [(s, lower, upper, x_vec, p_vec, search_spt, search_turns,
                         dict(ls_weights), tuple(rf_optimize_params), r0_mode,
-                        int(skip_turns), maxfun_per, float(f0)) for s in seeds]
+                        int(skip_turns), maxfun_per, float(f0), extras) for s in seeds]
             futs = [pool.submit(_pool_dfols, t) for t in tasks_b]
             bar = (tqdm(total=len(futs), desc="Stage B (DFO-LS starts)", ncols=100)
                    if (self.verbose and tqdm) else None)
@@ -1544,7 +1598,7 @@ class CavityGeometryOptimizer:
             # resolution; the search objective must never pick the winner.
             tasks_v = [(r['x'], x_vec, p_vec, final_spt, final_turns,
                         dict(ls_weights), tuple(rf_optimize_params), r0_mode,
-                        int(skip_turns), float(f0)) for r in ok]
+                        int(skip_turns), float(f0), extras) for r in ok]
             vers = list(pool.map(_pool_verify, tasks_v, chunksize=1))
             for r, v in zip(ok, vers):
                 if v and 'error' not in v:
