@@ -19,6 +19,7 @@ cylindrical pieces:
 Part of: PyCentralRegion module
 """
 import time
+import os
 import numpy as np
 from typing import Tuple, Optional, Callable
 from dataclasses import dataclass
@@ -291,6 +292,22 @@ class TimedRelease(Interaction):
         return r, v, active
 
 
+
+def _rotation_from_to(a, b):
+    """Rotation matrix taking direction a onto direction b (Rodrigues); identity when they are parallel."""
+    a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0.0 or nb == 0.0:
+        return np.eye(3)
+    a = a / na; b = b / nb
+    k = np.cross(a, b); s = float(np.linalg.norm(k)); c = float(np.dot(a, b))
+    if s < 1e-12:
+        return np.eye(3)
+    k = k / s
+    K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    th = np.arctan2(s, c)
+    return np.eye(3) + np.sin(th) * K + (1.0 - np.cos(th)) * (K @ K)
+
 class SpaceChargeKick(Interaction):
     """Space-charge kick of the live bunch from an open-boundary Poisson solve.
 
@@ -336,6 +353,8 @@ class SpaceChargeKick(Interaction):
         if not hasattr(solver, 'solve_eb'):
             raise TypeError("solver must provide solve_eb(positions, charges, velocities) -> (E, B)")
         self.solver = solver
+        self.move = os.environ.get('HCHC60_SC_MOVE', '0') == '1'   # 2026-09-16: self-field carried with the bunch
+        self._c0 = None
         self.every = max(1, int(resolve_every))
         self.macro_charge_c = macro_charge_c
         self.bunch_current_a = bunch_current_a
@@ -420,6 +439,7 @@ class SpaceChargeKick(Interaction):
         self.E[:] = 0.0
         self.B[:] = 0.0
         self.has_field[:] = False
+        self._c0 = None
         if n_dep < self.min_particles:
             self.n_skipped += 1
             return
@@ -428,6 +448,14 @@ class SpaceChargeKick(Interaction):
         self.E[dep] = E_dep
         self.B[dep] = B_dep
         self.has_field[dep] = True
+        if self.move:
+            # the bunch's mean direction is re-derived at every step from the SAME particles (depositing now,
+            # still alive then); the solve's vectors are kept and rotated from there
+            self._c0 = True
+            self._sol_mask = dep.copy()
+            self._v0 = v.copy()
+            self._E_solve = self.E.copy()
+            self._B_solve = self.B.copy()
         # charged-less particles that are kicked (a non-exempt reference): the field at their position
         others = active & ~dep & self.kick_mask
         if np.any(others) and hasattr(self.solver, 'gather'):
@@ -479,6 +507,23 @@ class SpaceChargeKick(Interaction):
             return r, v, active
         if step % self.every == 0:
             self._solve(step, r, v, active, t)
+        elif self.move and getattr(self, '_c0', None) is not None:
+            # 2026-09-16 (HCHC60_SC_MOVE): the stored per-particle vectors of the last solve are ROTATED with the mean
+            # direction of the bunch since the solve (the same particles then and now), so the kick turns with the
+            # orbit between solves; each particle still carries the field of its own solve position (self-force-free -
+            # a re-gather at a mapped-back point picks up the particle's own charge cloud, 1.1 mm off the every-step
+            # reference at 120 macro-particles, versus 34 um for the un-rotated per-particle scheme).
+            common = self._sol_mask & active
+            if np.any(common):
+                R = _rotation_from_to(self._v0[common].mean(axis=0), v[common].mean(axis=0))
+                who = active & self.kick_mask & self.has_field
+                if np.any(who):
+                    self.E[who] = self._E_solve[who] @ R.T
+                    self.B[who] = self._B_solve[who] @ R.T
+            fresh = active & ~self.has_field & self.deposit_mask
+            if np.any(fresh) and self.n_solves > 0 and hasattr(self.solver, 'gather'):
+                self.E[fresh] = self.solver.gather(r[fresh])
+                self.has_field[fresh] = True
         else:
             fresh = active & ~self.has_field & self.deposit_mask
             if np.any(fresh) and self.n_solves > 0 and hasattr(self.solver, 'gather'):
@@ -497,7 +542,7 @@ class SpaceChargeKick(Interaction):
         out = {
             'n_solves': int(self.n_solves), 'n_skipped': int(self.n_skipped),
             'n_kick_steps': int(self.n_kick_steps),
-            'resolve_every': int(self.every), 'kick_z': self.kick_z, 'exempt_ref': self.exempt_ref,
+            'resolve_every': int(self.every), 'kick_z': self.kick_z, 'exempt_ref': self.exempt_ref, 'move': bool(self.move),
             'charge_scale': self.charge_scale, 'noop': bool(self.noop),
             'n_charged': int(self.n_charged), 'bunch_charge_c': float(self.bunch_charge_c),
             'macro_charge_c': (float(self.charges[self.deposit_mask][0])
