@@ -28,24 +28,26 @@ What the kernel reproduces per step, in ``Tracker.run`` order:
 The E-field stack it understands is the one the 3D bunch deck installs:
 ``StaticPlusRFField(rf=TimedField(RadialBlendField(bem3d, cavity map [, RadialTaperField]),
 omega, phase), statics=[inflector 3D field])`` over gridded ``Field``s with the
-numba interpolator backend, plus the 3D magnet map as B. The Boris kick is the
-VERBATIM per-particle body of ``PyPATools.pusher.boris_rel_dkd_batch`` and
-reproduces it bit for bit (checked by ``selftest()``).
+numba interpolator backend, plus the 3D magnet map as B.
 
-Field interpolation has two modes, because the Python path's fused kernel
-``interpolators._interp3d_batch3`` is ``parallel=True`` and LLVM contracts its
-arithmetic differently from ANY scalar spelling of the same source - it differs
-from ``_interp3d_single`` and from the per-component ``_interp3d_batch`` by one
-ulp on a few per cent of points, so a per-point loop cannot be bit-identical to
-it:
+There are two modes, because the two compiled kernels the Python path leans on -
+``interpolators._interp3d_batch3`` and ``pusher.boris_rel_dkd_batch`` - are both
+``parallel=True``, and a parfor contracts its arithmetic differently from EVERY
+scalar spelling of the same source. ``_interp3d_batch3`` disagrees by an ulp
+with ``_interp3d_single`` and with the per-component ``_interp3d_batch`` on a few
+per cent of points; ``boris_rel_dkd_batch`` disagrees with its own per-particle
+body on about one input in 1e5. A per-particle loop therefore CANNOT be
+bit-identical to the Python path, however faithfully it is written:
 
-  ``interp='batch'`` (exact)  the kernel calls ``_interp3d_batch3`` itself, on
-      the same point sets and in the same order as the Python path, and
-      reproduces it BIT FOR BIT. It keeps that kernel's thread fork/join, so it
-      is the verification mode rather than the fast one.
-  ``interp='point'`` (default, fast)  the interpolation is inlined per particle
-      (the verbatim body of ``_interp3d_batch3``'s loop over the same leaf
-      functions). Field values then agree with the Python path to 1 ulp.
+  ``interp='batch'`` (exact)  the kernel calls ``_interp3d_batch3`` and
+      ``boris_rel_dkd_batch`` themselves, on the same point sets and in the same
+      order as the Python path, and reproduces it BIT FOR BIT. It keeps their
+      thread fork/join, so it is the verification mode rather than the fast one.
+  ``interp='point'`` (default, fast)  interpolation and push are inlined per
+      particle (the verbatim bodies of the two kernels' loops, over the same leaf
+      functions, with a per-particle interpolation cell hint that returns the
+      same cell as the plain search). Agreement with the Python path is then a
+      few ulp per evaluation, which after two turns is |dr| ~ 3e-16 m.
 
 The space-charge SOLVE stays in Python: the driver alternates kernel chunks with
 ``SpaceChargeKick.apply`` at the steps where a solve (or a gather for particles
@@ -81,6 +83,7 @@ from PyPATools.field import Field, TimedField
 if HAS_NUMBA:
     from PyPATools.field_src.interpolators import (_searchsorted_numba, _searchsorted_with_hint,
                                                    _trilinear_cell, _interp3d_batch3)
+    from PyPATools.pusher import boris_rel_dkd_batch
 
 
 class FastPathUnavailable(Exception):
@@ -354,6 +357,8 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
     e_acc = np.empty((n, 3))
     e_tmp = np.empty((n, 3))
     b_acc = np.empty((n, 3))
+    v_act = np.empty((n, 3))
+    dt_arr = np.empty(n)
     hitmask = np.zeros(n, dtype=np.bool_)
     hdt = 0.5 * dt
     t = t_start
@@ -508,19 +513,26 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
                         e_acc[a, 1] = e_acc[a, 1] + e_tmp[a, 1]
                         e_acc[a, 2] = e_acc[a, 2] + e_tmp[a, 2]
                 _eval_field_batch(bfld, xa, ya, za, na, b_acc)
-                for a in prange(na):
+                # and the push through the Python path's OWN batch kernel: its
+                # parfor contracts a little differently from any scalar spelling
+                # of the same source (about one row in 1e5 differs by an ulp), so
+                # calling it is the only way to be bit-identical.
+                for a in range(na):
                     p = idx[a]
-                    nrx, nry, nrz, nvx, nvy, nvz = _boris_point(
-                        r_half[a, 0], r_half[a, 1], r_half[a, 2],
-                        v[p, 0], v[p, 1], v[p, 2],
-                        e_acc[a, 0], e_acc[a, 1], e_acc[a, 2],
-                        b_acc[a, 0], b_acc[a, 1], b_acc[a, 2], dt, q_over_m)
-                    r[p, 0] = nrx
-                    r[p, 1] = nry
-                    r[p, 2] = nrz
-                    v[p, 0] = nvx
-                    v[p, 1] = nvy
-                    v[p, 2] = nvz
+                    v_act[a, 0] = v[p, 0]
+                    v_act[a, 1] = v[p, 1]
+                    v_act[a, 2] = v[p, 2]
+                    dt_arr[a] = dt
+                r_new, v_new = boris_rel_dkd_batch(r_half[:na], v_act[:na], e_acc[:na],
+                                                   b_acc[:na], dt_arr[:na], q_over_m)
+                for a in range(na):
+                    p = idx[a]
+                    r[p, 0] = r_new[a, 0]
+                    r[p, 1] = r_new[a, 1]
+                    r[p, 2] = r_new[a, 2]
+                    v[p, 0] = v_new[a, 0]
+                    v[p, 1] = v_new[a, 1]
+                    v[p, 2] = v_new[a, 2]
             else:
                 for a in prange(na):
                     p = idx[a]
@@ -709,13 +721,17 @@ def _hypot_point(x, y):
 def selftest(n: int = 4096, seed: int = 20260916) -> dict:
     """Compare the per-point leaves with the batch kernels they stand in for.
 
-    ``_boris_point`` must reproduce ``pusher.boris_rel_dkd_batch`` EXACTLY (it
-    does; the fast path refuses to run otherwise). ``_interp3_point`` cannot be
-    exact against ``interpolators._interp3d_batch3``, whose ``parallel=True``
-    compilation contracts differently from every scalar spelling of the same
-    source (it also disagrees with ``_interp3d_single`` and with the
-    per-component ``_interp3d_batch``); the residual is reported here and is why
-    ``interp='batch'`` exists.
+    Neither ``_interp3_point`` nor ``_boris_point`` can be exact against the
+    ``parallel=True`` kernels they stand in for: a parfor contracts differently
+    from every scalar spelling of the same source (``_interp3d_batch3`` also
+    disagrees with ``_interp3d_single`` and with the per-component
+    ``_interp3d_batch``, and ``boris_rel_dkd_batch`` differs from its own scalar
+    body on about one input in 1e5). The residuals are measured here; ``interp
+    ='batch'`` calls both batch kernels instead and is bit-identical.
+
+    What MUST be exact, and is checked: the cell-hint search returning the same
+    index as the plain binary search, the per-point interpolation matching
+    ``_interp3d_single``, and numba's ``np.hypot`` matching NumPy's.
     """
     from PyPATools.field_src.interpolators import _interp3d_batch3 as _b3, _interp3d_single
     from PyPATools.pusher import boris_rel_dkd_batch
@@ -767,8 +783,9 @@ def selftest(n: int = 4096, seed: int = 20260916) -> dict:
         r_mine[i] = ob[:3]
         v_mine[i] = ob[3:]
     boris_ok = bool(np.array_equal(r_ref, r_mine) and np.array_equal(v_ref, v_mine))
-    boris_max = 0.0 if boris_ok else float(max(np.max(np.abs(r_ref - r_mine)),
-                                               np.max(np.abs(v_ref - v_mine))))
+    boris_max = float(max(np.max(np.abs(r_ref - r_mine)), np.max(np.abs(v_ref - v_mine))))
+    boris_rows = int(np.sum((np.abs(r_ref - r_mine).max(axis=1) > 0)
+                            | (np.abs(v_ref - v_mine).max(axis=1) > 0)))
 
     # np.hypot: the blend / taper radius. NumPy's ufunc and numba's scalar
     # implementation need not be the same function.
@@ -778,9 +795,13 @@ def selftest(n: int = 4096, seed: int = 20260916) -> dict:
     h_mine = np.array([_hypot_point(hx[i], hy[i]) for i in range(n)])
     hypot_ok = bool(np.array_equal(h_ref, h_mine))
 
-    return {'boris_exact': boris_ok, 'boris_max_abs': boris_max,
-            'interp_exact_vs_batch3': interp_ok, 'interp_max_rel_vs_batch3': interp_rel,
-            'interp_exact_vs_single': single_ok, 'batch3_max_rel_vs_single': b3_vs_single,
+    return {'n_samples': int(n),
+            'boris_point_exact_vs_batch': boris_ok, 'boris_point_max_abs': boris_max,
+            'boris_point_rows_differing': boris_rows,
+            'interp_point_exact_vs_batch3': interp_ok,
+            'interp_point_max_rel_vs_batch3': interp_rel,
+            'interp_point_exact_vs_single': single_ok,
+            'batch3_max_rel_vs_single': b3_vs_single,
             'hinted_exact_vs_plain': hint_ok, 'hypot_exact': hypot_ok}
 
 
@@ -789,10 +810,12 @@ def _require_selftest():
     if _SELFTEST is None:
         _SELFTEST = selftest()
     s = _SELFTEST
-    if not s['boris_exact']:
+    # boris_point / interp3_point are ALLOWED to differ from the batch kernels in
+    # the last ulp (see the module docstring); interp='batch' calls those kernels
+    # instead. What must hold exactly is the cell-hint equivalence and hypot.
+    if not s['interp_point_exact_vs_single']:
         raise FastPathUnavailable(
-            f"the per-particle Boris kick does not reproduce boris_rel_dkd_batch exactly "
-            f"(max |diff| {s['boris_max_abs']:.3e})")
+            "the per-point interpolation does not reproduce _interp3d_single exactly")
     if not s['hinted_exact_vs_plain']:
         raise FastPathUnavailable(
             "the cell-hint interpolation does not match the plain binary search")
@@ -986,6 +1009,17 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
             raise FastPathUnavailable("SpaceChargeKick.prepare was not run for this beam")
         if not hasattr(sc.solver, 'gather'):
             raise FastPathUnavailable("space-charge solver without gather()")
+        if getattr(sc, 'move', False):
+            # HCHC60_SC_MOVE rotates the stored per-particle E_sc/B_sc with the
+            # bunch's mean direction on EVERY step between solves, so the kernel's
+            # "the solve's field is frozen until the next solve" no longer holds
+            # and every step would have to be a chunk boundary. Reproducing the
+            # rotation inside the kernel is a contained follow-up (the matrix is
+            # one Rodrigues formula over the mean velocity of the solve's own
+            # particle set); until then these runs take the general path.
+            raise FastPathUnavailable(
+                "SpaceChargeKick.move (HCHC60_SC_MOVE=1): the stored self-field is "
+                "rotated every step, which the chunked kernel does not reproduce")
 
     # terminators: at most one MetalTerminator, no collimator
     metal = None
