@@ -438,6 +438,23 @@ class AcceleratedOrbitFinder:
         # general PyPATools Tracker path; last_fast_path says what happened.
         self.fast_path = True
         self.last_fast_path = None
+        # Compiled MULTI-PARTICLE 3D fast path (fast_track3d.py): the whole
+        # bunch advanced for a chunk of steps in one njit kernel, with the same
+        # callback replaying the recorded steps. OFF by default; the 3D bunch
+        # deck turns it on from HCHC60_FAST3D=1. 'point' inlines the field
+        # interpolation per particle (fast, 1 ulp from the Python path);
+        # 'batch' calls interpolators._interp3d_batch3 itself and is bit-exact.
+        self.fast3d = False
+        self.fast3d_interp = 'point'
+        # None = let the kernel pick serial / parallel from the particle count
+        # (fast_track3d.PAR_MIN_PARTICLES); True / False force it.
+        self.fast3d_parallel = None
+        # numba thread cap for the kernel only, restored around the run and
+        # around the space-charge solve. The kernel's inner loop is trilinear
+        # interpolation on hundreds of MB of field map and stops scaling at
+        # about 8 threads (fast_track3d.DEFAULT_PAR_THREADS); 0 / None leaves
+        # numba's thread count alone.
+        self.fast3d_threads = 8
         # Space charge: a tracking.SpaceChargeKick (wrapping e.g.
         # PyPATools.poisson_fft.FFTPoissonSolver) attached to every run of
         # track_with_rf / track_once / optimize; None = no space charge. It is
@@ -1011,6 +1028,7 @@ class AcceleratedOrbitFinder:
             return False
 
         fast = None
+        fast3 = None
         self.last_fast_path = None
         if self.fast_path and self.space_charge is not None:
             self.last_fast_path = {'used': False, 'reason': 'space charge attached'}
@@ -1020,9 +1038,23 @@ class AcceleratedOrbitFinder:
                 fast = build_kernel_args(self, pd_init, dt, n_steps, t0, section_angle, max_turns)
             except FastPathUnavailable as exc:
                 self.last_fast_path = {'used': False, 'reason': str(exc)}
+        # Compiled multi-particle 3D kernel (opt-in, fast_track3d.py). It carries
+        # the timed release, the space-charge kick and the metal test itself, so
+        # it is tried whenever the 2D single-particle kernel did not apply.
+        if fast is None and getattr(self, 'fast3d', False):
+            from .fast_track3d import build_kernel_args3d, FastPathUnavailable as FPU3
+            try:
+                fast3 = build_kernel_args3d(self, pd_init, dt, n_steps, t0, birth_step,
+                                            release, n_ref,
+                                            interp=getattr(self, 'fast3d_interp', 'point'))
+            except FPU3 as exc:
+                self.last_fast_path = {'used': False, 'reason': f"3d: {exc}"}
         try:
             result = None
-            if fast is not None:
+            if fast3 is not None:
+                from .fast_track3d import run_fast3d
+                result = run_fast3d(self, fast3, callback, dt, t0)
+            if result is None and fast is not None:
                 result = self._run_fast_path(fast, callback, dt, t0)
                 if result is None:
                     # kernel and callback disagreed on the stop: redo the
