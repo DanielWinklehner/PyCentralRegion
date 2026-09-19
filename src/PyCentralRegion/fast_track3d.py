@@ -1020,9 +1020,13 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
                                       + rk_out[a, 1] * rk_out[a, 1])
                     gw = cav_gap_w[c]
                     if cav_gap_w_inner[c] > 0.0:
-                        frac = (r_cross - cav_r_min[c]) / (cav_taper_r[c] - cav_r_min[c])
-                        frac = max(0.0, min(frac, 1.0))
-                        gw = cav_gap_w_inner[c] + frac * (cav_gap_w[c] - cav_gap_w_inner[c])
+                        if cav_taper_r[c] < 0.0:
+                            # angular wedge floored at the minimum slot: see _pack_cavities
+                            gw = max(cav_gap_w_inner[c], r_cross * (-cav_taper_r[c]))
+                        else:
+                            frac = (r_cross - cav_r_min[c]) / (cav_taper_r[c] - cav_r_min[c])
+                            frac = max(0.0, min(frac, 1.0))
+                            gw = cav_gap_w_inner[c] + frac * (cav_gap_w[c] - cav_gap_w_inner[c])
                     xw = cav_omega[c] * (gw / speed) / 2.0
                     ttf = np.sin(xw) / xw
                     v_gap = cav_voltage[c]
@@ -1635,6 +1639,12 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
                 # > 0.0, so an explicit 0.0 would taper in Python and not here
                 raise FastPathUnavailable(
                     f"gap_width_inner = {float(gwi)} (only None or a positive width)")
+            # the angular law rides in the same slots with a negative taper radius, so its
+            # floor has to clear the same > 0.0 test the kernel applies
+            gwm = getattr(cavity, 'gap_width_min', None)
+            if gwm is not None and float(gwm) <= 0.0:
+                raise FastPathUnavailable(
+                    f"gap_width_min = {float(gwm)} (only None or a positive width)")
     try:
         # with bem2d (or RF off) nothing is kicked, so nothing is packed: a
         # cavity the packer would refuse must not make THAT path fall back

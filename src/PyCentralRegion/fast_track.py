@@ -308,9 +308,13 @@ def _track_kernel(r0, v0, dt, n_steps, t0, q_over_m, q_state, mass_mev, algo,
                 r_cross = np.sqrt(r_c[0] * r_c[0] + r_c[1] * r_c[1])
                 gw = cav_gap_w[c]
                 if cav_gap_w_inner[c] > 0.0:
-                    frac = (r_cross - cav_r_min[c]) / (cav_taper_r[c] - cav_r_min[c])
-                    frac = max(0.0, min(frac, 1.0))
-                    gw = cav_gap_w_inner[c] + frac * (cav_gap_w[c] - cav_gap_w_inner[c])
+                    if cav_taper_r[c] < 0.0:
+                        # angular wedge floored at the minimum slot: see _pack_cavities
+                        gw = max(cav_gap_w_inner[c], r_cross * (-cav_taper_r[c]))
+                    else:
+                        frac = (r_cross - cav_r_min[c]) / (cav_taper_r[c] - cav_r_min[c])
+                        frac = max(0.0, min(frac, 1.0))
+                        gw = cav_gap_w_inner[c] + frac * (cav_gap_w[c] - cav_gap_w_inner[c])
                 x = cav_omega[c] * (gw / speed) / 2.0
                 ttf = np.sin(x) / x
                 v_gap = cav_voltage[c]
@@ -510,9 +514,24 @@ def _pack_cavities(cavities, use_kicks):
         omega.append(float(cav.omega))
         phase.append(float(cav.get_total_phase_rad()))
         volt.append(float(cav.voltage))
+        # Two gap laws share these three slots (RFCavity.gap_width_at):
+        #   no law        gwi = -1
+        #   linear taper  gwi > 0, taper > 0  ->  gwi at r_min rising to gw at taper,
+        #                                         flat at gw beyond it
+        #   ANGULAR wedge gwi > 0, taper < 0  ->  max(gwi, r * (-taper)): a constant-angle
+        #                                         gap of (-taper) radians floored at gwi
+        # The angular law rides on a NEGATIVE taper radius rather than a new array because
+        # fast_track3d unpacks this pack POSITIONALLY (cav[10], cav[11]), so an extra array
+        # would shift those indices in a second kernel. A radius is never legitimately
+        # negative, so the sign is free to carry the flag.
         gw.append(float(cav.gap_width))
-        gwi.append(float(cav.gap_width_inner) if cav.gap_width_inner is not None else -1.0)
-        taper.append(float(cav.gap_taper_radius) if cav.gap_taper_radius is not None else 0.0)
+        _ang = getattr(cav, 'gap_angle', None)
+        if _ang is not None:
+            gwi.append(float(cav.gap_width_min))
+            taper.append(-float(_ang))
+        else:
+            gwi.append(float(cav.gap_width_inner) if cav.gap_width_inner is not None else -1.0)
+            taper.append(float(cav.gap_taper_radius) if cav.gap_taper_radius is not None else 0.0)
         rmin.append(float(cav.r_min))
         scale = getattr(cav, '_voltage_scale', None)
         if scale is not None:

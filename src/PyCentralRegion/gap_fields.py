@@ -182,15 +182,25 @@ def offset_gap_boundary(cavity, side: float, merge_tol: float = 5e-4) -> np.ndar
     """Boundary chain of a gap CHANNEL: centerline offset by ``side * w/2``.
 
     ``side`` is +1 for the CCW (left-of-travel) boundary, -1 for CW. With a
-    tapered gap (``gap_width_inner`` / ``gap_taper_radius``) the offset uses
-    the LOCAL width at each vertex radius; the chain is densified through the
-    tapered span (with an exact vertex at the taper transition radius) so the
-    piecewise-linear boundary follows the taper.
+    tapered gap (``gap_width_inner`` / ``gap_taper_radius``) or an angular one
+    (``gap_angle_deg`` / ``gap_width_min``) the offset uses the LOCAL width at
+    each vertex radius; the chain is densified through the varying span (with an
+    exact vertex at the transition radius) so the piecewise-linear boundary
+    follows it.
+
+    Both laws must be tested for. Testing only ``gap_width_inner`` built the
+    angular gap at a CONSTANT width, so the electrode geometry the BEM solved
+    was not the geometry the tracker kicked through.
     """
     pts = gap_chain(cavity, merge_tol=merge_tol)
-    if getattr(cavity, 'gap_width_inner', None) is None:
+    angle = getattr(cavity, 'gap_angle', None)
+    if angle is None and getattr(cavity, 'gap_width_inner', None) is None:
         return offset_polyline(pts, side * cavity.gap_width / 2.0)
-    pts = _densify_polyline_inner(pts, cavity.gap_taper_radius, max_ds=0.005)
+    # where the width stops varying: the taper transition, or for the angular law the
+    # radius at which the wedge meets its floor, r = gap_width_min / gap_angle
+    r_break = (float(cavity.gap_width_min) / float(angle) if angle is not None
+               else cavity.gap_taper_radius)
+    pts = _densify_polyline_inner(pts, r_break, max_ds=0.005)
     radii = np.hypot(pts[:, 0], pts[:, 1])
     return offset_polyline(pts, side * 0.5 * cavity.gap_width_at(radii))
 
@@ -1659,11 +1669,14 @@ def build_gap_electrodes(design_or_cavities,
                 f"or above the required active radius {max_r_inner * 1000:.1f} mm "
                 f"(e.g. the beam injection radius): the beam would cross gaps "
                 f"where no electrode exists. Open up the inter-gap clearances "
-                f"(see the CavityGeometryOptimizer clearance guard) or taper the "
+                f"(see the CavityGeometryOptimizer clearance guard) or narrow the "
                 f"gap width toward the center (RFCavity "
-                f"gap_width_inner/gap_taper_radius).")
+                f"gap_width_inner/gap_taper_radius, or gap_angle_deg/gap_width_min).")
 
-    gap_widths = [c.gap_width for c in cavities]
+    # the WIDEST the channel actually gets, not the nominal: under the angular law the
+    # width grows with radius, so a nominal taken at one radius under-sizes the model
+    gap_widths = [float(np.max(c.gap_width_at(np.array([c.r_min, c.r_max]))))
+                  for c in cavities]
     if height is None:
         height = 8.0 * max(gap_widths)
     z_levels = _z_levels(height, wall_dz, wall_growth)

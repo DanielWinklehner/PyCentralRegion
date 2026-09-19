@@ -312,7 +312,8 @@ class CavityGeometryOptimizer:
         # exact.
         self._gap_width_params = [
             (cavs[k].gap_width, getattr(cavs[k], 'gap_width_inner', None),
-             getattr(cavs[k], 'gap_taper_radius', None), cavs[k].r_min)
+             getattr(cavs[k], 'gap_taper_radius', None), cavs[k].r_min,
+             getattr(cavs[k], 'gap_angle', None), getattr(cavs[k], 'gap_width_min', None))
             for k in self._clearance_order]
 
         # Opt-in pinch-radius tie-breaker (see class docstring). The pinch
@@ -562,8 +563,15 @@ class CavityGeometryOptimizer:
 
     @staticmethod
     def _frozen_width_at(params, r: float) -> float:
-        """Local gap width [m] at radius r from frozen (nominal, taper) params."""
-        w_nom, w_inner, taper_r, r_min = params
+        """Local gap width [m] at radius r from frozen (nominal, taper, angle) params.
+
+        Mirrors RFCavity.gap_width_at. BOTH laws have to be handled here: under the
+        angular law w_inner is None, so testing that alone returned the constant nominal
+        and the clearance guard would size every gap as if it never widened.
+        """
+        w_nom, w_inner, taper_r, r_min, angle, w_min = params
+        if angle is not None:
+            return max(w_min, r * angle)
         if w_inner is None:
             return w_nom
         frac = min(max((r - r_min) / (taper_r - r_min), 0.0), 1.0)

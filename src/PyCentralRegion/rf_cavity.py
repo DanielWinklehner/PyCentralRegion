@@ -51,6 +51,17 @@ class RFCavity:
     gap_taper_radius : float, optional
         Transition radius [m] from tapered to straight (nominal) gap width.
         Required together with ``gap_width_inner``.
+    gap_angle_deg : float, optional
+        ANGULAR gap law: the gap is a constant-angle wedge of this opening,
+        so its width grows with radius, floored at ``gap_width_min``:
+        ``width(r) = max(gap_width_min, r * gap_angle)``. This is how a real
+        central-region gap is drawn - a wedge outside, a minimum slot inside.
+        Mutually exclusive with ``gap_width_inner``/``gap_taper_radius``,
+        which instead saturate at a CONSTANT width outside the taper radius.
+        Required together with ``gap_width_min``.
+    gap_width_min : float, optional
+        Minimum gap width [m] for the angular law. Required with
+        ``gap_angle_deg``.
     bunch_phase_offset : float
         Global bunch phase offset [degrees]
     n_variable_segments : int
@@ -101,6 +112,8 @@ class RFCavity:
                  segment_rotations: Optional[List[float]] = None,
                  gap_width_inner: Optional[float] = None,
                  gap_taper_radius: Optional[float] = None,
+                 gap_angle_deg: Optional[float] = None,
+                 gap_width_min: Optional[float] = None,
                  voltage_profile=None):
 
         self.r_min = r_min
@@ -129,6 +142,30 @@ class RFCavity:
                                  f"r_max={r_max})")
         self.gap_width_inner = gap_width_inner
         self.gap_taper_radius = gap_taper_radius
+
+        # Optional ANGULAR gap: a constant-angle wedge with a minimum slot width,
+        #     width(r) = max(gap_width_min, r * gap_angle)
+        # which is how the HCHC-60 CAD gap is actually drawn (Daniel, 2026-09-20): 2.5 deg
+        # beyond r = 150 mm, flooring at ~6.5 mm inward. The two anchors agree to 0.05 mm,
+        # because 2.5 deg * 150 mm = 6.545 mm - the floor bites at r = 149 mm.
+        #
+        # This is NOT expressible as the linear taper above, which saturates at a CONSTANT
+        # gap_width beyond gap_taper_radius; here the width keeps growing with r. It takes
+        # precedence over the taper when both are given.
+        if (gap_angle_deg is None) != (gap_width_min is None):
+            raise ValueError("gap_angle_deg and gap_width_min must be given together "
+                             "(or both omitted)")
+        if gap_angle_deg is not None:
+            if gap_angle_deg <= 0.0:
+                raise ValueError(f"gap_angle_deg must be > 0 (got {gap_angle_deg})")
+            if gap_width_min <= 0.0:
+                raise ValueError(f"gap_width_min must be > 0 (got {gap_width_min})")
+            if gap_width_inner is not None:
+                raise ValueError("gap_angle_deg/gap_width_min and gap_width_inner/"
+                                 "gap_taper_radius are two different gap laws; give one")
+        self.gap_angle_deg = gap_angle_deg
+        self.gap_angle = None if gap_angle_deg is None else np.deg2rad(gap_angle_deg)
+        self.gap_width_min = gap_width_min
 
         # Optional radial dee-voltage profile: the kick voltage becomes
         # voltage * scale(r) at the crossing radius (see set_voltage_profile).
@@ -321,10 +358,16 @@ class RFCavity:
     def gap_width_at(self, r):
         """Local gap channel width [m] at radius ``r`` (scalar or array).
 
-        Linear taper from ``gap_width_inner`` at ``r_min`` to the nominal
-        ``gap_width`` at ``gap_taper_radius``, constant nominal beyond;
-        constant ``gap_width`` everywhere when no taper is configured.
+        With ``gap_angle_deg`` set, a constant-angle wedge floored at a minimum
+        slot width: ``max(gap_width_min, r * gap_angle)``. Otherwise a linear
+        taper from ``gap_width_inner`` at ``r_min`` to the nominal ``gap_width``
+        at ``gap_taper_radius``, constant nominal beyond; constant ``gap_width``
+        everywhere when neither is configured.
         """
+        if self.gap_angle is not None:
+            w = np.maximum(self.gap_width_min,
+                           np.asarray(r, dtype=float) * self.gap_angle)
+            return float(w) if np.isscalar(r) else w
         if self.gap_width_inner is None:
             if np.isscalar(r):
                 return self.gap_width
