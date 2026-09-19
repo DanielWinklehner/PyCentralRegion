@@ -3346,15 +3346,17 @@ def main():
                     raise SystemExit(f"--gap-posts wants 'gap:side:arclength' triples, got {item!r}")
             posts += gap_posts(foot, dummy, spec, aperture=ap_mm, size=a.post_size,
                                offset=a.post_offset, overhang=a.post_overhang)
+        win_spec = []
         if a.gap_windows:
-            # "gap:side:s_lo:s_hi:z_lo:z_hi" - the vertical aperture, z_lo..z_hi being the OPENING
+            # "gap:side:s_lo:s_hi:z_lo:z_hi" - the vertical aperture, z_lo..z_hi being the OPENING.
+            # Parsed here but BUILT after every post exists, so the bounds can be snapped to the
+            # post centres (see below).
             for item in a.gap_windows.split(','):
                 f = item.split(':')
                 if len(f) != 6:
                     raise SystemExit(f"--gap-windows wants 'gap:side:s_lo:s_hi:z_lo:z_hi', got {item!r}")
-                posts += gap_window(foot, dummy, int(f[0]), f[1].strip(), float(f[2]), float(f[3]),
-                                    float(f[4]), float(f[5]), aperture=ap_mm,
-                                    depth=a.post_size, overhang=a.post_overhang)
+                win_spec.append((int(f[0]), f[1].strip(), float(f[2]), float(f[3]),
+                                 float(f[4]), float(f[5])))
         if a.gap0_posts:
             try:
                 s_in, s_out = (float(v) for v in a.gap0_posts.split(','))
@@ -3362,6 +3364,40 @@ def main():
                 raise SystemExit("--gap0-posts wants 's_inner,s_outer' in mm of arclength")
             posts += gap0_posts(foot, s_in, s_out, aperture=ap_mm, size=a.post_size,
                                 offset=a.post_offset, overhang=a.post_overhang)
+
+        # ---- windows, snapped to the post centres ------------------------------------------
+        # A window ALWAYS spans post centre to post centre. A cylindrical post's footprint tapers
+        # to nothing at its edge, so a window that stops at the edge leaves an uncovered wedge -
+        # which is the whole reason the rule exists. Snapping here rather than trusting the string
+        # means a --gap-windows spec written under the old edge-to-edge convention cannot survive a
+        # rebuild silently: cf4 carried stale edge-to-edge bounds on gaps 0, 1 and 2 (exactly
+        # centre +- half a post) while gaps 3 and 4, placed fresh, were correct.
+        import re as _re
+        _centres = {}
+        for q in (posts or []):
+            m = _re.match(r'^g(\d+)_(dee|dummy)(?:_\d+)?$', str(q.get('name', '')))
+            if m:
+                _centres.setdefault((int(m.group(1)), m.group(2)), []).append(float(q['s']))
+            elif str(q.get('name', '')).startswith('post_'):
+                _centres.setdefault((0, 'dee'), []).append(float(q['s']))   # gap0_posts naming
+        _snapped = []
+        for g, side, s_lo, s_hi, z_lo, z_hi in win_spec:
+            c = _centres.get((g, side))
+            if c and len(c) >= 2:
+                lo, hi = min(c), max(c)
+                if abs(lo - s_lo) > 1e-6 or abs(hi - s_hi) > 1e-6:
+                    _snapped.append(f"    gap {g} {side:<5} {s_lo:7.2f}..{s_hi:7.2f} -> "
+                                    f"{lo:7.2f}..{hi:7.2f} mm "
+                                    f"({s_lo - lo:+.2f} / {s_hi - hi:+.2f})")
+                s_lo, s_hi = lo, hi
+            elif c:
+                print(f"  [window] gap {g} {side}: only one post on this edge, "
+                      f"bounds left as given ({s_lo:.2f}..{s_hi:.2f} mm)")
+            posts += gap_window(foot, dummy, g, side, s_lo, s_hi, z_lo, z_hi,
+                                aperture=ap_mm, depth=a.post_size, overhang=a.post_overhang)
+        if _snapped:
+            print(f"\n  [window] snapped {len(_snapped)} window(s) to their post centres:")
+            print("\n".join(_snapped))
 
         posts = posts or None
         if posts:
