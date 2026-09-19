@@ -11,21 +11,29 @@ statistics, reference trajectory, full-beam record) is produced by unchanged
 code and the two paths agree to round-off (tests/test_fast_track.py).
 
 What the kernel reproduces, step by step, from ``Tracker.run`` /
-``Pusher._rk4_step_batch`` / ``RFCavityInteraction`` / ``RFCavity``:
-  * RF time frozen at the step midpoint for the four RK4 stages (TimedField
-    convention), relativistic RK4 (``rk4_rel_dbetagamma_dt``) with the
-    0.9999 c clamp, bilinear field lookups (``_interp2d_single``);
+``Pusher._rk4_step_batch`` / ``Pusher._boris_rel_step_batch`` /
+``RFCavityInteraction`` / ``RFCavity``:
+  * RF time frozen ONCE per step at the step midpoint (TimedField convention,
+    ``Tracker.run``'s single ``set_time(t + dt/2)`` before the push) and reused
+    by every push of that step, both algorithms, kicks included;
+  * ``rk4_rel``: four stages of ``rk4_rel_dbetagamma_dt`` with the post-step
+    0.9999 c velocity clamp; ``boris_rel``: drift-kick-drift with ONE E and one
+    B evaluation at ``r_half = r + v dt/2``, beta squared clamped at 0.9999 on
+    entry and no post-step velocity clamp; bilinear field lookups in both
+    (``_interp2d_single``);
   * thin-gap kicks in cavity order: Cramer crossing test on the step chord,
-    RK4 backtrack to the crossing, kick along the crossed segment's normal
-    with the transit-time factor, the radial voltage profile (tabulated) and
-    the crossing phase ``omega * (t_step + dt - dt_back) + phase`` exactly as
-    ``apply_kicks_batch`` computes it, RK4 forward to the step end;
+    backtrack to the crossing with the selected pusher, kick along the crossed
+    segment's normal with the transit-time factor, the radial voltage profile
+    (tabulated) and the crossing phase ``omega * (t_step + dt - dt_back) +
+    phase`` exactly as ``apply_kicks_batch`` computes it, forward push to the
+    step end (both algorithms take the backtrack branch: ``use_backtrack`` is
+    false only for plain ``boris``);
   * radial boundary and the midplane obstacle raster as terminators;
   * the Poincare section crossing count with the same arming rule, so the
     kernel stops where the callback would (max turns / target energy).
 
 Supported: one physical particle (no virtual reference, no staggered
-launch), ``rk4_rel``, gridded 2D or constant B, E as zero / a gridded 2D
+launch), ``rk4_rel`` or ``boris_rel``, gridded 2D or constant B, E as zero / a gridded 2D
 static field / a ``TimedField`` pattern / their ``StaticPlusRFField`` sum,
 thin-gap or bem2d gap model, at most one raster obstacle test, no collimator.
 Anything else raises ``FastPathUnavailable`` and the finder takes the general
@@ -133,7 +141,87 @@ def _rk4(r, v, dt, cos_rf, q_over_m,
 
 
 @njit(cache=True, fastmath=True)
-def _track_kernel(r0, v0, dt, n_steps, t0, q_over_m, q_state, mass_mev,
+def _boris(r, v, dt, cos_rf, q_over_m,
+           bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
+           sm, sgx, sgy, svx, svy, svz, ssc, sconst,
+           rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
+           r_new, v_new):
+    """One synchronized relativistic Boris step (drift-kick-drift) with the
+    single field evaluation at r_half = r + v dt/2 (RF pattern frozen at
+    cos_rf), as Pusher._boris_rel_step_batch + boris_rel_dkd_batch. dt may be
+    negative (the RF backtrack), and then r_half lies half a backtrack behind."""
+    e = np.empty(3)
+    es = np.empty(3)
+    b = np.empty(3)
+    rh = np.empty(3)
+    hdt = 0.5 * dt
+    for i in range(3):
+        rh[i] = r[i] + hdt * v[i]
+    _field2d(rh[0], rh[1], bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst, b)
+    _field2d(rh[0], rh[1], sm, sgx, sgy, svx, svy, svz, ssc, sconst, es)
+    _field2d(rh[0], rh[1], rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst, e)
+    for i in range(3):
+        e[i] = es[i] + e[i] * cos_rf
+    c2 = CLIGHT * CLIGHT
+    vx = v[0]
+    vy = v[1]
+    vz = v[2]
+    b2 = (vx * vx + vy * vy + vz * vz) / c2
+    if b2 >= 0.9999:
+        b2 = 0.9999
+    g = 1.0 / np.sqrt(1.0 - b2)
+    he = 0.5 * q_over_m * dt
+    ux = g * vx + he * e[0]
+    uy = g * vy + he * e[1]
+    uz = g * vz + he * e[2]
+    gm = np.sqrt(1.0 + (ux * ux + uy * uy + uz * uz) / c2)
+    f = he / gm
+    tx = f * b[0]
+    ty = f * b[1]
+    tz = f * b[2]
+    t2 = tx * tx + ty * ty + tz * tz
+    sf = 2.0 / (1.0 + t2)
+    sx = sf * tx
+    sy = sf * ty
+    sz = sf * tz
+    px = ux + (uy * tz - uz * ty)
+    py = uy + (uz * tx - ux * tz)
+    pz = uz + (ux * ty - uy * tx)
+    ux = ux + (py * sz - pz * sy)
+    uy = uy + (pz * sx - px * sz)
+    uz = uz + (px * sy - py * sx)
+    ux += he * e[0]
+    uy += he * e[1]
+    uz += he * e[2]
+    gn = np.sqrt(1.0 + (ux * ux + uy * uy + uz * uz) / c2)
+    v_new[0] = ux / gn
+    v_new[1] = uy / gn
+    v_new[2] = uz / gn
+    for i in range(3):
+        r_new[i] = rh[i] + hdt * v_new[i]
+    # no post-step velocity clamp here: boris_rel_dkd_batch clamps beta squared
+    # on entry instead (that is the only clamp of the Python path)
+
+
+@njit(cache=True, fastmath=True)
+def _push(algo, r, v, dt, cos_rf, q_over_m,
+          bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
+          sm, sgx, sgy, svx, svy, svz, ssc, sconst,
+          rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
+          r_new, v_new):
+    """One step with the engine's algorithm: 0 rk4_rel, 1 boris_rel."""
+    if algo == 0:
+        _rk4(r, v, dt, cos_rf, q_over_m, bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
+             sm, sgx, sgy, svx, svy, svz, ssc, sconst, rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
+             r_new, v_new)
+    else:
+        _boris(r, v, dt, cos_rf, q_over_m, bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
+               sm, sgx, sgy, svx, svy, svz, ssc, sconst, rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
+               r_new, v_new)
+
+
+@njit(cache=True, fastmath=True)
+def _track_kernel(r0, v0, dt, n_steps, t0, q_over_m, q_state, mass_mev, algo,
                   bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
                   sm, sgx, sgy, svx, svy, svz, ssc, sconst,
                   rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst, omega_rf, phase_rf,
@@ -144,6 +232,7 @@ def _track_kernel(r0, v0, dt, n_steps, t0, q_over_m, q_state, mass_mev,
                   section_angle, arm_angle, max_turns, target_energy_mev,
                   r_hist, v_hist, active_hist):
     """Returns (n_done, lost_step, lost_reason, n_cross, stop_reason).
+    algo: 0 rk4_rel, 1 boris_rel (the same cached compile serves both).
     lost_reason: 0 none, 1 radial boundary, 2 obstacle.
     stop_reason: 0 ran out of steps, 1 lost, 2 turns reached, 3 energy reached."""
     r = np.empty(3)
@@ -173,9 +262,9 @@ def _track_kernel(r0, v0, dt, n_steps, t0, q_over_m, q_state, mass_mev,
             v_prev[i] = v[i]
         t_mid = t + 0.5 * dt
         cos_rf = np.cos(omega_rf * t_mid + phase_rf) if rm != 0 else 0.0
-        _rk4(r, v, dt, cos_rf, q_over_m, bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
-             sm, sgx, sgy, svx, svy, svz, ssc, sconst, rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
-             r_new, v_new)
+        _push(algo, r, v, dt, cos_rf, q_over_m, bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
+              sm, sgx, sgy, svx, svy, svz, ssc, sconst, rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
+              r_new, v_new)
         for i in range(3):
             r[i] = r_new[i]
             v[i] = v_new[i]
@@ -209,9 +298,9 @@ def _track_kernel(r0, v0, dt, n_steps, t0, q_over_m, q_state, mass_mev,
                 if not crossed:
                     continue
                 dt_back = (1.0 - s_part) * dt
-                _rk4(r, v, -dt_back, cos_rf, q_over_m, bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
-                     sm, sgx, sgy, svx, svy, svz, ssc, sconst, rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
-                     r_c, v_c)
+                _push(algo, r, v, -dt_back, cos_rf, q_over_m, bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
+                      sm, sgx, sgy, svx, svy, svz, ssc, sconst, rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
+                      r_c, v_c)
                 t_cavity = t + dt - dt_back   # crossing time (t = step start)
                 speed = np.sqrt(v_c[0] * v_c[0] + v_c[1] * v_c[1] + v_c[2] * v_c[2])
                 gamma = 1.0 / np.sqrt(1.0 - (speed / CLIGHT) ** 2)
@@ -244,9 +333,9 @@ def _track_kernel(r0, v0, dt, n_steps, t0, q_over_m, q_state, mass_mev,
                 v_c[0] = f * unx
                 v_c[1] = f * uny
                 v_c[2] = f * uz
-                _rk4(r_c, v_c, dt_back, cos_rf, q_over_m, bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
-                     sm, sgx, sgy, svx, svy, svz, ssc, sconst, rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
-                     r_new, v_new)
+                _push(algo, r_c, v_c, dt_back, cos_rf, q_over_m, bm, bgx, bgy, bvx, bvy, bvz, bsc, bconst,
+                      sm, sgx, sgy, svx, svy, svz, ssc, sconst, rm, rgx, rgy, rvx, rvy, rvz, rsc, rconst,
+                      r_new, v_new)
                 for i in range(3):
                     r[i] = r_new[i]
                     v[i] = v_new[i]
@@ -455,8 +544,12 @@ def build_kernel_args(finder, pd_init, dt: float, n_steps: int, t0: float,
         raise FastPathUnavailable("more than one particle")
     if not bool(np.asarray(pd_init.alive)[0]):
         raise FastPathUnavailable("particle not alive at launch")
-    if str(getattr(engine, 'algorithm', '')).lower() != 'rk4_rel':
+    # exact whitelist: plain 'boris' staggers v by -dt/2 and skips the RF
+    # backtrack (rf_cavity.py use_backtrack), neither of which the kernel does
+    algo_name = str(getattr(engine, 'algorithm', '')).lower()
+    if algo_name not in ('rk4_rel', 'boris_rel'):
         raise FastPathUnavailable(f"algorithm {engine.algorithm}")
+    algo = 0 if algo_name == 'rk4_rel' else 1
     if engine.dim != '2D':
         raise FastPathUnavailable("3D engine")
     for tm in engine.extra_terminators:
@@ -484,7 +577,7 @@ def build_kernel_args(finder, pd_init, dt: float, n_steps: int, t0: float,
                 v0=np.ascontiguousarray(np.asarray(pd_init.v_vec[0], dtype=float)),
                 dt=float(dt), n_steps=int(n_steps), t0=float(t0),
                 q_over_m=float(pusher.q_over_m), q_state=float(design.species.q),
-                mass_mev=float(design.species.mass_mev),
+                mass_mev=float(design.species.mass_mev), algo=int(algo),
                 b=bpack, s=spack, rf=rpack, omega_rf=omega_rf, phase_rf=phase_rf,
                 cav=cav, r_max=float(engine.r_max), raster=raster,
                 section_angle=float(section_angle), arm_angle=float(np.pi),
@@ -501,6 +594,7 @@ def run_kernel(args: dict):
     b, s, rf, cav, ra = args['b'], args['s'], args['rf'], args['cav'], args['raster']
     out = _track_kernel(
         args['r0'], args['v0'], args['dt'], n, args['t0'], args['q_over_m'], args['q_state'], args['mass_mev'],
+        args['algo'],
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
         rf[0], rf[1], rf[2], rf[3], rf[4], rf[5], rf[6], rf[7], args['omega_rf'], args['phase_rf'],

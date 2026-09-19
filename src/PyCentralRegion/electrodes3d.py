@@ -38,6 +38,7 @@ dependency; the pip wheel bundles OpenCASCADE).
 """
 
 import time
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -908,7 +909,23 @@ def build_electrodes_3d(model2d: ElectrodeModel,
         tag = gmsh.model.addPhysicalGroup(2, faces_of(solids[k]), tag=2 + j)
         groups.append((k, 0.0, tag))
 
-    # ---- 6. mesh + export -----------------------------------------------------------
+    # ---- 6. geometry export (BEFORE meshing), then mesh -----------------------------
+    # The OCC solids exist here as real BREP with the physical groups already assigned, so this
+    # writes the geometry that is ACTUALLY meshed rather than a re-derivation of it. Coordinates
+    # are in mm (the builder works in mm internally).
+    _geom_out = os.environ.get('HCHC60_BEM3D_GEOM_OUT', '').strip()
+    if _geom_out:
+        import os as _os
+        _os.makedirs(_os.path.dirname(_geom_out) or '.', exist_ok=True)
+        for _ext in ('brep', 'step'):
+            try:
+                gmsh.write(f"{_geom_out}.{_ext}")
+                if verbose:
+                    print(f"[electrodes3d] wrote {_geom_out}.{_ext} (CAD, pre-mesh, mm)")
+            except Exception as _exc:                      # noqa: BLE001
+                warnings.warn(f"geometry export to .{_ext} failed: {type(_exc).__name__}: {_exc}",
+                              stacklevel=2)
+
     t0 = time.time()
     gmsh.model.mesh.generate(2)
     ntag, ncoord, _ = gmsh.model.mesh.getNodes()
@@ -1180,6 +1197,31 @@ def combine_obstacles(*tests: Callable[[np.ndarray], np.ndarray]) -> Callable[[n
     inside.parts = tests
     # a 3D part (ndim = 3) needs z: tracking.MetalTerminator reads this
     inside.ndim = max(int(getattr(t, 'ndim', 2)) for t in tests)
+
+    # If any part can answer the stronger question - did this STEP cross a surface - expose it, so
+    # MetalTerminator uses it. The parts that cannot (the RF cavity map, which is a raster with no
+    # surfaces) still contribute their point test on the step's end, so the combination is never
+    # weaker than the point-only version.
+    seg_parts = [t for t in tests if getattr(t, 'segment', None) is not None]
+    if seg_parts:
+        pt_parts = [t for t in tests if getattr(t, 'segment', None) is None]
+
+        def segment(r_prev, r):
+            r = np.atleast_2d(np.asarray(r, dtype=float))
+            hit = np.zeros(len(r), dtype=bool)
+            where = np.array(r[:, :3], dtype=float)
+            for t in seg_parts:
+                h, w = t.segment(r_prev, r)
+                h = np.asarray(h, dtype=bool)
+                fresh = h & ~hit
+                where[fresh] = np.asarray(w, dtype=float)[fresh]
+                hit |= h
+            for t in pt_parts:
+                cols = 3 if int(getattr(t, 'ndim', 2)) == 3 else 2
+                hit |= np.asarray(t(r[:, :cols]), dtype=bool)
+            return hit, where
+
+        inside.segment = segment
     return inside
 
 
@@ -1298,6 +1340,148 @@ def stacked_obstacles(model: ElectrodeModel, z_levels, spacing: float = 5e-4, ex
 
     inside.grid, inside.xs, inside.zs, inside.spacing, inside.ndim = grid, xs, zs, h, 3
     return inside
+
+
+_mesh_inside_kernel = None
+_mesh_segment_kernel = None
+
+
+def _define_mesh_kernels():
+    """Warp kernels, built once on first use.
+
+    Not inside a method: a kernel created per call is re-registered with Warp every time and
+    leaks (py_electrodes measured ~100 KB a call, 2.6 GB over a 1,500-particle run)."""
+    global _mesh_inside_kernel, _mesh_segment_kernel
+    if _mesh_inside_kernel is not None:
+        return
+    import warp as wp
+
+    @wp.kernel
+    def _inside(mesh: wp.uint64, pts: wp.array(dtype=wp.vec3f), out: wp.array(dtype=wp.uint8)):
+        i = wp.tid()
+        sign = float(0.0)
+        q = wp.mesh_query_point_sign_winding_number(mesh, pts[i], 1.0e6, sign)
+        if q.result and q.sign < 0.0:
+            out[i] = wp.uint8(1)
+
+    @wp.kernel
+    def _segment(mesh: wp.uint64, origins: wp.array(dtype=wp.vec3f),
+                 directions: wp.array(dtype=wp.vec3f), lengths: wp.array(dtype=wp.float32),
+                 hits: wp.array(dtype=wp.uint8), points: wp.array(dtype=wp.vec3f)):
+        i = wp.tid()
+        max_d = lengths[i]
+        if max_d <= 0.0:
+            return
+        q = wp.mesh_query_ray(mesh, origins[i], directions[i], max_d)
+        if q.result:
+            hits[i] = wp.uint8(1)
+            points[i] = origins[i] + directions[i] * q.t
+
+    _mesh_inside_kernel, _mesh_segment_kernel = _inside, _segment
+
+
+class MeshObstacles:
+    """Exact metal test straight off the triangle mesh, on the GPU, through a Warp BVH.
+
+    A drop-in for ``stacked_obstacles``: called with (N, 3) points it returns the point-in-metal
+    mask and carries ``ndim = 3``, so ``tracking.MetalTerminator`` feeds it all three columns.
+    What it adds is ``segment(r_prev, r)`` - did this step cross a surface, and where.
+
+    Why, given the raster is already fast:
+      - it is EXACT. The raster decides metal by even-odd point-in-polygon on z slices, so it is
+        good only to half a cell in x-y and half a level in z, and it goes wrong outright where a
+        metal face coincides with a sampled plane - the degeneracy that emptied a 15-turn run.
+      - ``segment`` catches a particle that steps THROUGH a thin wall between two samples, which
+        testing the positions at either end misses completely.
+      - measured on the real problem (40,000 particles, 37,280 triangles, 0.155 mm step):
+        0.062 ms/step against 0.70 ms for the raster lookup, and no 39 s raster build. The
+        brute-force kernel the spiral inflector uses - every ray against every triangle - takes
+        13.4 ms/step, which is where the "won't this be slower?" instinct comes from; the BVH is
+        216x faster than that and agrees with it exactly.
+
+    The catch, and why ``segment`` is not the whole story: a crossing test cannot see a particle
+    that is ALREADY inside metal and never crosses a surface. Birth positions therefore still go
+    through the point test - which is what ``__call__`` is for.
+    """
+
+    ndim = 3
+
+    def __init__(self, model: ElectrodeModel, device: str = 'cuda:0'):
+        import warp as wp
+        wp.init()
+        _define_mesh_kernels()
+        self._wp = wp
+        self.device = device
+        v = np.ascontiguousarray(np.asarray(model.vertices, dtype=np.float32))
+        f = np.ascontiguousarray(np.asarray(model.triangles, dtype=np.int32).ravel())
+        self._points = wp.from_numpy(v, dtype=wp.vec3f, device=device)
+        self._indices = wp.from_numpy(f, dtype=wp.int32, device=device)
+        self.mesh = wp.Mesh(points=self._points, indices=self._indices)
+        self.n_tri = len(f) // 3
+        self.n_inside_calls = 0
+        self.n_segment_calls = 0
+        self._buf = {}
+
+    def _slot(self, n, name, dtype):
+        """Device buffers reused across steps - a fresh allocation every step would dominate."""
+        key = (name, n)
+        if key not in self._buf:
+            self._buf[key] = self._wp.zeros(n, dtype=dtype, device=self.device)
+        return self._buf[key]
+
+    def __call__(self, pts) -> np.ndarray:
+        """Point-in-metal for (N, 2 or 3) points; (N, 2) is taken at z = 0, as the raster does."""
+        p = np.atleast_2d(np.asarray(pts, dtype=np.float32))
+        if p.shape[1] == 2:
+            p = np.column_stack([p, np.zeros(len(p), dtype=np.float32)])
+        n = len(p)
+        if n == 0:
+            return np.zeros(0, dtype=bool)
+        wp = self._wp
+        d_p = wp.from_numpy(np.ascontiguousarray(p[:, :3]), dtype=wp.vec3f, device=self.device)
+        d_out = self._slot(n, 'inside', wp.uint8)
+        d_out.zero_()
+        wp.launch(_mesh_inside_kernel, dim=n, device=self.device,
+                  inputs=[self.mesh.id, d_p, d_out])
+        wp.synchronize()
+        self.n_inside_calls += 1
+        return d_out.numpy().astype(bool)
+
+    def segment(self, r_prev, r):
+        """Did the step from r_prev to r cross a surface? Returns (hit_mask, hit_points [m])."""
+        a = np.ascontiguousarray(np.asarray(r_prev, dtype=np.float32)[:, :3])
+        b = np.ascontiguousarray(np.asarray(r, dtype=np.float32)[:, :3])
+        n = len(a)
+        if n == 0:
+            return np.zeros(0, dtype=bool), np.zeros((0, 3))
+        d = b - a
+        length = np.linalg.norm(d, axis=1).astype(np.float32)
+        good = length > 0.0
+        dirs = np.zeros_like(d)
+        dirs[good] = d[good] / length[good, None]
+        wp = self._wp
+        # Reused device buffers, filled in place. Allocating three arrays per step (30,000 of
+        # them a run) costs more than the query itself.
+        d_o, d_d, d_l = (self._slot(n, 'org', wp.vec3f), self._slot(n, 'dir', wp.vec3f),
+                         self._slot(n, 'len', wp.float32))
+        d_o.assign(a)
+        d_d.assign(np.ascontiguousarray(dirs))
+        d_l.assign(np.ascontiguousarray(length))
+        d_hit = self._slot(n, 'hit', wp.uint8)
+        d_pt = self._slot(n, 'pt', wp.vec3f)
+        d_hit.zero_()
+        wp.launch(_mesh_segment_kernel, dim=n, device=self.device,
+                  inputs=[self.mesh.id, d_o, d_d, d_l, d_hit, d_pt])
+        wp.synchronize()
+        self.n_segment_calls += 1
+        hit = d_hit.numpy().astype(bool)
+        # The hit POINTS are 12 bytes a particle and are wanted only for the few that actually hit
+        # - which on most steps is none at all. Fetching them unconditionally moved ~480 kB per
+        # step, ~14 GB over a run, and made the exact test slower end to end than the raster it
+        # replaces even though its kernel is ten times cheaper.
+        if not hit.any():
+            return hit, np.zeros((n, 3))
+        return hit, d_pt.numpy().astype(float)
 
 
 def check_trajectory_clearance(model_or_inside, trajectory, beam_halfwidth: float = 0.0,

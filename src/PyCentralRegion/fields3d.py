@@ -360,7 +360,8 @@ class RadialTaperField(FieldBase):
 # ============================================================================
 def bem_field3d(sol, xs, ys, zs, metal: Optional[Callable] = None, chunk: int = 4000, erode: int = 2,
                 backend: str = 'numba', label: str = 'BEM 3D gap field', r_max: Optional[float] = None,
-                verbose: bool = True) -> Field:
+                pot_device: Optional[str] = None, pot_precision: Optional[str] = None,
+                pot_check: int = 0, verbose: bool = True) -> Field:
     """E = -grad(phi) of a ``GapFieldSolution`` on the (xs, ys, zs) grid [m]
     as a dim-3 Field. ``metal(xyz) -> bool`` (e.g. ``electrodes3d.stacked_obstacles``)
     zeroes the field ``erode`` cells deep inside metal (the wall jump layer is
@@ -370,23 +371,42 @@ def bem_field3d(sol, xs, ys, zs, metal: Optional[Callable] = None, chunk: int = 
     ``r_max`` [m] evaluates the potential only inside that cylinder and leaves the rest
     of the box at zero: the corners of a square grid are 21 % of its points and a radial
     blend (``RadialBlendField``) never reads them. Two extra cells are evaluated beyond
-    ``r_max`` so the central-difference gradient inside it is still exact."""
+    ``r_max`` so the central-difference gradient inside it is still exact.
+
+    ``pot_device`` / ``pot_precision`` choose where and in what precision the potential is
+    evaluated ('cpu'/'gpu', 'double'/'single' - see ``GapFieldSolution.potential``); this is the
+    dominant cost of a whole map. ``pot_check`` re-evaluates that many random grid points in
+    double precision on the CPU and reports the difference, so a faster setting is measured
+    rather than assumed."""
     xs, ys, zs = (np.asarray(a, dtype=float) for a in (xs, ys, zs))
     gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')
     pts = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
     t0 = time.time()
+    kw = dict(chunk=chunk, verbose=verbose, device=pot_device, precision=pot_precision)
     if r_max is None:
-        phi = sol.potential(pts, chunk=chunk, verbose=verbose).reshape(gx.shape)
+        keep = np.ones(len(pts), dtype=bool)
+        phi = sol.potential(pts, **kw).reshape(gx.shape)
         n_eval = len(pts)
     else:
         keep = np.hypot(pts[:, 0], pts[:, 1]) <= float(r_max) + 2.0 * float(np.max(np.abs(np.diff(xs))))
         flat = np.zeros(len(pts))
-        flat[keep] = sol.potential(pts[keep], chunk=chunk, verbose=verbose)
+        flat[keep] = sol.potential(pts[keep], **kw)
         phi = flat.reshape(gx.shape)
         n_eval = int(keep.sum())
     if verbose:
         print(f"[fields3d] BEM potential on {gx.shape} ({n_eval / 1e6:.2f} of "
-              f"{pts.shape[0] / 1e6:.2f} M points) in {time.time() - t0:.0f} s")
+              f"{pts.shape[0] / 1e6:.2f} M points) in {time.time() - t0:.0f} s"
+              + (f" [{pot_device or 'cpu'}/{pot_precision or 'double'}]"
+                 if (pot_device or pot_precision) else ""))
+    if pot_check > 0 and n_eval:
+        idx = np.random.default_rng(0).choice(np.nonzero(keep)[0],
+                                              size=min(int(pot_check), n_eval), replace=False)
+        ref = sol.potential(pts[idx], chunk=chunk, verbose=False, device='cpu', precision='double')
+        got = phi.ravel()[idx]
+        scale = max(float(np.abs(ref).max()), 1e-30)
+        print(f"[fields3d] potential check on {len(idx)} points vs cpu/double: "
+              f"max |d| {np.abs(got - ref).max():.3e} V ({np.abs(got - ref).max() / scale:.2e} "
+              f"of peak {scale:.1f} V), rms {np.sqrt(np.mean((got - ref) ** 2)):.3e} V")
     ex = -np.gradient(phi, xs, axis=0)
     ey = -np.gradient(phi, ys, axis=1)
     ez = -np.gradient(phi, zs, axis=2) if len(zs) > 1 else np.zeros_like(phi)

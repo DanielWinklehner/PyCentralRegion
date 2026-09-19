@@ -249,18 +249,34 @@ class MetalTerminator(Terminator):
         idx = np.flatnonzero(active)
         if len(idx) == 0:
             return active
-        # 3D tests (electrodes3d.stacked_obstacles, fields3d.Raster3D) carry ndim = 3
-        cols = 3 if getattr(self.inside, 'ndim', 2) == 3 else 2
-        hit = np.asarray(self.inside(r[idx, :cols]), dtype=bool)
-        for p in idx[hit]:
+        # An obstacle that offers `segment` (electrodes3d.MeshObstacles) is asked whether the STEP
+        # crossed a surface, not whether its end point landed in metal. That is the stronger
+        # question: testing the positions at either end misses a particle that stepped clean
+        # through a thin wall, and can only place the loss at the sampled point, whereas the
+        # crossing test returns the actual intersection. Anything already inside metal at birth is
+        # caught by the point test the caller runs once on the initial distribution - a crossing
+        # test cannot see it, because there is no crossing.
+        seg = getattr(self.inside, 'segment', None)
+        if seg is not None and r_prev is not None:
+            hit, where = seg(r_prev[idx], r[idx])
+            hit = np.asarray(hit, dtype=bool)
+        else:
+            # 3D tests (electrodes3d.stacked_obstacles, fields3d.Raster3D) carry ndim = 3
+            cols = 3 if getattr(self.inside, 'ndim', 2) == 3 else 2
+            hit = np.asarray(self.inside(r[idx, :cols]), dtype=bool)
+            where = None
+        for k, p in enumerate(idx):
+            if not hit[k]:
+                continue
             p = int(p)
+            # where the metal was met: the intersection when we have it, else the step's end
+            q = where[k] if where is not None else r[p]
             if self.exempt_ref and p == self.ref_particle:
-                self.ref_hits.append((int(step), float(r[p, 0]), float(r[p, 1])))
+                self.ref_hits.append((int(step), float(q[0]), float(q[1])))
                 continue
             active[p] = False
-            self.hits.append((p - self.index_offset, int(step),
-                              float(r[p, 0]), float(r[p, 1])))
-            self.hits_z.append(float(r[p, 2]))
+            self.hits.append((p - self.index_offset, int(step), float(q[0]), float(q[1])))
+            self.hits_z.append(float(q[2]))
         return active
 
 
@@ -436,6 +452,7 @@ class SpaceChargeKick(Interaction):
     def _solve(self, step, r, v, active, t):
         dep = active & self.deposit_mask
         n_dep = int(dep.sum())
+        self._E_keep, self._B_keep, self._had_keep = self.E.copy(), self.B.copy(), self.has_field.copy()
         self.E[:] = 0.0
         self.B[:] = 0.0
         self.has_field[:] = False
@@ -444,7 +461,21 @@ class SpaceChargeKick(Interaction):
             self.n_skipped += 1
             return
         t0 = time.perf_counter()
-        E_dep, B_dep = self.solver.solve_eb(r[dep], self.charges[dep], v[dep])
+        E_prev, B_prev, had = self._E_keep, self._B_keep, self._had_keep
+        try:
+            E_dep, B_dep = self.solver.solve_eb(r[dep], self.charges[dep], v[dep])
+        except MemoryError as exc:
+            # 2026-09-16 04:38: a 152 MiB FFT array failed to allocate while a 39 GB dense BEM LU ran alongside and the
+            # whole 4 h extraction run was lost. Keep the previous per-particle field for this interval and go on.
+            self.n_skipped += 1
+            self.n_memory_errors = getattr(self, 'n_memory_errors', 0) + 1
+            self.E[:] = E_prev
+            self.B[:] = B_prev
+            self.has_field[:] = had
+            if self.verbose:
+                print(f"    SC solve @ step {step}: MemoryError ({exc}); previous field kept "
+                      f"({self.n_memory_errors} so far)", flush=True)
+            return
         self.E[dep] = E_dep
         self.B[dep] = B_dep
         self.has_field[dep] = True
@@ -541,7 +572,7 @@ class SpaceChargeKick(Interaction):
         log = np.asarray(self.log, dtype=float).reshape(-1, 9)
         out = {
             'n_solves': int(self.n_solves), 'n_skipped': int(self.n_skipped),
-            'n_kick_steps': int(self.n_kick_steps),
+            'n_kick_steps': int(self.n_kick_steps), 'n_memory_errors': int(getattr(self, 'n_memory_errors', 0)),
             'resolve_every': int(self.every), 'kick_z': self.kick_z, 'exempt_ref': self.exempt_ref, 'move': bool(self.move),
             'charge_scale': self.charge_scale, 'noop': bool(self.noop),
             'n_charged': int(self.n_charged), 'bunch_charge_c': float(self.bunch_charge_c),

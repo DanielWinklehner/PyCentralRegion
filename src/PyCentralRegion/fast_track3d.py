@@ -20,10 +20,22 @@ What the kernel reproduces per step, in ``Tracker.run`` order:
   3. interactions in ``engine.extra_interactions`` order: ``TimedRelease``
      (birth_step == step + 1 becomes active at the END of step ``step``), then
      ``SpaceChargeKick`` (the per-particle E_sc/B_sc impulse, every step);
-  4. terminators: ``RadialVerticalTerminator(r_max, z_max)`` over ALL rows, then
+  4. the RF thin-gap kick. It is an ``RFCavityInteraction`` that
+     ``tracking.TrackingEngine._build_hooks`` (tracking.py:675-678) APPENDS
+     AFTER ``engine.extra_interactions`` when ``use_rf and gap_model == 'thin'``,
+     so the per-step order is boris push -> TimedRelease -> SpaceChargeKick ->
+     RF kick -> terminators -> ``t += dt``. Per cavity in ``design.rf_cavities``
+     order: the cavity bounding-box prefilter and then the Cramer crossing test
+     on the 2D (x, y) chord ``r_prev -> r`` (``r_prev`` is the step-start copy
+     and is NOT refreshed between cavities; ``r`` IS, a previous cavity having
+     already moved it), first crossing per particle only across the cavity's
+     segments; then a ``boris_rel`` backtrack by ``dt_back = (1 - s_part) * dt``
+     with the RF time still frozen at ``t + dt/2``, the kick along the crossed
+     segment's normal, and a ``boris_rel`` push forward by ``+dt_back``;
+  5. terminators: ``RadialVerticalTerminator(r_max, z_max)`` over ALL rows, then
      ``MetalTerminator`` over the active ones in ascending index order, the
      virtual reference particle exempt (its contacts logged in ``ref_hits``);
-  5. ``t += dt``; the finder's callback - replayed in Python afterwards.
+  6. ``t += dt``; the finder's callback - replayed in Python afterwards.
 
 The E-field stack it understands is the one the 3D bunch deck installs:
 ``StaticPlusRFField(rf=TimedField(RadialBlendField(bem3d, cavity map [, RadialTaperField]),
@@ -54,6 +66,12 @@ The space-charge SOLVE stays in Python: the driver alternates kernel chunks with
 released since the last solve) is due, so the hook's own unchanged code decides
 the fields and the kernel only applies the impulse in between.
 
+Both gap models are reproduced: ``'bem2d'`` (the gap field integrated
+continuously through the E-stack above) and ``'thin'`` (discrete gap kicks,
+item 4). With ``'thin'`` the design E-field is the inflector static map alone -
+there is no RF pattern to integrate - and the RF phase of each kick comes from
+that cavity's own ``omega`` / ``get_total_phase_rad()``, not from the field.
+
 Anything outside this configuration raises ``FastPathUnavailable`` and the
 finder takes the general path. Opt-in via ``finder.fast3d = True``; OFF by
 default. ``finder.fast3d_interp = 'batch'`` selects the exact mode.
@@ -79,6 +97,13 @@ except ImportError:                                   # pragma: no cover
 
 from PyPATools.global_variables import CLIGHT
 from PyPATools.field import Field, TimedField
+
+# The cavity packing is dimension-agnostic (it keeps only the 2D (x, y) parts of
+# each gap segment, which is all a vertically infinite thin gap needs), so the 2D
+# kernel's own packer is reused rather than duplicated. fast_track.py imports
+# nothing but numpy / numba / PyPATools at module scope and its njit bodies
+# compile lazily, so this is cheap.
+from .fast_track import _pack_cavities, FastPathUnavailable as _FastTrack2DUnavailable
 
 if HAS_NUMBA:
     from PyPATools.field_src.interpolators import (_searchsorted_numba, _searchsorted_with_hint,
@@ -320,6 +345,212 @@ def _taper_factor(tmode, rr, taper_s, taper_r0, taper_r1):
     return taper_s + (1.0 - taper_s) * _smoothstep(rr, taper_r0, taper_r1)
 
 
+# NO fastmath here, for the same reason as ``_sc_kick_point``: this is
+# ``Pusher._boris_rel_step_batch``, whose E-stack sums are NumPy and whose push
+# is ``boris_rel_dkd_batch``. Reassociating either loses bit-identity in
+# ``interp='batch'`` with no visible symptom.
+@njit(cache=True)
+def _kick_push(use_batch, m, r_in, v_in, dt_arr, gidx, cos_rf,
+               e_in, e_out, e_st, bfld, blend_on, blend_r0, blend_r1,
+               taper_on, taper_s, taper_r0, taper_r1, q_over_m, hints,
+               wbuf, rrbuf, sub_i, sub_o, xa, ya, za, e_tmp, e_acc, b_acc,
+               r_half_k, r_out, v_out):
+    """``Pusher._boris_rel_step_batch`` over a COMPACT subset of ``m`` rows.
+
+    The RF backtrack and the forward re-push of ``RFCavity.apply_kicks_batch``
+    are ordinary ``pusher.push_batch`` calls with a per-particle dt (negative,
+    then positive) on the crossing subset, so they re-make the WHOLE E-stack
+    decision over THAT subset: ``RadialBlendField`` picks its outer-only /
+    inner-only / per-particle branch from the subset's own wmin/wmax and
+    ``RadialTaperField`` its mode from the subset's own rsmin/rsmax. Inheriting
+    the step's own push branch would diverge whenever the bunch straddles a seam.
+
+    ``gidx[a]`` is the GLOBAL particle index of row ``a`` - the cell-hint row in
+    ``interp='point'``. Writes ``r_out[:m]`` / ``v_out[:m]``; every other array
+    is scratch.
+    """
+    for a in range(m):
+        hd = 0.5 * dt_arr[a]
+        r_half_k[a, 0] = r_in[a, 0] + hd * v_in[a, 0]
+        r_half_k[a, 1] = r_in[a, 1] + hd * v_in[a, 1]
+        r_half_k[a, 2] = r_in[a, 2] + hd * v_in[a, 2]
+        if blend_on:
+            wbuf[a] = _smoothstep(np.hypot(r_half_k[a, 0], r_half_k[a, 1]),
+                                  blend_r0, blend_r1)
+
+    branch = 4
+    if blend_on:
+        wmin = 2.0
+        wmax = -1.0
+        for a in range(m):
+            w = wbuf[a]
+            if w < wmin:
+                wmin = w
+            if w > wmax:
+                wmax = w
+        if m == 0:
+            branch = 0
+        elif wmin >= 1.0:
+            branch = 2
+        elif wmax <= 0.0:
+            branch = 1
+        else:
+            branch = 3
+
+    n_i = 0
+    n_o = 0
+    if branch == 1 or branch == 4:
+        for a in range(m):
+            sub_i[n_i] = a
+            n_i += 1
+    elif branch == 2:
+        for a in range(m):
+            sub_o[n_o] = a
+            n_o += 1
+    elif branch == 3:
+        for a in range(m):
+            if wbuf[a] < 1.0:
+                sub_i[n_i] = a
+                n_i += 1
+            if wbuf[a] > 0.0:
+                sub_o[n_o] = a
+                n_o += 1
+
+    tmode = 0
+    if taper_on and n_o > 0:
+        rsmin = 1.0e300
+        rsmax = -1.0e300
+        for a in range(n_o):
+            rr = np.hypot(r_half_k[sub_o[a], 0], r_half_k[sub_o[a], 1])
+            rrbuf[sub_o[a]] = rr
+            if rr < rsmin:
+                rsmin = rr
+            if rr > rsmax:
+                rsmax = rr
+        if rsmax <= taper_r0:
+            tmode = 1
+        elif rsmin >= taper_r1:
+            tmode = 0
+        else:
+            tmode = 2
+
+    if use_batch:
+        for a in range(m):
+            e_acc[a, 0] = 0.0
+            e_acc[a, 1] = 0.0
+            e_acc[a, 2] = 0.0
+        if n_i > 0:
+            for a in range(n_i):
+                xa[a] = r_half_k[sub_i[a], 0]
+                ya[a] = r_half_k[sub_i[a], 1]
+                za[a] = r_half_k[sub_i[a], 2]
+            _eval_field_batch(e_in, xa, ya, za, n_i, e_tmp)
+            if branch == 3:
+                for a in range(n_i):
+                    w = 1.0 - wbuf[sub_i[a]]
+                    e_acc[sub_i[a], 0] += w * e_tmp[a, 0]
+                    e_acc[sub_i[a], 1] += w * e_tmp[a, 1]
+                    e_acc[sub_i[a], 2] += w * e_tmp[a, 2]
+            else:
+                for a in range(n_i):
+                    e_acc[sub_i[a], 0] = e_tmp[a, 0]
+                    e_acc[sub_i[a], 1] = e_tmp[a, 1]
+                    e_acc[sub_i[a], 2] = e_tmp[a, 2]
+        if n_o > 0:
+            for a in range(n_o):
+                xa[a] = r_half_k[sub_o[a], 0]
+                ya[a] = r_half_k[sub_o[a], 1]
+                za[a] = r_half_k[sub_o[a], 2]
+            _eval_field_batch(e_out, xa, ya, za, n_o, e_tmp)
+            if branch == 3:
+                for a in range(n_o):
+                    g = sub_o[a]
+                    fac = _taper_factor(tmode, rrbuf[g], taper_s, taper_r0, taper_r1)
+                    w = wbuf[g]
+                    e_acc[g, 0] += w * (e_tmp[a, 0] * fac)
+                    e_acc[g, 1] += w * (e_tmp[a, 1] * fac)
+                    e_acc[g, 2] += w * (e_tmp[a, 2] * fac)
+            else:
+                for a in range(n_o):
+                    g = sub_o[a]
+                    fac = _taper_factor(tmode, rrbuf[g], taper_s, taper_r0, taper_r1)
+                    e_acc[g, 0] = e_tmp[a, 0] * fac
+                    e_acc[g, 1] = e_tmp[a, 1] * fac
+                    e_acc[g, 2] = e_tmp[a, 2] * fac
+        for a in range(m):
+            xa[a] = r_half_k[a, 0]
+            ya[a] = r_half_k[a, 1]
+            za[a] = r_half_k[a, 2]
+        for a in range(m):
+            e_acc[a, 0] = e_acc[a, 0] * cos_rf
+            e_acc[a, 1] = e_acc[a, 1] * cos_rf
+            e_acc[a, 2] = e_acc[a, 2] * cos_rf
+        if e_st[0] != 0:
+            _eval_field_batch(e_st, xa, ya, za, m, e_tmp)
+            for a in range(m):
+                e_acc[a, 0] = e_acc[a, 0] + e_tmp[a, 0]
+                e_acc[a, 1] = e_acc[a, 1] + e_tmp[a, 1]
+                e_acc[a, 2] = e_acc[a, 2] + e_tmp[a, 2]
+        _eval_field_batch(bfld, xa, ya, za, m, b_acc)
+        r_k, v_k = boris_rel_dkd_batch(r_half_k[:m], v_in[:m], e_acc[:m],
+                                       b_acc[:m], dt_arr[:m], q_over_m)
+        for a in range(m):
+            r_out[a, 0] = r_k[a, 0]
+            r_out[a, 1] = r_k[a, 1]
+            r_out[a, 2] = r_k[a, 2]
+            v_out[a, 0] = v_k[a, 0]
+            v_out[a, 1] = v_k[a, 1]
+            v_out[a, 2] = v_k[a, 2]
+    else:
+        for a in range(m):
+            p = gidx[a]
+            x = r_half_k[a, 0]
+            y = r_half_k[a, 1]
+            z = r_half_k[a, 2]
+            ex = 0.0
+            ey = 0.0
+            ez = 0.0
+            if branch == 1 or branch == 4:
+                ex, ey, ez = _eval_field(e_in, x, y, z, hints, p, 0)
+            elif branch == 2:
+                gx0, gy0, gz0 = _eval_field(e_out, x, y, z, hints, p, 3)
+                fac = _taper_factor(tmode, rrbuf[a], taper_s, taper_r0, taper_r1)
+                ex = gx0 * fac
+                ey = gy0 * fac
+                ez = gz0 * fac
+            elif branch == 3:
+                w = wbuf[a]
+                if w < 1.0:
+                    gx0, gy0, gz0 = _eval_field(e_in, x, y, z, hints, p, 0)
+                    ex = ex + (1.0 - w) * gx0
+                    ey = ey + (1.0 - w) * gy0
+                    ez = ez + (1.0 - w) * gz0
+                if w > 0.0:
+                    gx0, gy0, gz0 = _eval_field(e_out, x, y, z, hints, p, 3)
+                    fac = _taper_factor(tmode, rrbuf[a], taper_s, taper_r0, taper_r1)
+                    ex = ex + w * (gx0 * fac)
+                    ey = ey + w * (gy0 * fac)
+                    ez = ez + w * (gz0 * fac)
+            ex = ex * cos_rf
+            ey = ey * cos_rf
+            ez = ez * cos_rf
+            if e_st[0] != 0:
+                sx0, sy0, sz0 = _eval_field(e_st, x, y, z, hints, p, 6)
+                ex = ex + sx0
+                ey = ey + sy0
+                ez = ez + sz0
+            bx0, by0, bz0 = _eval_field(bfld, x, y, z, hints, p, 9)
+            nrx, nry, nrz, nvx, nvy, nvz = _boris_point(
+                x, y, z, v_in[a, 0], v_in[a, 1], v_in[a, 2], ex, ey, ez,
+                bx0, by0, bz0, dt_arr[a], q_over_m)
+            r_out[a, 0] = nrx
+            r_out[a, 1] = nry
+            r_out[a, 2] = nrz
+            v_out[a, 0] = nvx
+            v_out[a, 1] = nvy
+            v_out[a, 2] = nvz
+
+
 # ============================================================================
 # the chunk kernel
 # ============================================================================
@@ -327,17 +558,28 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
                   t_start, dt, q_over_m, use_batch,
                   bfld, e_in, e_out, e_st, blend_on, blend_r0, blend_r1,
                   taper_on, taper_s, taper_r0, taper_r1, omega, phase,
+                  cav, q_state, mass_mev,
                   sc_on, sc_E, sc_B, sc_kick_mask, sc_has_field, sc_qom, sc_kick_z,
                   r_max, z_max, metal_on, metal_every, exempt_ref, ref_particle, ras_a, ras_b,
-                  hints, r_hist, v_hist, active_hist, t_hist, ref_hit_hist, kick_hist, hit_p, hit_s):
+                  hints, r_prev,
+                  r_hist, v_hist, active_hist, t_hist, ref_hit_hist, kick_hist, hit_p, hit_s):
     """Advance ``r``, ``v``, ``active`` (all full-length, mutated in place) over
     steps ``step0 .. step0 + n_sub - 1``.
 
     ``skip_ab_first``   the first step's push/release AND space-charge kick were
                         already done (the driver ran the Python solve): start at
-                        the terminators.
+                        the RF thin-gap kick phase.
     ``stop_after_a_last`` the last step stops right after push/release, so the
                         driver can run the Python solve for it.
+
+    ``r_prev`` is an (n, 3) buffer OWNED BY THE DRIVER, not kernel scratch: the
+    step's push fills it (``Tracker.run``'s ``r_prev = r.copy()``, full length)
+    and the RF kick phase reads it, and those two can land in DIFFERENT kernel
+    calls - exactly on a space-charge solve step, where ``stop_after_a_last``
+    ends one call after the push and ``skip_ab_first`` resumes the next one at
+    the kick. A kernel-local buffer would be ``np.empty`` garbage there and the
+    crossing test would run on a garbage chord. It is filled only when
+    ``cav[0]`` (a thin gap is in play); nothing else reads it.
 
     Returns (n_c, all_lost, n_kick_steps, n_hits, t_out); ``n_c`` steps completed
     the terminator/record phase and occupy ``r_hist[:n_c]``, i.e. steps
@@ -360,6 +602,26 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
     v_act = np.empty((n, 3))
     dt_arr = np.empty(n)
     hitmask = np.zeros(n, dtype=np.bool_)
+    # the RF thin-gap kick's own scratch. wbuf / rrbuf / sub_i / sub_o / xa / ya /
+    # za / e_acc / e_tmp / b_acc / dt_arr above are reused by it: the step's push
+    # has finished with them by the time the kick runs, and they are per-CALL
+    # scratch, so the skip_ab_first re-entry cannot see stale values either.
+    # ... and sized to ZERO when there is no thin gap (bem2d, or RF off): the
+    # kick phase is then never entered, so nothing reads them, and a 3D bunch
+    # deck must not pay ~10 n-row allocations per kernel call for a buffer it
+    # never touches. The dtype/ndim/layout are unchanged, so `_kick_push`'s
+    # numba signature is the same either way.
+    n_k = n if cav[0] else 0
+    cidx = np.empty(n_k, dtype=np.int64)        # crossing particles, ascending
+    cseg = np.empty(n_k, dtype=np.int64)        # the segment each one crossed
+    csp = np.empty(n_k)                         # s_part of the crossing
+    dtb = np.empty(n_k)                         # dt_back = (1 - s_part) dt
+    rk_in = np.empty((n_k, 3))
+    vk_in = np.empty((n_k, 3))
+    rk_out = np.empty((n_k, 3))
+    vk_out = np.empty((n_k, 3))
+    vk_new = np.empty((n_k, 3))
+    rk_half = np.empty((n_k, 3))
     hdt = 0.5 * dt
     t = t_start
     n_c = 0
@@ -373,9 +635,26 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
         do_c = not (m == n_sub - 1 and stop_after_a_last)
         kicked = False
 
+        # ---------------- 1: RF time frozen at the step midpoint -------------
+        # Hoisted out of `do_ab` because the thin-gap kick needs it too, and on a
+        # `skip_ab_first` re-entry the push that would have computed it ran in
+        # the previous kernel call. Bit-identical there: the driver hands back
+        # the same step-start `t`, the expression is the same and there is no
+        # fastmath in this function.
+        cos_rf = np.cos(omega * (t + hdt) + phase)
+
         if do_ab:
-            # ---------------- 1 + 2: RF time at the midpoint, one push -------
-            cos_rf = np.cos(omega * (t + hdt) + phase)
+            # ---------------- 2: one push ------------------------------------
+            # `Tracker.run` copies the WHOLE r array before the push and the RF
+            # interaction gets `r_prev[active]` from it, so the copy is over all
+            # rows and has to happen before r is touched. Only the thin-gap kick
+            # reads `r_prev`, and only under `cav[0]`, so with bem2d (or RF off)
+            # the copy is 3n float64 reads+writes per step for nothing - skip it.
+            if cav[0]:
+                for p in range(n):
+                    r_prev[p, 0] = r[p, 0]
+                    r_prev[p, 1] = r[p, 1]
+                    r_prev[p, 2] = r[p, 2]
             na = 0
             for p in range(n):
                 if active[p]:
@@ -626,7 +905,169 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
         if not do_c:
             break
 
-        # ---------------- 4: terminators -------------------------------------
+        # ---------------- 4: RF thin-gap kicks -------------------------------
+        # `TrackingEngine._build_hooks` APPENDS an `RFCavityInteraction` after
+        # `engine.extra_interactions` when use_rf and gap_model == 'thin', so the
+        # kick runs AFTER the release and the space-charge kick (it must sit
+        # after the `do_c` break, not at the end of the `do_ab` block: on a
+        # space-charge solve step the Python `sc.apply` runs between the two).
+        if cav[0]:
+            cav_seg_start = cav[1]
+            seg_p1 = cav[2]
+            seg_p2 = cav[3]
+            seg_dir = cav[4]
+            seg_perp = cav[5]
+            cav_omega = cav[6]
+            cav_phase = cav[7]
+            cav_voltage = cav[8]
+            cav_gap_w = cav[9]
+            cav_gap_w_inner = cav[10]
+            cav_taper_r = cav[11]
+            cav_r_min = cav[12]
+            vp_start = cav[13]
+            vp_r = cav[14]
+            vp_s = cav[15]
+            cav_lo = cav[16]
+            cav_hi = cav[17]
+            n_cav = len(cav_seg_start) - 1
+            for c in range(n_cav):
+                # `check_crossings_batch` returns no crossings for a cavity with
+                # no segments (its `if len(pts) == 0: return`)
+                if cav_seg_start[c + 1] == cav_seg_start[c]:
+                    continue
+                # --- crossings, in ASCENDING global index (what np.where gives)
+                # `r_prev` is NOT refreshed between cavities and `r` IS: a
+                # previous cavity's kick has already moved the chord's end.
+                n_cross = 0
+                for p in range(n):
+                    if not active[p]:
+                        # the post-TimedRelease mask, as in the Python path: a
+                        # row born this step has r_prev[p] == r[p], so d_part is
+                        # exactly zero, det is exactly zero and the |det| > 1e-10
+                        # test rejects every segment - including it is harmless.
+                        continue
+                    r1x = r_prev[p, 0]
+                    r1y = r_prev[p, 1]
+                    r2x = r[p, 0]
+                    r2y = r[p, 1]
+                    # the cavity bounding-box prefilter of check_crossings_batch:
+                    # part of the answer, not an optimization (a near-parallel
+                    # chord outside the box must not be solved exactly either)
+                    if max(r1x, r2x) < cav_lo[c, 0] or min(r1x, r2x) > cav_hi[c, 0]:
+                        continue
+                    if max(r1y, r2y) < cav_lo[c, 1] or min(r1y, r2y) > cav_hi[c, 1]:
+                        continue
+                    dpx = r2x - r1x
+                    dpy = r2y - r1y
+                    for s in range(cav_seg_start[c], cav_seg_start[c + 1]):
+                        dcx = seg_p2[s, 0] - seg_p1[s, 0]
+                        dcy = seg_p2[s, 1] - seg_p1[s, 1]
+                        det = dcx * (-dpy) - dcy * (-dpx)
+                        det = -det
+                        if abs(det) <= 1e-10:
+                            continue
+                        bcx = r1x - seg_p1[s, 0]
+                        bcy = r1y - seg_p1[s, 1]
+                        det_t = bcx * (-dpy) - bcy * (-dpx)
+                        det_t = -det_t
+                        det_s = dcx * bcy - dcy * bcx
+                        t_cav = det_t / det
+                        sp = -det_s / det
+                        if t_cav >= 0.0 and t_cav <= 1.0 and sp >= 0.0 and sp <= 1.0:
+                            cidx[n_cross] = p
+                            cseg[n_cross] = s
+                            csp[n_cross] = sp
+                            n_cross += 1
+                            break        # only the FIRST crossing per particle
+                if n_cross == 0:
+                    continue
+
+                # --- backtrack to the crossing, per-particle -dt_back
+                for a in range(n_cross):
+                    p = cidx[a]
+                    dtb[a] = (1.0 - csp[a]) * dt
+                    dt_arr[a] = -dtb[a]
+                    rk_in[a, 0] = r[p, 0]
+                    rk_in[a, 1] = r[p, 1]
+                    rk_in[a, 2] = r[p, 2]
+                    vk_in[a, 0] = v[p, 0]
+                    vk_in[a, 1] = v[p, 1]
+                    vk_in[a, 2] = v[p, 2]
+                _kick_push(use_batch, n_cross, rk_in, vk_in, dt_arr, cidx, cos_rf,
+                           e_in, e_out, e_st, bfld, blend_on, blend_r0, blend_r1,
+                           taper_on, taper_s, taper_r0, taper_r1, q_over_m, hints,
+                           wbuf, rrbuf, sub_i, sub_o, xa, ya, za, e_tmp, e_acc, b_acc,
+                           rk_half, rk_out, vk_out)
+
+                # --- the kick itself, in RFCavity.apply_kicks_batch's order.
+                # The spellings matter: (gamma/c) * v and (c * u) / s are NOT
+                # the same rows as (gamma*v)/c and (c/s) * u (31 % / 36 % of
+                # random rows differ in the last ulp), and this is the one
+                # place where bit-identity is decided.
+                for a in range(n_cross):
+                    s = cseg[a]
+                    vx = vk_out[a, 0]
+                    vy = vk_out[a, 1]
+                    vz = vk_out[a, 2]
+                    speed = np.sqrt(vx * vx + vy * vy + vz * vz)
+                    bet = speed / CLIGHT
+                    gamma = 1.0 / np.sqrt(1.0 - bet * bet)
+                    e_old = (gamma - 1.0) * mass_mev
+                    # np.linalg.norm(r_cavity[:, :2], axis=1), NOT np.hypot (the
+                    # blend / taper radius above is hypot; the two are different
+                    # functions and this one sets the gap width and the profile)
+                    r_cross = np.sqrt(rk_out[a, 0] * rk_out[a, 0]
+                                      + rk_out[a, 1] * rk_out[a, 1])
+                    gw = cav_gap_w[c]
+                    if cav_gap_w_inner[c] > 0.0:
+                        frac = (r_cross - cav_r_min[c]) / (cav_taper_r[c] - cav_r_min[c])
+                        frac = max(0.0, min(frac, 1.0))
+                        gw = cav_gap_w_inner[c] + frac * (cav_gap_w[c] - cav_gap_w_inner[c])
+                    xw = cav_omega[c] * (gw / speed) / 2.0
+                    ttf = np.sin(xw) / xw
+                    v_gap = cav_voltage[c]
+                    if vp_start[c + 1] > vp_start[c]:
+                        v_gap = v_gap * np.interp(r_cross,
+                                                  vp_r[vp_start[c]:vp_start[c + 1]],
+                                                  vp_s[vp_start[c]:vp_start[c + 1]])
+                    t_cavity = t + dt - dtb[a]        # t is the STEP-START time
+                    d_e = 1e-6 * q_state * v_gap * ttf * np.cos(
+                        cav_omega[c] * t_cavity + cav_phase[c])
+                    gamma_new = (e_old + d_e) / mass_mev + 1.0
+                    bg_new = np.sqrt(max(gamma_new * gamma_new - 1.0, 0.0))
+                    gc = gamma / CLIGHT
+                    ux = gc * vx
+                    uy = gc * vy
+                    uz = gc * vz
+                    u_along = ux * seg_dir[s, 0] + uy * seg_dir[s, 1]
+                    u_perp = ux * seg_perp[s, 0] + uy * seg_perp[s, 1]
+                    u_perp_new = np.sign(u_perp) * np.sqrt(
+                        max(bg_new * bg_new - u_along * u_along - uz * uz, 0.0))
+                    unx = u_along * seg_dir[s, 0] + u_perp_new * seg_perp[s, 0]
+                    uny = u_along * seg_dir[s, 1] + u_perp_new * seg_perp[s, 1]
+                    un2 = unx * unx + uny * uny + uz * uz
+                    den = np.sqrt(1.0 + un2)
+                    vk_new[a, 0] = (CLIGHT * unx) / den
+                    vk_new[a, 1] = (CLIGHT * uny) / den
+                    vk_new[a, 2] = (CLIGHT * uz) / den
+                    dt_arr[a] = dtb[a]
+
+                # --- forward to the step end, and back into r / v
+                _kick_push(use_batch, n_cross, rk_out, vk_new, dt_arr, cidx, cos_rf,
+                           e_in, e_out, e_st, bfld, blend_on, blend_r0, blend_r1,
+                           taper_on, taper_s, taper_r0, taper_r1, q_over_m, hints,
+                           wbuf, rrbuf, sub_i, sub_o, xa, ya, za, e_tmp, e_acc, b_acc,
+                           rk_half, rk_in, vk_out)
+                for a in range(n_cross):
+                    p = cidx[a]
+                    r[p, 0] = rk_in[a, 0]
+                    r[p, 1] = rk_in[a, 1]
+                    r[p, 2] = rk_in[a, 2]
+                    v[p, 0] = vk_out[a, 0]
+                    v[p, 1] = vk_out[a, 1]
+                    v[p, 2] = vk_out[a, 2]
+
+        # ---------------- 5: terminators -------------------------------------
         # ONE parallel region: the radial / vertical loss (which for an already
         # inactive row is a no-op, so restricting it to the active ones is the
         # same mask) and the metal test that follows it.
@@ -656,7 +1097,7 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
                     hit_s[n_hits] = step
                     n_hits += 1
 
-        # ---------------- 5: clock, record ------------------------------------
+        # ---------------- 6: clock, record ------------------------------------
         t += dt
         for p in range(n):
             r_hist[m, p, 0] = r[p, 0]
@@ -716,6 +1157,88 @@ _SELFTEST = None
 @njit(cache=True)
 def _hypot_point(x, y):
     return np.hypot(x, y)
+
+
+@njit(cache=True)
+def _sin_point(x):
+    return np.sin(x)
+
+
+@njit(cache=True)
+def _cos_point(x):
+    return np.cos(x)
+
+
+@njit(cache=True)
+def _sign_point(x):
+    return np.sign(x)
+
+
+@njit(cache=True)
+def _interp_point(x, xp, fp):
+    return np.interp(x, xp, fp)
+
+
+# NO fastmath: the kick chain of the kernel, one particle, for the selftest.
+# Same arithmetic order as the block inside ``_chunk3d_impl``.
+@njit(cache=True)
+def _kick_chain_point(vx, vy, vz, rx, ry, sp, dt, t, omega, phase, voltage, gw,
+                      q_state, mass_mev, dirx, diry, perpx, perpy):
+    speed = np.sqrt(vx * vx + vy * vy + vz * vz)
+    bet = speed / CLIGHT
+    gamma = 1.0 / np.sqrt(1.0 - bet * bet)
+    e_old = (gamma - 1.0) * mass_mev
+    r_cross = np.sqrt(rx * rx + ry * ry)
+    xw = omega * (gw / speed) / 2.0
+    ttf = np.sin(xw) / xw
+    dtb = (1.0 - sp) * dt
+    t_cavity = t + dt - dtb
+    d_e = 1e-6 * q_state * voltage * ttf * np.cos(omega * t_cavity + phase)
+    gamma_new = (e_old + d_e) / mass_mev + 1.0
+    bg_new = np.sqrt(max(gamma_new * gamma_new - 1.0, 0.0))
+    gc = gamma / CLIGHT
+    ux = gc * vx
+    uy = gc * vy
+    uz = gc * vz
+    u_along = ux * dirx + uy * diry
+    u_perp = ux * perpx + uy * perpy
+    u_perp_new = np.sign(u_perp) * np.sqrt(
+        max(bg_new * bg_new - u_along * u_along - uz * uz, 0.0))
+    unx = u_along * dirx + u_perp_new * perpx
+    uny = u_along * diry + u_perp_new * perpy
+    un2 = unx * unx + uny * uny + uz * uz
+    den = np.sqrt(1.0 + un2)
+    return (CLIGHT * unx) / den, (CLIGHT * uny) / den, (CLIGHT * uz) / den, d_e
+
+
+def _kick_chain_numpy(v, r, sp, dt, t, omega, phase, voltage, gw,
+                      q_state, mass_mev, dir_along, perp):
+    """``RFCavity.apply_kicks_batch`` (rf_cavity.py:584-637) verbatim, as NumPy."""
+    c = CLIGHT
+    speed = np.linalg.norm(v, axis=1)
+    gamma = 1.0 / np.sqrt(1.0 - (speed / c) ** 2)
+    e_old_mev = (gamma - 1.0) * mass_mev
+    r_crossing = np.linalg.norm(r[:, :2], axis=1)
+    transit_time = np.full(np.shape(r_crossing), gw) / speed
+    omega_tau_half = omega * transit_time / 2.0
+    ttf = np.sin(omega_tau_half) / omega_tau_half
+    dt_back = (1.0 - sp) * dt
+    t_cavity = t + dt - dt_back
+    d_e_mev = 1e-6 * q_state * voltage * ttf * np.cos(omega * t_cavity + phase)
+    gamma_new = (e_old_mev + d_e_mev) / mass_mev + 1.0
+    bg_new = np.sqrt(np.maximum(gamma_new ** 2 - 1.0, 0.0))
+    u = (gamma / c)[:, None] * v
+    u_xy = u[:, :2]
+    u_z = u[:, 2]
+    u_along = np.sum(u_xy * dir_along, axis=1)
+    u_perp_old = np.sum(u_xy * perp, axis=1)
+    u_perp_new_sq = bg_new ** 2 - u_along ** 2 - u_z ** 2
+    u_perp_new = np.sign(u_perp_old) * np.sqrt(np.maximum(u_perp_new_sq, 0.0))
+    u_xy_new = u_along[:, None] * dir_along + u_perp_new[:, None] * perp
+    u_new = np.column_stack([u_xy_new, u_z])
+    u_new_mag2 = np.sum(u_new ** 2, axis=1)
+    v_new = c * u_new / np.sqrt(1.0 + u_new_mag2)[:, None]
+    return v_new, d_e_mev
 
 
 def selftest(n: int = 4096, seed: int = 20260916) -> dict:
@@ -795,7 +1318,50 @@ def selftest(n: int = 4096, seed: int = 20260916) -> dict:
     h_mine = np.array([_hypot_point(hx[i], hy[i]) for i in range(n)])
     hypot_ok = bool(np.array_equal(h_ref, h_mine))
 
+    # ---- the thin-gap kick: numba's scalar transcendentals vs NumPy's ufuncs,
+    # and the whole kick chain vs the NumPy expression chain of
+    # apply_kicks_batch. All four scalars were bit-equal in accel-dev-env on
+    # 2026-09-16; this is the regression guard, not a new assumption.
+    sa = rng.uniform(-20.0, 20.0, size=n)
+    sin_ok = bool(np.array_equal(np.sin(sa), np.array([_sin_point(a) for a in sa])))
+    cos_ok = bool(np.array_equal(np.cos(sa), np.array([_cos_point(a) for a in sa])))
+    sgn_ok = bool(np.array_equal(np.sign(sa), np.array([_sign_point(a) for a in sa])))
+    tab_r = np.sort(rng.uniform(0.0, 0.5, size=32))
+    tab_s = rng.uniform(0.5, 1.5, size=32)
+    iq = rng.uniform(-0.1, 0.6, size=n)
+    interp_ok_tab = bool(np.array_equal(np.interp(iq, tab_r, tab_s),
+                                        np.array([_interp_point(a, tab_r, tab_s)
+                                                  for a in iq])))
+
+    kv = rng.normal(scale=2.0e7, size=(n, 3))
+    kr = rng.uniform(0.02, 0.4, size=(n, 3))
+    ksp = rng.uniform(0.0, 1.0, size=n)
+    ang = rng.uniform(-np.pi, np.pi, size=n)
+    kdir = np.column_stack([np.cos(ang), np.sin(ang)])
+    kperp = np.column_stack([-np.sin(ang), np.cos(ang)])
+    kw = dict(dt=6.0e-11, t=3.7e-8, omega=2.0 * np.pi * 49.2e6, phase=0.37,
+              voltage=62000.0, gw=0.01, q_state=1.0, mass_mev=105.6583745)
+    v_ref, de_ref = _kick_chain_numpy(kv, kr, ksp, kw['dt'], kw['t'], kw['omega'],
+                                      kw['phase'], kw['voltage'], kw['gw'],
+                                      kw['q_state'], kw['mass_mev'], kdir, kperp)
+    v_mine = np.empty_like(v_ref)
+    de_mine = np.empty(n)
+    for i in range(n):
+        out = _kick_chain_point(kv[i, 0], kv[i, 1], kv[i, 2], kr[i, 0], kr[i, 1],
+                                ksp[i], kw['dt'], kw['t'], kw['omega'], kw['phase'],
+                                kw['voltage'], kw['gw'], kw['q_state'], kw['mass_mev'],
+                                kdir[i, 0], kdir[i, 1], kperp[i, 0], kperp[i, 1])
+        v_mine[i] = out[:3]
+        de_mine[i] = out[3]
+    kick_ok = bool(np.array_equal(v_ref, v_mine) and np.array_equal(de_ref, de_mine))
+    kick_max = float(np.max(np.abs(v_ref - v_mine)))
+    kick_rows = int(np.sum(np.abs(v_ref - v_mine).max(axis=1) > 0))
+
     return {'n_samples': int(n),
+            'kick_point_exact_vs_numpy': kick_ok, 'kick_point_max_abs': kick_max,
+            'kick_point_rows_differing': kick_rows,
+            'sin_exact': sin_ok, 'cos_exact': cos_ok, 'sign_exact': sgn_ok,
+            'interp_exact': interp_ok_tab,
             'boris_point_exact_vs_batch': boris_ok, 'boris_point_max_abs': boris_max,
             'boris_point_rows_differing': boris_rows,
             'interp_point_exact_vs_batch3': interp_ok,
@@ -805,7 +1371,10 @@ def selftest(n: int = 4096, seed: int = 20260916) -> dict:
             'hinted_exact_vs_plain': hint_ok, 'hypot_exact': hypot_ok}
 
 
-def _require_selftest():
+def _require_selftest(exact_kick: bool = False):
+    """``exact_kick``: the caller asked for ``interp='batch'`` AND the thin-gap
+    kick is on, so the kick chain's bit-identity is a gate rather than a
+    measurement."""
     global _SELFTEST
     if _SELFTEST is None:
         _SELFTEST = selftest()
@@ -821,6 +1390,11 @@ def _require_selftest():
             "the cell-hint interpolation does not match the plain binary search")
     if not s['hypot_exact']:
         raise FastPathUnavailable("numba's np.hypot differs from NumPy's (blend radius)")
+    if exact_kick and not s['kick_point_exact_vs_numpy']:
+        raise FastPathUnavailable(
+            "the thin-gap kick chain does not reproduce apply_kicks_batch bit for bit "
+            f"(max |dv| {s['kick_point_max_abs']:.3e} m/s on "
+            f"{s['kick_point_rows_differing']} rows)")
     return s
 
 
@@ -975,19 +1549,29 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
         raise FastPathUnavailable("numba not installed")
     if interp not in ('point', 'batch'):
         raise FastPathUnavailable(f"interp {interp!r} (use 'point' or 'batch')")
-    _require_selftest()
     engine = finder.engine
     if engine.dim != '3D':
         raise FastPathUnavailable(f"{engine.dim} engine (fast_track.py covers 2D)")
     if str(getattr(engine, 'algorithm', '')).lower() != 'boris_rel':
         raise FastPathUnavailable(f"algorithm {engine.algorithm} (only boris_rel)")
-    if engine.use_rf and engine.gap_model != 'bem2d':
-        raise FastPathUnavailable(
-            f"gap_model {engine.gap_model} (thin-gap kicks are not reproduced)")
+    # The fast path never calls `TrackingEngine._build_hooks`, so the flag that
+    # decides whether it appends an RFCavityInteraction is re-derived here with
+    # the same expression (tracking.py:675).
+    use_kicks = bool(engine.use_rf and engine.gap_model == 'thin')
+    if engine.use_rf and engine.gap_model not in ('thin', 'bem2d'):
+        raise FastPathUnavailable(f"gap_model {engine.gap_model}")
     if engine.use_rf and engine.gap_model == 'bem2d':
+        # bem2d only: _sync_bem_field raises for a thin-gap design, whose efield
+        # is the bare inflector map and has no set_time
         engine._sync_bem_field()
+    _require_selftest(exact_kick=bool(use_kicks and interp == 'batch'))
 
-    # interactions: TimedRelease (optional) then SpaceChargeKick (optional), that order
+    # interactions: TimedRelease (optional) then SpaceChargeKick (optional), that
+    # order. RFCavityInteraction is deliberately NOT whitelisted here: _build_hooks
+    # does `interactions = list(self.extra_interactions)` and only THEN appends it,
+    # and the finder only ever puts [TimedRelease, SpaceChargeKick] into
+    # extra_interactions, so one appearing in this loop would be a duplicate kick
+    # hook installed by hand - which must still fall back.
     sc = None
     seen_release = False
     for ix in engine.extra_interactions:
@@ -1039,6 +1623,45 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
     e = _pack_efield(design.efield)
     b = _pack_field(design.bfield, 'B-field')
 
+    # thin-gap cavities. _pack_cavities is shared with the 2D kernel; what it
+    # does NOT carry is the per-cavity bounding box that check_crossings_batch
+    # uses as its candidate prefilter (rf_cavity.py:455-464), so that is derived
+    # here from the packed segment endpoints.
+    if use_kicks:
+        for cavity in design.rf_cavities:
+            gwi = getattr(cavity, 'gap_width_inner', None)
+            if gwi is not None and float(gwi) <= 0.0:
+                # _pack_cavities encodes "no taper" as -1.0 and the kernel tests
+                # > 0.0, so an explicit 0.0 would taper in Python and not here
+                raise FastPathUnavailable(
+                    f"gap_width_inner = {float(gwi)} (only None or a positive width)")
+    try:
+        # with bem2d (or RF off) nothing is kicked, so nothing is packed: a
+        # cavity the packer would refuse must not make THAT path fall back
+        cavd = _pack_cavities(design.rf_cavities if use_kicks else [], use_kicks)
+    except _FastTrack2DUnavailable as exc:
+        raise FastPathUnavailable(str(exc))
+    seg_start = cavd['cav_seg_start']
+    n_cav = len(seg_start) - 1
+    cav_lo = np.empty((n_cav, 2))
+    cav_hi = np.empty((n_cav, 2))
+    for c in range(n_cav):
+        lo_i, hi_i = int(seg_start[c]), int(seg_start[c + 1])
+        if hi_i <= lo_i:
+            # an empty cavity: check_crossings_batch returns before it computes
+            # pts.min(axis=0) at all, so nothing may be a candidate here
+            cav_lo[c, :] = np.inf
+            cav_hi[c, :] = -np.inf
+            continue
+        pts = np.vstack([cavd['seg_p1'][lo_i:hi_i], cavd['seg_p2'][lo_i:hi_i]])
+        cav_lo[c, :] = pts.min(axis=0)
+        cav_hi[c, :] = pts.max(axis=0)
+    cav = (bool(cavd['use_kicks']), cavd['cav_seg_start'], cavd['seg_p1'], cavd['seg_p2'],
+           cavd['seg_dir'], cavd['seg_perp'], cavd['cav_omega'], cavd['cav_phase'],
+           cavd['cav_voltage'], cavd['cav_gap_w'], cavd['cav_gap_w_inner'],
+           cavd['cav_taper_r'], cavd['cav_r_min'], cavd['vp_start'], cavd['vp_r'],
+           cavd['vp_s'], np.ascontiguousarray(cav_lo), np.ascontiguousarray(cav_hi))
+
     n = int(pd_init.numpart)
     r0 = np.ascontiguousarray(np.array(pd_init.x_vec, dtype=float))
     v0 = np.ascontiguousarray(np.array(pd_init.v_vec, dtype=float))
@@ -1055,6 +1678,8 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
         blend_on=e['blend_on'], blend_r0=e['blend_r0'], blend_r1=e['blend_r1'],
         taper_on=e['taper_on'], taper_s=e['taper_s'], taper_r0=e['taper_r0'],
         taper_r1=e['taper_r1'], omega=e['omega'], phase=e['phase'],
+        cav=cav, use_kicks=use_kicks, n_cavities=len(design.rf_cavities),
+        q_state=float(design.species.q), mass_mev=float(design.species.mass_mev),
         r_max=float(engine.r_max), z_max=float(engine.z_max),
         metal=metal, metal_on=metal is not None,
         metal_every=int(getattr(metal, 'every', 1)) if metal is not None else 1,
@@ -1164,6 +1789,10 @@ def _run_fast3d(finder, args: dict, callback, dt: float, t0: float,
     # per-particle interpolation cell hints, four fields x three axes, kept
     # ACROSS chunks (a particle stays in its cell for many steps)
     hints = np.zeros((n, 12), dtype=np.int64)
+    # the step-start positions the RF crossing test runs on. DRIVER-owned and
+    # reused across kernel calls on purpose: on a space-charge solve step the
+    # push that fills it and the kick that reads it are in two different calls.
+    r_prev = np.empty((n, 3))
 
     step = 0
     t = float(t0)
@@ -1220,10 +1849,12 @@ def _run_fast3d(finder, args: dict, callback, dt: float, t0: float,
             args['blend_on'], args['blend_r0'], args['blend_r1'],
             args['taper_on'], args['taper_s'], args['taper_r0'], args['taper_r1'],
             args['omega'], args['phase'],
+            args['cav'], args['q_state'], args['mass_mev'],
             sc_on, sc_E, sc_B, sc_kick_mask, sc_has_field, sc_qom, sc_kick_z,
             args['r_max'], args['z_max'], args['metal_on'], args['metal_every'],
             args['exempt_ref'], args['ref_particle'], args['ras_a'], args['ras_b'],
-            hints, r_hist, v_hist, active_hist, t_hist, ref_hist, kick_hist, hit_p, hit_s)
+            hints, r_prev,
+            r_hist, v_hist, active_hist, t_hist, ref_hist, kick_hist, hit_p, hit_s)
         if numba_mod is not None:
             # back to the process default so the space-charge solve between
             # chunks (poisson_fft has parallel=True kernels of its own) is not
@@ -1289,7 +1920,14 @@ def _run_fast3d(finder, args: dict, callback, dt: float, t0: float,
         steps_done = n_steps
     r_f, v_f, a_f, t_f = final
 
+    # 'kicks' says the thin-gap branch actually ran, so a test cannot pass by
+    # silently falling through a use_rf=False design. NOTE a deliberate
+    # divergence: RFCavity.n_crossings / total_energy_gain are NOT replayed (as
+    # in fast_track.py); nothing in the tracking path reads them, only
+    # RFCavity.get_statistics.
     finder.last_fast_path = {'used': True, 'path': '3d', 'interp': args['interp'],
+                             'kicks': bool(args['use_kicks']),
+                             'n_cavities': int(args['n_cavities']),
                              'parallel': parallel, 'threads': args.get('threads'),
                              'steps': int(steps_done),
                              'n_particles': int(n),

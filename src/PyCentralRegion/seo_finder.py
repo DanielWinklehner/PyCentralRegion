@@ -1069,6 +1069,120 @@ class SEOFinder:
             raise RuntimeError("mean_frequency: no valid SEOs found")
         return float(np.mean(freqs))
 
+    def isochronous_frequency(self,
+                              r_min_mm: Optional[float] = None,
+                              r_max_mm: Optional[float] = None,
+                              n_orbits: int = 16,
+                              trim_inner: int = 2,
+                              trim_outer: int = 2,
+                              solver: Optional[str] = None,
+                              verbose: Optional[bool] = None) -> float:
+        """RF base frequency [Hz] from EVERY usable SEO in the map, fringes dropped.
+
+        ``mean_frequency`` needs a hand-picked radius list, which bakes one map's
+        geometry into the caller. This samples the map's own radial extent
+        instead, then discards the ``trim_inner`` innermost and ``trim_outer``
+        outermost SUCCESSFUL orbits - the two places the answer is not to be
+        trusted. Inside, the field is not yet isochronous (the injection orbit's
+        frequency is far off) and closure is poor; outside, the pole fringe rolls
+        the field over and the frequency drops away (on the HCHC-60 maps the
+        outermost tabulated orbit sits ~3e-3 low while everything from 400 to
+        1900 mm agrees to ~1e-3).
+
+        Why this matters (2026-09-16): handing a cavity optimizer a free RF
+        frequency lets a short-turn cost function pull it ABOVE the isochronous
+        value - on HCHC-60 by 6.5e-4 over 15 turns, which is 0.94 deg of phase
+        slip per turn at harmonic 4 and crests the beam at half energy. The
+        frequency belongs to the FIELD, not to the cost function.
+
+        Parameters
+        ----------
+        r_min_mm, r_max_mm : float, optional
+            Sampling span. Defaults are taken from the map itself: 10 % and 95 %
+            of the largest radius fully inscribed in the grid.
+        n_orbits : int
+            SEOs to attempt across the span (before trimming).
+        trim_inner, trim_outer : int
+            Successful orbits to discard at each end.
+        verbose : bool, optional
+            Defaults to the finder's own ``verbose``.
+
+        Returns
+        -------
+        float
+            Mean orbital frequency [Hz] of the kept orbits. Details of the fit
+            (per-orbit radii / frequencies, which were trimmed, the relative
+            spread) are left in ``self.last_isochronous_fit``.
+        """
+        verbose = self.verbose if verbose is None else verbose
+        if r_max_mm is None or r_min_mm is None:
+            fld = self._polar_field()
+            if fld is None:
+                raise ValueError("isochronous_frequency: the design's field is not a regular grid map, "
+                                 "so the extent cannot be read - pass r_min_mm and r_max_mm explicitly")
+            r_map_mm = 1e3 * float(fld.r_max)
+            r_min_mm = 0.10 * r_map_mm if r_min_mm is None else r_min_mm
+            r_max_mm = 0.95 * r_map_mm if r_max_mm is None else r_max_mm
+        if not (r_max_mm > r_min_mm > 0):
+            raise ValueError(f"isochronous_frequency: bad span {r_min_mm}..{r_max_mm} mm")
+
+        # One radius at a time, tolerating failures: the Newton solve RAISES where no closed orbit
+        # exists, and that is precisely the fringe this method is meant to discard (on the HCHC-60
+        # 2.2 m maps it fails from ~2.09 m out). find_seos_at_radii would propagate the first one.
+        radii = list(np.linspace(float(r_min_mm), float(r_max_mm), int(n_orbits)))
+        # energy_seed_kev stays None so each radius derives its own seed from the local average field,
+        # exactly as find_seos_at_radii does. Do NOT warm-start from the previous radius: seeding a large
+        # radius with a much lower energy makes the Newton solve converge on a HALF-turn closure, which
+        # reports ~2x the true frequency (seen 2026-09-16: 15.98 MHz identical at eight radii).
+        orbits, failed = [], []
+        for r in radii:
+            try:
+                o = self.find_seo_newton(r, energy_seed_kev=None, solver=solver,
+                                         do_final_tracking=False)
+            except Exception as exc:                      # no closed orbit here - fringe, or too deep in
+                failed.append((float(r), str(exc).splitlines()[-1][:80]))
+                continue
+            if o is not None and o.frequency_hz > 0:
+                orbits.append(o)
+        good = sorted(orbits, key=lambda o: o.radius_mm)
+        if not good:
+            raise RuntimeError("isochronous_frequency: no valid SEOs found over "
+                               f"{r_min_mm:.0f}..{r_max_mm:.0f} mm "
+                               f"({len(failed)} of {len(radii)} radii failed to close)")
+
+        lo = min(int(max(0, trim_inner)), max(0, len(good) - 1))
+        hi = len(good) - min(int(max(0, trim_outer)), max(0, len(good) - 1 - lo))
+        kept = good[lo:hi] or good
+        freqs = np.array([o.frequency_hz for o in kept], dtype=float)
+        f_mean = float(np.mean(freqs))
+        spread = float((freqs.max() - freqs.min()) / f_mean) if len(freqs) > 1 else 0.0
+
+        self.last_isochronous_fit = {
+            'f_mean_hz': f_mean,
+            'f_min_hz': float(freqs.min()), 'f_max_hz': float(freqs.max()),
+            'relative_spread': spread,
+            'span_mm': (float(r_min_mm), float(r_max_mm)),
+            'n_attempted': int(n_orbits), 'n_valid': len(good), 'n_kept': len(kept),
+            'failed_radii_mm': [r for r, _ in failed],
+            'kept_radii_mm': [float(o.radius_mm) for o in kept],
+            'kept_frequencies_hz': [float(o.frequency_hz) for o in kept],
+            'trimmed_inner_mm': [float(o.radius_mm) for o in good[:lo]],
+            'trimmed_outer_mm': [float(o.radius_mm) for o in good[hi:]],
+        }
+        if verbose:
+            print(f"   isochronous frequency: {1e-6 * f_mean:.6f} MHz from {len(kept)} of "
+                  f"{len(good)} valid SEOs ({int(n_orbits)} attempted) over "
+                  f"{kept[0].radius_mm:.0f}..{kept[-1].radius_mm:.0f} mm; "
+                  f"spread {1e4 * spread:.2f}e-4", flush=True)
+            if good[:lo] or good[hi:]:
+                print("     trimmed as fringe: "
+                      f"inner {[round(o.radius_mm) for o in good[:lo]]}, "
+                      f"outer {[round(o.radius_mm) for o in good[hi:]]} mm", flush=True)
+            if failed:
+                print(f"     no closed orbit at {[round(r) for r, _ in failed]} mm "
+                      f"({len(failed)} of {len(radii)}) - outside the usable map", flush=True)
+        return f_mean
+
     @staticmethod
     def plot_poincare_section(orbit: StaticOrbit, ax=None):
         """

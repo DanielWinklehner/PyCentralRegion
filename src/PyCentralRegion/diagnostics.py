@@ -415,3 +415,114 @@ class BeamStatisticsCollector:
     def get_statistics(self) -> List[TurnStatistics]:
         """Return collected statistics."""
         return self.turn_stats
+
+
+# ============================================================================
+# Robust bunch centroid (halo / straggler rejection)
+# ============================================================================
+@dataclass
+class RobustCentroid:
+    """The core of the bunch: centroid, mean velocity and what was rejected."""
+    x: np.ndarray                 # (3,) core centroid [m]
+    v: np.ndarray                 # (3,) core mean velocity [m/s]
+    mask: np.ndarray              # (n_active,) bool, True = kept as core
+    n_kept: int
+    n_total: int
+    rms: np.ndarray               # (3,) core rms about x [m]
+    energy_mev: float = 0.0       # core mean energy, when energies were supplied
+    n_iter: int = 0               # clipping passes actually taken
+
+    @property
+    def rejected_frac(self) -> float:
+        return 1.0 - self.n_kept / max(self.n_total, 1)
+
+
+def robust_centroid(r_active: np.ndarray,
+                    v_active: Optional[np.ndarray] = None,
+                    energy_mev: Optional[np.ndarray] = None,
+                    n_sigma: float = 3.0,
+                    n_iter: int = 3,
+                    min_keep_frac: float = 0.5) -> RobustCentroid:
+    """The bunch's CORE centroid, with halo and stragglers rejected.
+
+    WHY THIS EXISTS. With ``reference_centroid=True`` the tracker prepends a VIRTUAL
+    particle 0 that is the centroid of the beam AS LAUNCHED, propagated as a single
+    particle. It is not the centroid of the surviving bunch at any later time, and once
+    halo and phase stragglers develop it is not even close - so it is the wrong reference
+    to optimize a bunch phase against (Daniel, 2026-09-16). Recompute the real thing from
+    the live distribution every N steps instead.
+
+    REJECTION RULE. Iterative clipping about the MEDIAN, with the scale from the median
+    absolute deviation (sigma = 1.4826 MAD, the Gaussian-consistent estimator), applied per
+    axis. Median/MAD rather than mean/std because the mean and the standard deviation are
+    themselves dragged by the very outliers being rejected, so a first mean/std pass
+    systematically under-rejects a heavy tail - which is exactly the shape a halo has.
+
+    Stragglers in a cyclotron fall behind in RF phase, hence in energy, hence in radius, so
+    they show up as POSITION outliers and the (x, y, z) clip catches them. Passing
+    ``energy_mev`` adds energy as a fourth clipped axis, which also separates a straggler
+    that happens to sit at the core radius at this instant.
+
+    ``min_keep_frac`` is a floor: if a pass would cut the core below that fraction of the
+    particles it was given, the pass is refused and the previous core is kept. That stops a
+    genuinely broad or bimodal bunch from being clipped down to a handful of particles and
+    reported as a confident centroid.
+
+    Parameters
+    ----------
+    r_active : (n, 3) positions of the ACTIVE particles [m]. Pass the live subset; the
+        virtual reference particle must NOT be included (it is not part of the bunch).
+    v_active : (n, 3) velocities [m/s], optional - returned as the core mean.
+    energy_mev : (n,) kinetic energies, optional - adds the energy clip axis.
+    n_sigma : clip threshold in MAD-sigmas.
+    n_iter : maximum clipping passes.
+    min_keep_frac : refuse a pass that would keep less than this fraction.
+
+    Returns
+    -------
+    RobustCentroid
+    """
+    r_active = np.asarray(r_active, dtype=float)
+    if r_active.ndim != 2 or r_active.shape[1] != 3:
+        raise ValueError(f"r_active must be (n, 3), got {r_active.shape}")
+    n_total = int(r_active.shape[0])
+    if n_total == 0:
+        return RobustCentroid(x=np.full(3, np.nan), v=np.full(3, np.nan),
+                              mask=np.zeros(0, dtype=bool), n_kept=0, n_total=0,
+                              rms=np.full(3, np.nan))
+
+    cols = [r_active[:, 0], r_active[:, 1], r_active[:, 2]]
+    if energy_mev is not None:
+        cols.append(np.asarray(energy_mev, dtype=float).reshape(n_total))
+
+    kept = np.ones(n_total, dtype=bool)
+    taken = 0
+    for _ in range(max(int(n_iter), 0)):
+        trial = np.ones(n_total, dtype=bool)
+        for c in cols:
+            sub = c[kept]
+            if sub.size == 0:
+                continue
+            med = float(np.median(sub))
+            mad = float(np.median(np.abs(sub - med)))
+            sigma = 1.4826 * mad
+            if not np.isfinite(sigma) or sigma <= 0.0:
+                continue          # degenerate axis (all equal): it separates nothing
+            trial &= np.abs(c - med) <= n_sigma * sigma
+        trial &= kept             # never resurrect a particle a previous pass rejected
+        if trial.sum() < max(1, int(min_keep_frac * n_total)):
+            break                 # refuse: this would clip the bunch away, not its halo
+        taken += 1
+        if bool(np.array_equal(trial, kept)):
+            break                 # converged
+        kept = trial
+
+    core = r_active[kept]
+    x = core.mean(axis=0)
+    rms = core.std(axis=0)
+    v = (np.asarray(v_active, dtype=float)[kept].mean(axis=0)
+         if v_active is not None else np.full(3, np.nan))
+    e = (float(np.asarray(energy_mev, dtype=float).reshape(n_total)[kept].mean())
+         if energy_mev is not None else 0.0)
+    return RobustCentroid(x=x, v=v, mask=kept, n_kept=int(kept.sum()), n_total=n_total,
+                          rms=rms, energy_mev=e, n_iter=taken)

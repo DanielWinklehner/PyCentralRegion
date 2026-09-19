@@ -1252,6 +1252,7 @@ class CavityGeometryOptimizer:
                         worker_builder_args: tuple = (),
                         n_starts: Optional[int] = None,
                         geometry_jitter_deg: float = 1.0,
+                        seed_energy_floor: float = 0.25,
                         collimator_seed: Optional[tuple] = None,
                         seed_from_current_geometry: bool = False,
                         stage_a_objective: bool = False) -> OptimizedOrbit:
@@ -1288,6 +1289,7 @@ class CavityGeometryOptimizer:
                 phase_grid, freq_fracs, maxfun, r0_mode, skip_turns,
                 workers, worker_builder, worker_builder_args,
                 n_starts, geometry_jitter_deg, collimator_seed,
+                seed_energy_floor,
                 seed_from_current_geometry, stage_a_objective)
 
         of = self.orbit_finder
@@ -1368,6 +1370,7 @@ class CavityGeometryOptimizer:
                                   worker_builder_args, n_starts,
                                   geometry_jitter_deg,
                                   collimator_seed=None,
+                                  seed_energy_floor: float = 0.25,
                                   seed_from_current_geometry: bool = False,
                                   stage_a_objective: bool = False) -> OptimizedOrbit:
         """Parallel staged optimization (see optimize_staged docstring).
@@ -1494,11 +1497,22 @@ class CavityGeometryOptimizer:
                     else:
                         print(f"  E={E:.3f} MeV @ phase={ph:.0f} deg, f={f / 1e6:.3f} MHz")
 
-            # ---- Seeds: distinct VIABLE phase basins (>= 25% of the best
-            # stage-A energy), then jittered clones of the good basins. Seeding
-            # non-accelerating phases wastes whole DFO-LS starts.
+            # ---- Seeds: distinct VIABLE phase basins, then jittered clones of the good basins.
+            # Seeding non-accelerating phases wastes whole DFO-LS starts.
+            #
+            # 2026-09-16: made a parameter, but MEASUREMENT SAYS DO NOT RAISE IT. On HCHC-60 the only
+            # start that ever converged was seeded at phase -120 deg and optimized to -46 deg, moving 74
+            # deg. Stage A ranks phases with the geometry FROZEN at x0 (naive, all segment angles zero),
+            # and it rates -120 POORLY - so a higher floor deletes the one viable basin:
+            #     floor 0.25 -> phases -120,-90,-60,-30,0 -> 1/16 converged, best cost 0.76
+            #     floor 0.50 -> phases  -90,-60,-30,0     -> 0/16 converged, best cost 134.9
+            #     floor 0.80 -> phases      -60,-30,0     -> 0/16 converged, best cost 26.5
+            # Because the optimizer moves the phase that far, stage-A energy has almost no predictive
+            # value for which seed wins, so filtering on it is at best neutral and at worst fatal. The
+            # real cure for the 1-in-16 rate is seed_from_current_geometry=True (start every clone from a
+            # geometry AND phase already known to survive), not this knob. Kept at the historical 0.25.
             # objective mode: scores are -cost (negative); every finite point is viable
-            e_min = -np.inf if stage_a_objective else 0.25 * scan[0][0]
+            e_min = -np.inf if stage_a_objective else float(seed_energy_floor) * scan[0][0]
             picked = []
             for E, ph, f in scan:
                 if len(picked) >= n_starts:

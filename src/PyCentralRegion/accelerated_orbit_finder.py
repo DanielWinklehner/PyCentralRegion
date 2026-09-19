@@ -48,7 +48,8 @@ class SparseBeamRecord:
     ``(step, state)`` for a requested time. Anything else raises ``IndexError``.
     """
 
-    def __init__(self, times_s, n_particles: int, t0_s: float, dt_s: float):
+    def __init__(self, times_s, n_particles: int, t0_s: float, dt_s: float,
+                 track_ids=None, track_every: int = 1):
         self.times_s = [float(t) for t in times_s]
         self.t0_s = float(t0_s)
         self.dt_s = float(dt_s)
@@ -58,6 +59,14 @@ class SparseBeamRecord:
         self.first: Optional[np.ndarray] = None
         self._last = np.full((int(n_particles), 6), np.nan)
         self.n_steps = 0
+        # a few particles kept as continuous PATHS, for the 3D viewer. The snapshot states above
+        # are a dozen instants and cannot show where a particle went; these can. Only a handful
+        # of ids, only every track_every-th step: 200 ids every 10th step of a 15-turn run is
+        # 14 MB, against 5.8 GB for the dense buffer this class exists to avoid.
+        self.track_ids = None if track_ids is None else np.asarray(track_ids, dtype=int)
+        self.track_every = max(1, int(track_every))
+        self.track_steps: List[int] = []
+        self._track: List[np.ndarray] = []
 
     def record(self, step: int, r_array: np.ndarray, v_array: np.ndarray):
         self._last[:, :3] = r_array
@@ -66,7 +75,21 @@ class SparseBeamRecord:
             self.first = self._last.copy()
         if step in self.wanted:
             self.states[int(step)] = self._last.copy()
+        if self.track_ids is not None and int(step) % self.track_every == 0:
+            self.track_steps.append(int(step))
+            self._track.append(np.asarray(r_array, dtype=float)[self.track_ids].copy())
         self.n_steps = max(self.n_steps, int(step) + 1)
+
+    @property
+    def tracks(self) -> Optional[np.ndarray]:
+        """(n_saved_steps, n_track_ids, 3) positions [m] of the tracked subset, or None.
+
+        A particle that has been lost or not yet born holds whatever the engine left in its
+        slot, so read this together with ``track_steps`` and the terminator's hit steps rather
+        than trusting every row to be a live position."""
+        if not self._track:
+            return None
+        return np.stack(self._track, axis=0)
 
     @property
     def last(self) -> np.ndarray:
@@ -559,12 +582,33 @@ class AcceleratedOrbitFinder:
             # - strip our own statics so they are not counted twice
             ef = self.design.efield
             mine = [id(s) for s in self.static_efields]
+            # ...AND every field this finder's inflector has produced. Build helpers
+            # attach the inflector to their OWN finder with the default field_dim=2,
+            # which leaves its MIDPLANE SLICE as design.efield. That slice is a
+            # different object from the 3D map a second finder then attaches, so an
+            # identity test against static_efields alone misses it and
+            # superpose_efield SUMS the two: the inflector's E_x / E_y applied twice
+            # (E_z only once, since the slice drops it). Measured 2026-09-16 at the
+            # HCHC-60 injection point: E_x -748624 V/m tracked where -374312 is
+            # correct, with E_z right - an error that survives a sanity check.
+            # InflectorModel caches both forms (_field, _field2d) and there is one
+            # instance per process, so identity still settles it.
+            infl = getattr(self, 'inflector', None)
+            if infl is not None:
+                mine.append(id(getattr(infl, '_field', None)))
+                mine += [id(v) for v in getattr(infl, '_field2d', {}).values()]
             if ef is not None and id(ef) in mine:
                 ef = Field.zero()
             elif isinstance(ef, StaticPlusRFField):
                 ef = ef.rf if ef.rf is not None else Field.zero()
-            elif isinstance(ef, CompositeField) and mine and all(id(p) in mine for p in ef.fields):
-                ef = Field.zero()
+            elif isinstance(ef, CompositeField) and mine:
+                w = list(getattr(ef, 'weights', [1.0] * len(ef.fields)))
+                keep = [(p, wi) for p, wi in zip(ef.fields, w) if id(p) not in mine]
+                if not keep:
+                    ef = Field.zero()
+                elif len(keep) < len(ef.fields):
+                    ef = (keep[0][0] if len(keep) == 1
+                          else CompositeField([p for p, _ in keep], [wi for _, wi in keep]))
             self._base_efield = ef
         base = self._base_efield
         if self.static_efields:
@@ -860,7 +904,9 @@ class AcceleratedOrbitFinder:
                       max_turns: int,
                       save_full_beam: bool = False,
                       section_angle: Optional[float] = None,
-                      save_times_s: Optional[List[float]] = None) -> Tuple:
+                      save_times_s: Optional[List[float]] = None,
+                      track_ids: Optional[np.ndarray] = None,
+                      track_every: int = 1) -> Tuple:
         """Track particle(s) with RF and collect diagnostics (single or multi).
 
         ``save_full_beam`` keeps every step of every particle (the dense
@@ -944,7 +990,8 @@ class AcceleratedOrbitFinder:
             'n_released_later': int(np.sum(birth_step > 0)),
             'birth_quantization_s': 0.5 * dt if release is not None else 0.0}
         if save_times_s is not None:
-            full_beam = SparseBeamRecord(save_times_s, self.n_particles, t0, dt)
+            full_beam = SparseBeamRecord(save_times_s, self.n_particles, t0, dt,
+                                         track_ids=track_ids, track_every=track_every)
         else:
             full_beam = (np.full((n_steps, self.n_particles, 6), np.nan)
                          if save_full_beam else None)
@@ -1541,11 +1588,17 @@ class AcceleratedOrbitFinder:
                    pr0: Optional[float] = None,
                    r0_mode: str = 'offset',
                    save_full_beam: bool = False,
-                   save_times_s: Optional[List[float]] = None) -> OptimizedOrbit:
+                   save_times_s: Optional[List[float]] = None,
+                   track_ids: Optional[np.ndarray] = None,
+                   track_every: int = 1) -> OptimizedOrbit:
         """Single deterministic tracking run (no optimization) of ``initial_beam``.
 
         ``save_times_s``: keep the full beam only at these clock times (plus the
-        first and last step) - see ``track_with_rf`` / ``SparseBeamRecord``."""
+        first and last step) - see ``track_with_rf`` / ``SparseBeamRecord``.
+
+        ``track_ids`` additionally keeps those particles' positions at every
+        ``track_every``-th step as continuous paths (``record.tracks``), for
+        viewing trajectories against the 3D geometry."""
         self.design.set_bunch_phase(bunch_phase_deg)
         self.design.set_rf_frequency(rf_freq_mhz * 1e6)
 
@@ -1559,7 +1612,8 @@ class AcceleratedOrbitFinder:
         try:
             result = self.track_with_rf(pd, dt, max_turns,
                                         save_full_beam=save_full_beam,
-                                        save_times_s=save_times_s)
+                                        save_times_s=save_times_s,
+                                        track_ids=track_ids, track_every=track_every)
         finally:
             self.engine.extra_terminators = []
         vals = {'bunch_phase': bunch_phase_deg, 'rf_freq': rf_freq_mhz * 1e6}

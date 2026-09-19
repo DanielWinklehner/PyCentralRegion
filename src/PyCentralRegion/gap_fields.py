@@ -55,6 +55,7 @@ GPU, on scipy otherwise (the first solve per process pays a few seconds of
 kernel compile / JIT).
 """
 
+import os
 import time
 import warnings
 from dataclasses import dataclass, field as dataclass_field
@@ -2236,17 +2237,43 @@ class GapFieldSolution:
     final_residual: float = float('nan')
 
     def potential(self, pts: np.ndarray, chunk: int = 50000,
-                  verbose: bool = False) -> np.ndarray:
-        """Potential [V] at (M, 3) points via the single-layer representation."""
+                  verbose: bool = False, device: Optional[str] = None,
+                  precision: Optional[str] = None) -> np.ndarray:
+        """Potential [V] at (M, 3) points via the single-layer representation.
+
+        ``device``    : 'cpu' | 'gpu'; default from HCHC60_BEM_POT_DEVICE, else 'cpu'.
+        ``precision`` : 'double' | 'single'; default from HCHC60_BEM_POT_PRECISION, else double.
+
+        Unlike the boundary assembly - O(N^2), singular and near-singular quadrature, where a
+        consumer GPU's fp64 rate loses badly to the CPU runtime - this is M x N regular
+        quadrature with M >> N and no singularity handling: a wide, shallow sweep, which is what
+        a GPU is for. Single precision is the lever that makes it worth doing (Ada gives fp32 at
+        64x its fp64 rate) and costs nothing here: the result is differenced onto a grid and
+        trilinearly interpolated, so its useful precision is set by the grid spacing, not by the
+        mantissa. Check it rather than trust it - ``bem_field3d(..., pot_check=N)`` re-evaluates
+        N random points in double on the CPU and reports the difference.
+        """
         from bempp_cl.api.operators.potential import laplace as lap_pot
+        import bempp_cl.api as bempp
+        device = (device or os.environ.get('HCHC60_BEM_POT_DEVICE', 'cpu')).lower()
+        precision = (precision or os.environ.get('HCHC60_BEM_POT_PRECISION', 'double')).lower()
+        if device not in ('cpu', 'gpu'):
+            raise ValueError(f"device must be 'cpu' or 'gpu', got {device!r}")
+        if precision not in ('single', 'double'):
+            raise ValueError(f"precision must be 'single' or 'double', got {precision!r}")
         pts = np.atleast_2d(np.asarray(pts, dtype=float))
         out = np.empty(len(pts))
-        for i0 in range(0, len(pts), chunk):
-            block = pts[i0:i0 + chunk]
-            op = lap_pot.single_layer(self.space, block.T.copy())
-            out[i0:i0 + len(block)] = np.real(op * self.neumann).ravel()
-            if verbose and len(pts) > chunk:
-                print(f"[gap_fields]   potential eval {i0 + len(block)}/{len(pts)}")
+        prev = bempp.POTENTIAL_OPERATOR_DEVICE_TYPE
+        bempp.POTENTIAL_OPERATOR_DEVICE_TYPE = device
+        try:
+            for i0 in range(0, len(pts), chunk):
+                block = pts[i0:i0 + chunk]
+                op = lap_pot.single_layer(self.space, block.T.copy(), precision=precision)
+                out[i0:i0 + len(block)] = np.real(op * self.neumann).ravel()
+                if verbose and len(pts) > chunk:
+                    print(f"[gap_fields]   potential eval {i0 + len(block)}/{len(pts)}")
+        finally:
+            bempp.POTENTIAL_OPERATOR_DEVICE_TYPE = prev
         return out
 
     def efield_midplane(self, pts_2d: np.ndarray, h: float = 2e-4) -> np.ndarray:
@@ -2600,3 +2627,78 @@ def plot_electrode_footprints(model: ElectrodeModel, ax=None, show_chains: bool 
     ax.set_ylabel('y [m]')
     ax.set_title(f'Gap electrodes ({model.n_elements} elements)')
     return ax
+
+
+# ============================================================================
+# Tall-wall field for 3D tracking: the 2D solution applied at every z
+# ============================================================================
+def tallwall_field_3d(solution,
+                      z_half: float = 0.020,
+                      verbose: bool = True,
+                      **to_field_kwargs):
+    """The MIDPLANE solution of a tall-wall model, replicated over z as a dim-3 ``Field``.
+
+    Daniel, 2026-09-16: *"I'd prefer tall-wall to be a 2D BEM solve and the 2D solution
+    simply applied at all z values."* This is that, exactly:
+
+      * ``solution.to_field(...)`` evaluates phi ON the median plane and returns E = -grad phi
+        as a dim-2 field with E_z = 0. ``build_gap_electrodes`` already extrudes its solids to
+        8x the largest gap width, which is the converged tall-wall 2D limit at the midplane.
+      * those (E_x, E_y) are then REPLICATED onto two z-planes at +-``z_half``, with E_z = 0.
+
+    Replicating rather than calling ``to_field3d(xs, ys, [-z, +z])`` is deliberate. to_field3d
+    would evaluate the potential AT +-z_half on the real finite prisms, which is mildly
+    z-dependent near the caps and yields a small non-zero E_z - the finite-height field, not
+    the 2D limit. Two identical planes make the z-independence exact and E_z identically zero.
+
+    Why dim-3 at all, when the field is 2D: ``fast_track3d._pack_field`` rejects dim-2 fields
+    ("only 3D grids and constants"), so a literal 2D field silently drops a 3D run onto the
+    general Python path at roughly 40x the cost. Two planes are enough for trilinear
+    interpolation and cost twice a 2D grid, i.e. nothing.
+
+    ``z_half`` must BRACKET the tracking aperture: the interpolator returns 0 outside the
+    grid, so a particle beyond +-z_half would see no RF field at all. Default 20 mm against
+    the usual 17 mm vertical limit.
+
+    Returns a dim-3 ``Field``; wrap it in a ``TimedField`` (see ``make_bem_efield``) to use it.
+    """
+    f2d = solution.to_field(verbose=verbose, **to_field_kwargs)
+    if int(getattr(f2d, 'dim', 0)) != 2:
+        raise ValueError(f"to_field returned a dim-{f2d.dim} field; expected the dim-2 midplane")
+    ips = [f2d._field[k] for k in 'xyz']
+    xs = np.ascontiguousarray(ips[0]._grid[0], dtype=float)
+    ys = np.ascontiguousarray(ips[0]._grid[1], dtype=float)
+    ex = np.ascontiguousarray(ips[0]._values, dtype=float)
+    ey = np.ascontiguousarray(ips[1]._values, dtype=float)
+    if ex.shape != (len(xs), len(ys)):
+        raise ValueError(f"midplane values {ex.shape} do not match the grid "
+                         f"({len(xs)}, {len(ys)})")
+    zs = np.array([-abs(float(z_half)), abs(float(z_half))], dtype=float)
+    rep = lambda a: np.ascontiguousarray(np.repeat(a[:, :, None], len(zs), axis=2))  # noqa: E731
+    out = Field.from_arrays(
+        grid={'x': xs, 'y': ys, 'z': zs},
+        values={'x': rep(ex), 'y': rep(ey), 'z': np.zeros((len(xs), len(ys), len(zs)))},
+        label="tall-wall 2D BEM field applied at all z (static pattern)",
+        interpolator_backend=to_field_kwargs.get('interpolator_backend', 'auto'),
+    )
+    if verbose:
+        print(f"[gap_fields] tall-wall 2D -> dim-3: grid ({len(xs)}, {len(ys)}, {len(zs)}), "
+              f"z = +-{1e3 * abs(z_half):.1f} mm, E_z identically 0, "
+              f"max |E_xy| {np.max(np.hypot(ex, ey)):.3e} V/m")
+    return out
+
+
+def make_tallwall_efield(design,
+                         z_half: float = 0.020,
+                         build_kwargs: Optional[dict] = None,
+                         solve_kwargs: Optional[dict] = None,
+                         field_kwargs: Optional[dict] = None,
+                         verbose: bool = True):
+    """``make_bem_efield`` for the tall-wall-at-all-z model: electrodes -> 2D solve -> dim-3 Field
+    -> TimedField. Returns (TimedField, GapFieldSolution)."""
+    model = build_gap_electrodes(design, verbose=verbose, **(build_kwargs or {}))
+    solution = solve_gap_field(model, verbose=verbose, **(solve_kwargs or {}))
+    static = tallwall_field_3d(solution, z_half=z_half, verbose=verbose, **(field_kwargs or {}))
+    cav = design.rf_cavities[0]
+    timed = TimedField(static, omega=float(cav.omega), phase=float(cav.bunch_phase_offset))
+    return timed, solution
