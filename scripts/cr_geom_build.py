@@ -73,7 +73,14 @@ DEE_CENTER_ANGLES = [45.0, 135.0, 225.0, 315.0]
 HARMONIC = 4
 DEE_OPENING_ANGLE = 180.0 / HARMONIC            # 45 deg, the classical synchronous dee angle
 CAVITY_VOLTAGE = 65000.0
+# The accelerating gap follows the CAD: a constant-angle wedge floored at a minimum slot
+# (Daniel, 2026-09-20), width(r) = max(GAP_WIDTH_MIN, r * GAP_ANGLE_DEG). GAP_WIDTH stays as
+# the nominal the DeeSystem is seeded with; the LOCAL width is what the boundaries are offset
+# by - see _half_width_mm. Keep these in step with HCHC-60_optimize_cavity_geometry.py, or the
+# geometry built here is not the geometry the optimizer designed.
 GAP_WIDTH = 0.010                               # m
+GAP_ANGLE_DEG = float(os.environ.get('HCHC60_GAP_ANGLE_DEG', 2.5))
+GAP_WIDTH_MIN = float(os.environ.get('HCHC60_GAP_WIDTH_MIN_MM', 6.5)) * 1e-3
 
 # --- the vertical structure, as the old builder ended up using it ---------------------------
 # electrodes3d.HeightProfiles.iba plus the decisions of 2026-09-13/16 that
@@ -100,6 +107,23 @@ _DEF_OUTLINE = (Path(os.environ.get('HCHC60_EXPORT', '')) / 'steps_baseline_mm' 
 # ============================================================================================
 # 1a. the gap centre lines
 # ============================================================================================
+def _half_width_mm(cav, pts_mm, side: float):
+    """Signed half gap width [mm] at every point of a centre line given in MILLIMETRES.
+
+    The gap width varies with radius under either RFCavity law - the angular wedge
+    (gap_angle_deg/gap_width_min) or the linear taper (gap_width_inner/gap_taper_radius) -
+    so the boundary has to be offset by the LOCAL width. Offsetting by the nominal
+    cav.gap_width built a constant-width gap while the optimizer had designed a varying
+    one, which is the geometry the BEM would then have solved.
+    """
+    pts = np.asarray(pts_mm, dtype=float)
+    fn = getattr(cav, 'gap_width_at', None)
+    if fn is None:                                   # pre-law cavity objects
+        return side * 0.5 * float(cav.gap_width) * MM
+    r_m = np.hypot(pts[:, 0], pts[:, 1]) / MM
+    return side * 0.5 * np.asarray(fn(r_m), dtype=float) * MM
+
+
 def load_gap_lines(pkl_path: Path):
     """The RF gap centre lines of the optimizer's winning geometry.
 
@@ -116,6 +140,7 @@ def load_gap_lines(pkl_path: Path):
     # below. The radii must also be strictly increasing between r_min and r_max.
     dees = create_dee_system(R_MIN, R_MAX, DEE_CENTER_ANGLES, DEE_OPENING_ANGLE,
                              voltage=CAVITY_VOLTAGE, harmonic=HARMONIC, gap_width=GAP_WIDTH,
+                             gap_angle_deg=GAP_ANGLE_DEG, gap_width_min=GAP_WIDTH_MIN,
                              n_variable_segments=n_seg,
                              segment_angles=list(geom['segment_angles_per_gap'][0]),
                              segment_radii=list(geom['segment_radii_per_gap'][0]))
@@ -128,6 +153,17 @@ def load_gap_lines(pkl_path: Path):
         cav.update_geometry(segment_angles=list(geom['segment_angles_per_gap'][g]),
                             segment_radii=list(geom['segment_radii_per_gap'][g]),
                             segment_rotations=(list(rots[g]) if rots else None))
+    # The gap LAW comes from this module, not from the pickle - old results carry no record of
+    # the width they were optimized with. A geometry optimized under the flat 10 mm gap and
+    # rebuilt here gets the angular law instead, so its boundaries move. Say so loudly: it
+    # changes the geometry, and a silent change is how a rebuilt config stops matching its own
+    # tracking results.
+    _law = (f"angular {GAP_ANGLE_DEG:g} deg floored at {GAP_WIDTH_MIN * MM:.2f} mm"
+            f"  -> {dees.gaps[0].gap_width_at(0.080) * MM:.2f} mm at r = 80 mm, "
+            f"{dees.gaps[0].gap_width_at(0.200) * MM:.2f} mm at r = 200 mm")
+    print(f"  gap width law: {_law}")
+    print(f"  NOTE: the law is this module's, not the pickle's. A geometry optimized under a "
+          f"different gap width rebuilds with DIFFERENT boundaries.")
     return dees, geom, result
 
 
@@ -1368,10 +1404,8 @@ def dee_boundaries(dees: DeeSystem, wall: np.ndarray, r_max: float = R_MAX_DEE_M
     # clipping first leaves the boundary ends off the arc they have to meet.
     bnd = []
     for g, cav in enumerate(dees.gaps):
-        if getattr(cav, 'gap_width_inner', None) is not None:
-            raise NotImplementedError("tapered gap: offset the local width, as offset_gap_boundary does")
         s = +1.0 if g % 2 == 0 else -1.0
-        bnd.append(_clip_outer(offset_polyline(raw[g], s * 0.5 * cav.gap_width * MM), r_max))
+        bnd.append(_clip_outer(offset_polyline(raw[g], _half_width_mm(cav, raw[g], s)), r_max))
 
     inner = {}
     full = [b.copy() for b in bnd]
@@ -1618,7 +1652,7 @@ def dummy_boundaries(dees: DeeSystem, wall: np.ndarray, r_max: float = R_MAX_DEE
         for g, s in ((g_lo, +1.0), (g_hi, -1.0)):
             cav = dees.gaps[g]
             ch, _, _ = gap_centre_line(cav, junction_tol, r_max=None)
-            off = _clip_outer(offset_polyline(ch, s * 0.5 * cav.gap_width * MM), r_max)
+            off = _clip_outer(offset_polyline(ch, _half_width_mm(cav, ch, s)), r_max)
             off, d0, _ = _reach_inner(off, wall, -abs(overlap))
             chains.append(ch)
             offs.append((off, d0))
