@@ -200,7 +200,20 @@ def offset_gap_boundary(cavity, side: float, merge_tol: float = 5e-4) -> np.ndar
     # radius at which the wedge meets its floor, r = gap_width_min / gap_angle
     r_break = (float(cavity.gap_width_min) / float(angle) if angle is not None
                else cavity.gap_taper_radius)
-    pts = _densify_polyline_inner(pts, r_break, max_ds=0.005)
+    # How finely to resample differs between the two laws, and getting it wrong is expensive
+    # rather than visibly wrong:
+    #   TAPER    the width varies BELOW gap_taper_radius, so that part is resampled; above it
+    #            the width is constant and the offset of a straight edge is exact.
+    #   ANGULAR  the width is CONSTANT below r_break (the floor) and LINEAR IN R above it. A
+    #            linear-in-r offset of a straight edge is exact with vertices only at the kinks
+    #            - the same argument _densify_polyline_inner already makes for the taper's outer
+    #            part - so NOTHING here needs resampling, only a vertex at the kink. An infinite
+    #            max_ds gives exactly that (n_sub collapses to 1).
+    # Resampling the angular law anyway bought no accuracy and tripled the 2D BEM element count
+    # (28,104 -> 94,250 on e016e), which at n^3 is ~40x the solve time: a dense pass went from
+    # 11 minutes to over 100.
+    pts = _densify_polyline_inner(pts, r_break,
+                                  max_ds=(np.inf if angle is not None else 0.005))
     radii = np.hypot(pts[:, 0], pts[:, 1])
     return offset_polyline(pts, side * 0.5 * cavity.gap_width_at(radii))
 
