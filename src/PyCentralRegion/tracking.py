@@ -360,16 +360,19 @@ class SpaceChargeKick(Interaction):
     stores in the result metadata under 'space_charge': solve count, timing,
     mean and max |E_sc| on the bunch, the bunch rms size at each solve (cells
     per sigma is the resolution check) and the solver's own summary.
+
+    ``move=True`` rotates the stored per-particle fields with the bunch's mean direction between solves (see
+    ``step``); the numba fast path does not reproduce it and falls back to the general path.
     """
 
     def __init__(self, solver, resolve_every: int = 8, macro_charge_c: Optional[float] = None,
                  bunch_current_a: Optional[float] = None, bunch_frequency_hz: Optional[float] = None,
                  charge_scale: float = 1.0, kick_z: bool = False, min_particles: int = 2,
-                 exempt_ref: bool = True, verbose: bool = False, log_limit: int = 20000):
+                 exempt_ref: bool = True, verbose: bool = False, log_limit: int = 20000, move: bool = False):
         if not hasattr(solver, 'solve_eb'):
             raise TypeError("solver must provide solve_eb(positions, charges, velocities) -> (E, B)")
         self.solver = solver
-        self.move = os.environ.get('HCHC60_SC_MOVE', '0') == '1'   # 2026-09-16: self-field carried with the bunch
+        self.move = bool(move)   # 2026-09-16: self-field carried with the bunch between solves
         self._c0 = None
         self.every = max(1, int(resolve_every))
         self.macro_charge_c = macro_charge_c
@@ -539,7 +542,7 @@ class SpaceChargeKick(Interaction):
         if step % self.every == 0:
             self._solve(step, r, v, active, t)
         elif self.move and getattr(self, '_c0', None) is not None:
-            # 2026-09-16 (HCHC60_SC_MOVE): the stored per-particle vectors of the last solve are ROTATED with the mean
+            # 2026-09-16 (move=True): the stored per-particle vectors of the last solve are ROTATED with the mean
             # direction of the bunch since the solve (the same particles then and now), so the kick turns with the
             # orbit between solves; each particle still carries the field of its own solve position (self-force-free -
             # a re-gather at a mapped-back point picks up the particle's own charge cloud, 1.1 mm off the every-step

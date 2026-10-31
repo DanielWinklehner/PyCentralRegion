@@ -550,6 +550,7 @@ def build_electrodes_3d(model2d: ElectrodeModel,
                         edge_fillet: Optional[float] = None,
                         heal_tolerance: Optional[float] = None,
                         voltage_profile=None,
+                        geometry_out: Optional[str] = None,
                         verbose: bool = True) -> ElectrodeModel:
     """Closed 3D metal solids from the 2D footprints + vertical profiles -> surface mesh.
 
@@ -590,6 +591,8 @@ def build_electrodes_3d(model2d: ElectrodeModel,
         OCC shape-healing tolerance [m] applied to the finished solids
         (removes sliver edges / faces the booleans may leave). Off by default.
     voltage_profile : see ``gap_fields.build_gap_electrodes``.
+    geometry_out : str, optional
+        Path prefix: write the finished solids (before meshing) to ``<prefix>.brep`` and ``<prefix>.step`` [mm].
     """
     import gmsh
     t_start = time.time()
@@ -913,15 +916,13 @@ def build_electrodes_3d(model2d: ElectrodeModel,
     # The OCC solids exist here as real BREP with the physical groups already assigned, so this
     # writes the geometry that is ACTUALLY meshed rather than a re-derivation of it. Coordinates
     # are in mm (the builder works in mm internally).
-    _geom_out = os.environ.get('HCHC60_BEM3D_GEOM_OUT', '').strip()
-    if _geom_out:
-        import os as _os
-        _os.makedirs(_os.path.dirname(_geom_out) or '.', exist_ok=True)
+    if geometry_out:
+        os.makedirs(os.path.dirname(geometry_out) or '.', exist_ok=True)
         for _ext in ('brep', 'step'):
             try:
-                gmsh.write(f"{_geom_out}.{_ext}")
+                gmsh.write(f"{geometry_out}.{_ext}")
                 if verbose:
-                    print(f"[electrodes3d] wrote {_geom_out}.{_ext} (CAD, pre-mesh, mm)")
+                    print(f"[electrodes3d] wrote {geometry_out}.{_ext} (CAD, pre-mesh, mm)")
             except Exception as _exc:                      # noqa: BLE001
                 warnings.warn(f"geometry export to .{_ext} failed: {type(_exc).__name__}: {_exc}",
                               stacklevel=2)

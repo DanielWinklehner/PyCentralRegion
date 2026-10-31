@@ -1633,7 +1633,7 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
         if not hasattr(sc.solver, 'gather'):
             raise FastPathUnavailable("space-charge solver without gather()")
         if getattr(sc, 'move', False):
-            # HCHC60_SC_MOVE rotates the stored per-particle E_sc/B_sc with the
+            # SpaceChargeKick(move=True) rotates the stored per-particle E_sc/B_sc with the
             # bunch's mean direction on EVERY step between solves, so the kernel's
             # "the solve's field is frozen until the next solve" no longer holds
             # and every step would have to be a chunk boundary. Reproducing the
@@ -1641,7 +1641,7 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
             # one Rodrigues formula over the mean velocity of the solve's own
             # particle set); until then these runs take the general path.
             raise FastPathUnavailable(
-                "SpaceChargeKick.move (HCHC60_SC_MOVE=1): the stored self-field is "
+                "SpaceChargeKick(move=True): the stored self-field is "
                 "rotated every step, which the chunked kernel does not reproduce")
 
     # terminators: at most one MetalTerminator, no collimator

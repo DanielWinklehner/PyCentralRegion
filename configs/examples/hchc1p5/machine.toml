@@ -1,0 +1,35 @@
+# Worked example: HCHC-1.5 (H2+, h = 4, four radial dees, ~7 turns to ~3.1 MeV) with the WiderNoses magnet map and the
+# sp1Lo_c1 spiral-inflector hand-off. This file holds what the designs share (machine, magnet, injected beam);
+# a design file includes it and adds its gap geometry (seed), electrode options and run settings.
+
+include = ["../../defaults/core.toml"]
+
+[run]
+cache_dir = "E:/HCHC1.5/_fieldcache"
+
+[paths]
+bfield_3d = "E:/HCHC1.5/Fieldmaps/20261028_HCHC-1.5_3D_FullCyclo_Res1mm_z3cm_xy40cm_IBA_BH_CutPoles_WiderNoses_zSym_BCS.txt"
+bfield_2d = "E:/HCHC1.5/Results/CR/fieldmaps_derived/20261028_HCHC1.5_2D_MidPlane_from3D_Res1mm_xy40cm_CutPoles_WiderNoses_zSym_BCS.comsol"
+handoff = "E:/HCHC1.5/Results/CR/handoff_sp1Lo_R10_centroid.h5"            # 97958 particles, 8.03 mA
+inflector_efield = "E:/HCHC1.5/Results/triplet/sp1Lo_c1/export_baseline_levelled/efield_fine_best_baseline.pickle"
+housing_step = "E:/HCHC1.5/Results/triplet/sp1Lo_c1/export_baseline_levelled/steps_baseline_mm/002_Housing.stp"
+housing_outline = "E:/HCHC1.5/Results/triplet/sp1Lo_c1/export_baseline_levelled/steps_baseline_mm/housing_outline.txt"
+
+[machine]
+species = "H2_1+"
+harmonic = 4
+n_dees = 4
+dee_shape = "radial"
+dee_center_angles_deg = [45.0, 135.0, 225.0, 315.0]
+dee_opening_deg = 42.0
+dee_voltage_kv = 65.0
+design_voltage_kv = 60.0
+r_max_cavity_m = 0.37
+r_max_m = 0.38
+z_max_m = 0.030
+target_energy_mev = 3.0
+
+[magnet]
+sign = 1.0
+scale = 1.0
+crop_r_m = 0.40
