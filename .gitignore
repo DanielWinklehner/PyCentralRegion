@@ -5,7 +5,7 @@
 /create_md.py
 /codebase.md
 /build/
-/tests/
+/tests/local/
 /src/PyCentralRegion.egg-info/
 __pycache__/
 *.pyc

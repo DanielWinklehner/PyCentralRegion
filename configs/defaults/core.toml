@@ -1,0 +1,101 @@
+# Defaults of the core pipeline sections: [run], [paths], [machine], [magnet], [inflector], [fields], [track].
+# A run file includes what it needs and sets only what differs, e.g.
+#     include = ["../../defaults/core.toml"]
+#     [run]
+#     name = "my_design"
+# tests/unit/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/config.py.
+
+[run]
+name = ""                   # run name; output files carry it
+out_dir = ""                # results folder
+cache_dir = ""              # field-map crops and other reusable caches
+
+[paths]                     # relative paths are taken relative to the file that sets them; "" = not given
+bfield_3d = ""              # 3D magnet map (COMSOL text export: x y z Bx By Bz)
+bfield_2d = ""              # midplane magnet map (optional: midplane check of the 3D crop)
+seed = ""                   # gap-geometry optimizer result (.pkl): gap lines, reference orbit, phase, f_rev
+handoff = ""                # injected bunch: openPMD plane-crossing file of the spiral inflector (.h5)
+inflector_efield = ""       # spiral-inflector static E-field (.pickle, PyPATools Field)
+housing_step = ""           # spiral-inflector housing solid (.stp)
+housing_outline = ""        # housing outline at the midplane (.txt), read by the electrode builder
+model3d = ""                # 3D electrode model (.pkl); written by `pcr build`
+fields = ""                 # BEM field cache (.pkl); written by `pcr fields`
+
+[machine]
+species = "H2_1+"           # PyPATools species name
+harmonic = 4                # RF harmonic h
+n_dees = 4                  # number of dees; 4-fold symmetric machines are supported
+dee_shape = "radial"        # "radial": gap lines made of straight segments; "spiral" is not supported yet
+dee_center_angles_deg = [45.0, 135.0, 225.0, 315.0]
+dee_opening_deg = 42.0      # angular width of every dee
+dee_voltage_kv = 65.0       # dee voltage the electrode model is built (and the BEM field normalised) at
+design_voltage_kv = 60.0    # dee voltage of the 1D gap model the seed geometry was optimized with
+gap_width_m = 0.01          # nominal gap width of the dee-system template
+gap_angle_deg = 2.5         # gap width law: max(gap_width_min_m, r * gap_angle_deg)
+gap_width_min_m = 0.0065
+r_min_m = 0.005             # inner end of the gap lines
+r_max_cavity_m = 0.37       # outer end of the gap lines
+r_max_m = 0.38              # tracking: particles beyond this radius are lost
+z_max_m = 0.030             # tracking: particles beyond |z| are lost
+target_energy_mev = 3.0
+n_turns_design = 6          # turns of the seed optimization (used to rebuild its dee system)
+skip_turns_design = 1
+
+[magnet]
+sign = 1.0                  # multiplies the map (its Bz sign vs the tracker's convention)
+scale = 1.0                 # multiplies the map
+crop_r_m = 0.40             # radius of the 3D crop kept in memory
+flatten_r_m = 0.0           # > 0: flatten the central field inside this radius (Maxwell-consistent); 0 = off
+
+[inflector]
+rotation_deg = 0.0          # rotation of the spiral inflector about the machine axis (field, housing, bunch)
+refine = 4                  # E-field grid refinement before a rotation
+refine_z_max_m = 0.030      # |z| kept when refining
+zshift_m = 0.0              # vertical shift of the inflector field
+flip_z = false
+housing_scale = 0.001       # housing STEP units -> m
+
+[fields]                    # BEM solve and field grid
+dxy_m = 0.0015              # grid spacing in x and y
+margin_m = 0.005            # grid half-width = model r_cut + margin
+z_half_m = 0.028            # grid covers |z| <= z_half_m
+dz_m = 0.002
+stack_z_half_m = 0.030      # metal raster used as the obstacle test: |z| range and spacings
+stack_dz_m = 0.001
+stack_dxy_m = 0.0005
+max_elements = 80000        # refuse larger meshes
+tol = 1e-5                  # GMRES tolerance
+solver = "auto"             # auto | cupy | scipy | strong | dense
+pot_device = "gpu"          # potential evaluation on cpu | gpu
+pot_precision = "single"    # single | double
+pot_chunk = 250000          # points per potential batch
+pot_check = 3000            # points re-evaluated in double precision as a check
+gpu_fit_safety = 1.05       # GPU memory head-room factor of the potential batches
+
+[track]                     # bunch tracking
+pusher = "boris_rel"
+steps_per_turn = 1000
+turns = 8
+fast3d = true               # numba 3D fast path
+fast3d_interp = "point"
+volt_scale = 1.0            # dee voltage / the model's voltage
+phases_deg = []             # RF phases of the phase scan; empty = the seed's phase only
+n_scan = 4000               # particles per phase-scan run
+n_final = 0                 # particles of the final run; 0 = the whole hand-off bunch
+seed_scan = 0               # bunch sampling seeds
+seed_final = 2
+sc = true                   # space charge
+sc_cells = 64               # FFT grid cells per axis (0 = from sc_h_m)
+sc_every = 5                # steps between Poisson solves
+sc_final_cells = 128        # the final run's grid and solve interval
+sc_final_every = 1
+sc_h_m = 0.0                # FFT cell size when sc_cells = 0
+sc_max_cells = 0            # cap on the cells per axis (0 = none)
+sc_window_q = 0.002         # outlier quantile cut of the FFT window
+sc_frame = "bunch"          # "bunch" (grid along the bunch) | "lab"
+sc_gpu = true
+sc_current_ma = 0.0         # 0 = the hand-off file's current
+n_tracks = 20000            # particles whose full tracks are stored (final run)
+track_every = 4             # steps between stored track points
+probes_deg = [25.0, 45.0]   # azimuths of the radial probes (final run)
+snapshot_ns = []            # times [ns] of full-beam snapshots (final run)

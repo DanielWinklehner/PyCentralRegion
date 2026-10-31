@@ -1,0 +1,321 @@
+"""Run configuration: TOML files -> one nested dict -> typed sections.
+
+A run is described by one TOML file. It may name other files in a top-level ``include = [...]`` (paths relative to
+the including file); the including file wins over what it includes, later includes win over earlier ones, and
+command-line overrides (``section.key=value``, the value parsed as TOML, else taken as a string) win over all files.
+
+Each stage reads its own section into the dataclass its module defines::
+
+    cfg = load('run.toml', overrides=['track.turns=4'])
+    track = section(cfg, 'track', TrackConfig)
+
+``section`` rejects keys the dataclass does not define, so a misspelt key fails instead of being ignored. The
+documented defaults of every section are in ``configs/defaults/<section>.toml``; ``SECTIONS`` maps a section name to
+its dataclass (imported only when asked for, so this module needs nothing beyond the standard library).
+
+Paths: in the ``[paths]`` section, and for any key ending in ``_path``, ``_dir`` or ``_file`` anywhere, a relative
+path is taken relative to the file that sets it. An empty string means "not given".
+"""
+import copy
+import dataclasses
+import importlib
+import json
+import tomllib
+import typing
+from pathlib import Path
+
+PATH_SUFFIXES = ('_path', '_dir', '_file')
+
+# section name -> 'module:Class' of its dataclass
+SECTIONS = {
+    'run': 'PyCentralRegion.config:RunConfig',
+    'paths': 'PyCentralRegion.config:PathsConfig',
+    'machine': 'PyCentralRegion.config:MachineConfig',
+    'magnet': 'PyCentralRegion.config:MagnetConfig',
+    'inflector': 'PyCentralRegion.config:InflectorConfig',
+    'geometry': 'PyCentralRegion.geometry.options:GeometryConfig',
+    'fields': 'PyCentralRegion.config:FieldsConfig',
+    'track': 'PyCentralRegion.config:TrackConfig',
+    'btrim': 'PyCentralRegion.btrim:BTrimConfig',
+    'score': 'PyCentralRegion.analysis.objectives:ScoreConfig',
+    'mobo': 'PyCentralRegion.mobo.space:MoboConfig',
+}
+
+
+class ConfigError(ValueError):
+    pass
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# loading
+def load(path, overrides=()):
+    """Read a TOML run file (with its includes) and apply ``key=value`` overrides. Returns a plain nested dict."""
+    path = Path(path).resolve()
+    cfg = _load_file(path, ())
+    for item in overrides:
+        keys, value = parse_override(item)
+        set_dotted(cfg, keys, value)
+    cfg['_source'] = str(path)
+    return cfg
+
+
+def _load_file(path, seen):
+    if path in seen:
+        raise ConfigError(f"include loop: {' -> '.join(map(str, seen + (path,)))}")
+    with open(path, 'rb') as fh:
+        try:
+            data = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as ex:
+            raise ConfigError(f"{path}: {ex}") from None
+    _resolve_paths(data, path.parent, in_paths=False)
+    includes = data.pop('include', [])
+    if isinstance(includes, str):
+        includes = [includes]
+    base = {}
+    for inc in includes:
+        base = merge(base, _load_file((path.parent / inc).resolve(), seen + (path,)))
+    return merge(base, data)
+
+
+def _resolve_paths(node, folder, in_paths):
+    for key, value in node.items():
+        if isinstance(value, dict):
+            _resolve_paths(value, folder, in_paths=in_paths or key == 'paths')
+        elif isinstance(value, str) and value and (in_paths or key.endswith(PATH_SUFFIXES)):
+            p = Path(value)
+            node[key] = str(p if p.is_absolute() else (folder / p).resolve())
+
+
+def merge(base, top):
+    """Deep merge of two config dicts: tables merge key by key, everything else (arrays included) is replaced."""
+    out = copy.deepcopy(base)
+    for key, value in top.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = merge(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def parse_override(item):
+    """'track.turns=4' -> (['track', 'turns'], 4). The value is parsed as a TOML value, else kept as a string."""
+    if '=' not in item:
+        raise ConfigError(f"override {item!r} is not key=value")
+    key, raw = item.split('=', 1)
+    keys = [k.strip() for k in key.strip().split('.')]
+    if not all(keys):
+        raise ConfigError(f"override {item!r}: empty key")
+    try:
+        value = tomllib.loads(f"v = {raw.strip()}")['v']
+    except tomllib.TOMLDecodeError:
+        value = raw.strip()
+    return keys, value
+
+
+def get_dotted(cfg, keys, default=None):
+    node = cfg
+    for k in (keys.split('.') if isinstance(keys, str) else keys):
+        if not isinstance(node, dict) or k not in node:
+            return default
+        node = node[k]
+    return node
+
+
+def set_dotted(cfg, keys, value):
+    keys = keys.split('.') if isinstance(keys, str) else list(keys)
+    node = cfg
+    for k in keys[:-1]:
+        node = node.setdefault(k, {})
+        if not isinstance(node, dict):
+            raise ConfigError(f"cannot set {'.'.join(keys)}: {k} is not a table")
+    node[keys[-1]] = value
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# typed sections
+def section_class(name):
+    if name not in SECTIONS:
+        raise ConfigError(f"unknown section [{name}]; known: {', '.join(SECTIONS)}")
+    module, cls = SECTIONS[name].split(':')
+    return getattr(importlib.import_module(module), cls)
+
+
+def section(cfg, name, cls=None):
+    """The [name] table of cfg as an instance of its dataclass (defaults for missing keys, error on unknown ones)."""
+    cls = cls or section_class(name)
+    data = cfg.get(name, {}) if isinstance(cfg, dict) else {}
+    return from_dict(cls, data, where=f"[{name}]")
+
+
+def from_dict(cls, data, where=''):
+    if not isinstance(data, dict):
+        raise ConfigError(f"{where}: expected a table, got {type(data).__name__}")
+    fields = {f.name: f for f in dataclasses.fields(cls)}
+    unknown = sorted(set(data) - set(fields))
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}; known: {', '.join(fields)}")
+    hints = typing.get_type_hints(cls)
+    kwargs = {}
+    for name, value in data.items():
+        kwargs[name] = _coerce(hints.get(name), _default_of(fields[name]), value, f"{where} {name}")
+    return cls(**kwargs)
+
+
+def _default_of(field):
+    if field.default is not dataclasses.MISSING:
+        return field.default
+    if field.default_factory is not dataclasses.MISSING:
+        return field.default_factory()
+    return dataclasses.MISSING
+
+
+def _coerce(hint, default, value, where):
+    """Light coercion of TOML values to the field's type: int -> float, list -> tuple, table -> nested dataclass,
+    list of tables -> list of dataclasses (when the annotation says so)."""
+    origin = typing.get_origin(hint)
+    args = typing.get_args(hint)
+    if dataclasses.is_dataclass(hint) and isinstance(value, dict):
+        return from_dict(hint, value, where)
+    if origin in (list, tuple) and args and dataclasses.is_dataclass(args[0]) and isinstance(value, list):
+        items = [from_dict(args[0], v, f"{where}[{i}]") for i, v in enumerate(value)]
+        return tuple(items) if origin is tuple else items
+    if (hint is float or isinstance(default, float)) and isinstance(value, int) and not isinstance(value, bool):
+        return float(value)
+    if (origin is tuple or isinstance(default, tuple)) and isinstance(value, list):
+        return tuple(value)
+    return value
+
+
+def to_dict(obj):
+    """A section dataclass (or any nested mix of dataclasses, tuples and dicts) as plain JSON-able data."""
+    if dataclasses.is_dataclass(obj):
+        return {f.name: to_dict(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
+    if isinstance(obj, (list, tuple)):
+        return [to_dict(v) for v in obj]
+    if isinstance(obj, dict):
+        return {k: to_dict(v) for k, v in obj.items()}
+    return obj
+
+
+def save_resolved(cfg, path):
+    """Write the fully merged config as JSON next to a run's outputs (what the run actually used)."""
+    with open(path, 'w') as fh:
+        json.dump(cfg, fh, indent=1, sort_keys=True)
+
+
+def require(value, what):
+    """Return a given path, or fail with a message naming the missing config key."""
+    if not value:
+        raise ConfigError(f"{what} is not set")
+    return value
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# sections of the core pipeline (the geometry, B-trim, score and MOBO sections live with their modules)
+@dataclasses.dataclass
+class RunConfig:
+    name: str = ''                   # run name; output files carry it
+    out_dir: str = ''                # results folder
+    cache_dir: str = ''              # field-map crops and other reusable caches
+
+
+@dataclasses.dataclass
+class PathsConfig:
+    bfield_3d: str = ''              # 3D magnet map (COMSOL text export, x y z Bx By Bz)
+    bfield_2d: str = ''              # midplane magnet map (optional: midplane check of the 3D crop)
+    seed: str = ''                   # gap-geometry optimizer result (.pkl): gap lines, reference orbit, phase, f_rev
+    handoff: str = ''                # injected bunch: openPMD plane-crossing file of the spiral inflector (.h5)
+    inflector_efield: str = ''       # spiral-inflector static E-field (.pickle, PyPATools Field)
+    housing_step: str = ''           # spiral-inflector housing solid (.stp)
+    housing_outline: str = ''        # housing outline at the midplane (.txt) for the electrode builder
+    model3d: str = ''                # 3D electrode model (.pkl, ElectrodeModel); written by `pcr build`
+    fields: str = ''                 # BEM field cache (.pkl); written by `pcr fields`
+
+
+@dataclasses.dataclass
+class MachineConfig:
+    species: str = 'H2_1+'           # PyPATools species name
+    harmonic: int = 4                # RF harmonic h
+    n_dees: int = 4                  # dees (4-fold symmetric machines are supported)
+    dee_shape: str = 'radial'        # 'radial' (gap lines from straight segments); 'spiral' is not supported yet
+    dee_center_angles_deg: tuple = (45.0, 135.0, 225.0, 315.0)
+    dee_opening_deg: float = 42.0    # angular width of every dee
+    dee_voltage_kv: float = 65.0     # dee voltage the electrode model is built (and the BEM normalised) at
+    design_voltage_kv: float = 60.0  # dee voltage of the 1D gap model the seed geometry was optimized with
+    gap_width_m: float = 0.01        # nominal gap width of the dee-system template
+    gap_angle_deg: float = 2.5       # gap width law: max(gap_width_min, r * gap_angle)
+    gap_width_min_m: float = 6.5e-3
+    r_min_m: float = 0.005           # inner end of the gap lines
+    r_max_cavity_m: float = 0.37     # outer end of the gap lines
+    r_max_m: float = 0.38            # tracking: particles beyond this radius are lost
+    z_max_m: float = 0.030           # tracking: particles beyond |z| are lost
+    target_energy_mev: float = 3.0
+    n_turns_design: int = 6          # turns of the seed optimization (rebuilds its dee system)
+    skip_turns_design: int = 1
+
+
+@dataclasses.dataclass
+class MagnetConfig:
+    sign: float = 1.0                # multiplies the map (the map's Bz sign vs the tracker's convention)
+    scale: float = 1.0               # multiplies the map (field-level tuning)
+    crop_r_m: float = 0.40           # radius of the 3D crop kept in memory
+    flatten_r_m: float = 0.0         # > 0: flatten the central field inside this radius (Maxwell-consistent); 0 = off
+
+
+@dataclasses.dataclass
+class InflectorConfig:
+    rotation_deg: float = 0.0        # rotation of the spiral inflector about the machine axis (field, housing, bunch)
+    refine: int = 4                  # E-field grid refinement before a rotation (trilinear interpolation stays exact)
+    refine_z_max_m: float = 0.030    # |z| kept when refining
+    zshift_m: float = 0.0            # vertical shift of the inflector field
+    flip_z: bool = False
+    housing_scale: float = 1e-3      # housing STEP units -> m
+
+
+@dataclasses.dataclass
+class FieldsConfig:
+    dxy_m: float = 0.0015            # BEM field grid spacing in x and y
+    margin_m: float = 0.005          # grid half-width = model r_cut + margin
+    z_half_m: float = 0.028          # grid covers |z| <= z_half
+    dz_m: float = 0.002
+    stack_z_half_m: float = 0.030    # metal raster (obstacle test): |z| range, spacing
+    stack_dz_m: float = 0.001
+    stack_dxy_m: float = 5e-4
+    max_elements: int = 80000        # refuse larger meshes
+    tol: float = 1e-5                # GMRES tolerance
+    solver: str = 'auto'             # BEM solver backend: auto | cupy | scipy | strong | dense
+    pot_device: str = 'gpu'          # potential evaluation: cpu | gpu
+    pot_precision: str = 'single'    # single | double
+    pot_chunk: int = 250000          # points per potential batch
+    pot_check: int = 3000            # points re-evaluated in double precision as a check
+    gpu_fit_safety: float = 1.05     # GPU memory head-room factor of the potential batches
+
+
+@dataclasses.dataclass
+class TrackConfig:
+    pusher: str = 'boris_rel'
+    steps_per_turn: int = 1000
+    turns: int = 8
+    fast3d: bool = True              # numba 3D fast path
+    fast3d_interp: str = 'point'
+    volt_scale: float = 1.0          # dee voltage / the model's voltage
+    phases_deg: tuple = ()           # RF phases of the phase scan; empty = the seed's phase only
+    n_scan: int = 4000               # particles per phase-scan run
+    n_final: int = 0                 # particles of the final run; 0 = the whole hand-off bunch
+    seed_scan: int = 0               # bunch sampling seeds
+    seed_final: int = 2
+    sc: bool = True                  # space charge
+    sc_cells: int = 64               # FFT grid cells per axis (0 = from sc_h_m)
+    sc_every: int = 5                # steps between Poisson solves
+    sc_final_cells: int = 128        # the final run's grid and solve interval
+    sc_final_every: int = 1
+    sc_h_m: float = 0.0              # FFT cell size when sc_cells = 0
+    sc_max_cells: int = 0            # cap on the cells per axis (0 = none)
+    sc_window_q: float = 0.002       # outlier quantile cut of the FFT window
+    sc_frame: str = 'bunch'          # 'bunch' (grid along the bunch) | 'lab'
+    sc_gpu: bool = True
+    sc_current_ma: float = 0.0       # 0 = the hand-off file's current
+    n_tracks: int = 20000            # particles whose full tracks are stored (final run)
+    track_every: int = 4             # steps between stored track points
+    probes_deg: tuple = (25.0, 45.0)  # azimuths of the radial probes (final run)
+    snapshot_ns: tuple = ()          # times [ns] of full-beam snapshots (final run)

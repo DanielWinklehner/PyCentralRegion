@@ -1,63 +1,78 @@
-from .seo_finder import *
-from .central_region import *
-from .rf_cavity import (RFCavity, DeeSystem, create_dee_system,
-                        create_double_gap_cavity, create_four_cavity_system,
-                        snap_nodes_between_turns, check_variable_segments)
-from .tracking import (TrackingEngine, TrackingResult, track_single_particle,
-                       RadialSlitCollimator, MetalTerminator, TimedRelease)
-from . import handoff
-from .handoff import load_handoff, make_beam_from_handoff
-from .accelerated_orbit_finder import (AcceleratedOrbitFinder, OptimizedOrbit,
-                                       make_beam_from_state, make_single_particle_beam,
-                                       make_gaussian_beam, make_beam_from_cylindrical)
-from .cavity_optimizer import CavityGeometryOptimizer
-from . import diagnostics
-from . import gap_fields
-from .gap_fields import VoltageProfile
-from . import electrodes3d
-from .electrodes3d import (HeightProfiles, Bar, Post, Patch, ExtraSolid, build_electrodes_3d,
-                           auto_bars, bar_clearances, midplane_obstacles, raster_obstacles,
-                           combine_obstacles, check_trajectory_clearance)
-from . import polyprism
-from . import inflector
-from .inflector import (InflectorModel, load_inflector_field, midplane_field, housing_mesh,
-                        housing_section, StaticPlusRFField, superpose_efield)
-from . import closed_orbit
-from .closed_orbit import (CartesianMidplane, PolarMidplane, closed_orbits,
-                           orbits_at_radii)
+"""PyCentralRegion: central-region design for compact cyclotrons (orbits, RF gaps, 3D electrodes, BEM fields,
+bunch tracking with space charge, beam-quality scoring and multi-objective optimisation).
 
-__all__ = [
+Importing the package is cheap. The physics modules (numba, PyPATools, bempp, gmsh) load the first time one of their
+names is used, so the configuration, analysis and optimisation layers (``config``, ``analysis``, ``mobo``) also work
+in environments without the physics stack. ``from PyCentralRegion import X`` behaves as before.
+"""
+import importlib
+
+# public name -> submodule that defines it
+_EXPORTS = {
     # seo_finder
-    'SEOFinder', 'StaticOrbit', 'PoincarePoint',
-    'save_seo_database', 'load_seo_database', 'analyze_isochronism',
+    'SEOFinder': 'seo_finder', 'StaticOrbit': 'seo_finder', 'PoincarePoint': 'seo_finder',
+    'save_seo_database': 'seo_finder', 'load_seo_database': 'seo_finder', 'analyze_isochronism': 'seo_finder',
     # central_region
-    'CentralRegion',
+    'CentralRegion': 'central_region',
     # rf_cavity
-    'RFCavity', 'DeeSystem', 'create_dee_system',
-    'create_double_gap_cavity', 'create_four_cavity_system',
-    'snap_nodes_between_turns', 'check_variable_segments',
+    'RFCavity': 'rf_cavity', 'DeeSystem': 'rf_cavity', 'create_dee_system': 'rf_cavity',
+    'create_double_gap_cavity': 'rf_cavity', 'create_four_cavity_system': 'rf_cavity',
+    'snap_nodes_between_turns': 'rf_cavity', 'check_variable_segments': 'rf_cavity',
     # tracking
-    'TrackingEngine', 'TrackingResult', 'track_single_particle',
-    'RadialSlitCollimator', 'MetalTerminator', 'TimedRelease',
+    'TrackingEngine': 'tracking', 'TrackingResult': 'tracking', 'track_single_particle': 'tracking',
+    'RadialSlitCollimator': 'tracking', 'MetalTerminator': 'tracking', 'TimedRelease': 'tracking',
     # handoff (spiral-inflector hand-off bunches, staggered launch)
-    'load_handoff', 'make_beam_from_handoff', 'handoff',
-    # electrodes3d (3D electrode solids, bars, obstacle / clearance checks)
-    'HeightProfiles', 'Bar', 'Post', 'ExtraSolid', 'build_electrodes_3d',
-    'auto_bars', 'bar_clearances', 'midplane_obstacles', 'raster_obstacles',
-    'combine_obstacles', 'check_trajectory_clearance',
-    # inflector (static field + housing + bunch of the spiral inflector in the CR model)
-    'InflectorModel', 'load_inflector_field', 'midplane_field', 'housing_mesh',
-    'housing_section', 'StaticPlusRFField', 'superpose_efield',
+    'load_handoff': 'handoff', 'make_beam_from_handoff': 'handoff',
     # accelerated_orbit_finder
-    'AcceleratedOrbitFinder', 'OptimizedOrbit',
-    'make_beam_from_state', 'make_single_particle_beam', 'make_gaussian_beam',
-    'make_beam_from_cylindrical',
+    'AcceleratedOrbitFinder': 'accelerated_orbit_finder', 'OptimizedOrbit': 'accelerated_orbit_finder',
+    'make_beam_from_state': 'accelerated_orbit_finder', 'make_single_particle_beam': 'accelerated_orbit_finder',
+    'make_gaussian_beam': 'accelerated_orbit_finder', 'make_beam_from_cylindrical': 'accelerated_orbit_finder',
     # cavity_optimizer
-    'CavityGeometryOptimizer',
-    # closed_orbit (Gordon polar closed-orbit solver)
-    'CartesianMidplane', 'PolarMidplane', 'closed_orbits', 'orbits_at_radii',
+    'CavityGeometryOptimizer': 'cavity_optimizer',
     # gap_fields (radial dee-voltage shape for the BEM Dirichlet data)
-    'VoltageProfile',
-    # submodules
-    'diagnostics', 'gap_fields', 'closed_orbit', 'electrodes3d', 'polyprism', 'inflector',
-]
+    'VoltageProfile': 'gap_fields',
+    # electrodes3d (3D electrode solids, bars, obstacle / clearance checks)
+    'HeightProfiles': 'electrodes3d', 'Bar': 'electrodes3d', 'Post': 'electrodes3d', 'Patch': 'electrodes3d',
+    'ExtraSolid': 'electrodes3d', 'build_electrodes_3d': 'electrodes3d', 'auto_bars': 'electrodes3d',
+    'bar_clearances': 'electrodes3d', 'midplane_obstacles': 'electrodes3d', 'raster_obstacles': 'electrodes3d',
+    'combine_obstacles': 'electrodes3d', 'check_trajectory_clearance': 'electrodes3d',
+    # inflector (static field + housing + bunch of the spiral inflector in the CR model)
+    'InflectorModel': 'inflector', 'load_inflector_field': 'inflector', 'midplane_field': 'inflector',
+    'housing_mesh': 'inflector', 'housing_section': 'inflector', 'StaticPlusRFField': 'inflector',
+    'superpose_efield': 'inflector',
+    # closed_orbit (Gordon polar closed-orbit solver)
+    'CartesianMidplane': 'closed_orbit', 'PolarMidplane': 'closed_orbit', 'closed_orbits': 'closed_orbit',
+    'orbits_at_radii': 'closed_orbit',
+}
+_SUBMODULES = ('accelerated_orbit_finder', 'analysis', 'btrim', 'cavity_optimizer', 'central_region', 'cli',
+               'closed_orbit', 'config', 'diagnostics', 'electrodes3d', 'fast_track', 'fast_track3d', 'fields3d',
+               'gap_fields', 'geometry', 'handoff', 'inflector', 'machine', 'mobo', 'polyprism', 'rf_cavity',
+               'seo_finder', 'simulate3d', 'tracking')
+# the package used to star-import these two modules: their other public names stay reachable
+_STAR_MODULES = ('seo_finder', 'central_region')
+
+__all__ = list(_EXPORTS) + ['diagnostics', 'gap_fields', 'closed_orbit', 'electrodes3d', 'polyprism', 'inflector',
+                            'handoff']
+
+
+def __getattr__(name):
+    if name in _EXPORTS:
+        value = getattr(importlib.import_module(f'.{_EXPORTS[name]}', __name__), name)
+    elif name in _SUBMODULES:
+        value = importlib.import_module(f'.{name}', __name__)
+    elif not name.startswith('_'):
+        for mod in _STAR_MODULES:
+            module = importlib.import_module(f'.{mod}', __name__)
+            if hasattr(module, name):
+                value = getattr(module, name)
+                break
+        else:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_EXPORTS) | set(_SUBMODULES))
