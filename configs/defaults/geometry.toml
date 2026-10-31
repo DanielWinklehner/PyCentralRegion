@@ -1,0 +1,80 @@
+# Defaults of the [geometry] section: the 3D electrode builder (PyCentralRegion.geometry). Lengths in mm, angles in
+# degrees. The machine (dee angles, harmonic, gap-width law, cavity radius, dee voltage) is [machine], the spiral
+# inflector's rotation [inflector] rotation_deg, the inputs [paths] seed / housing_outline / handoff and the output
+# [paths] model3d. Hardware on a gap edge is placed by arclength along that edge from its inner end, e.g.
+#     [[geometry.posts]]
+#     gap = 1
+#     side = "dee"            # or "dummy": the other side of the same gap
+#     s_mm = 120.0
+#     length_mm = 0.0         # along the edge; 0 = post_size_mm
+#     [[geometry.windows]]    # gap, side, s_lo_mm, s_hi_mm, z_lo_mm, z_hi_mm (the opening)
+#     [[geometry.holes]]      # gap, side, r_mm, s_mm, z_mm, s_lo_mm, s_hi_mm (the plate)
+#     [[geometry.boxes]]      # x_min_mm, x_max_mm, y_min_mm, y_max_mm (grounded collimators)
+#     [[geometry.junctions]]  # gap, r_mm
+#     [[geometry.dee_rmin]]   # dee, r_mm
+# tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/geometry/options.py.
+
+[geometry]
+# gap lines
+snap_nodes = true            # zero inert variable segments, then put the node radii midway between turns
+junctions = []               # after the snap: junctions moved to radii between the 3D beam's passes
+junction_tol_deg = 1.0       # close a variable -> fixed junction whose net angular step is below this
+# spiral inflector
+si_rotation = "inflector"    # "inflector": [inflector] rotation_deg; "corner": gap-0 ray minus the exit spec's azimuth
+gap0_on_plate = false        # re-fit gap 0's variable segment onto the turned exit-plate line
+exit_plane_spec_file = ""    # exit_plane_spec.json; "" = the export folder above the housing outline's
+channel_back_mm = 1.0        # beam channel starts this far upstream of the emitting plane
+channel_extend_mm = 200.0    # ... and runs this far downstream along its normal
+aperture_inset_mm = [0.0, 0.0]   # narrow the exit aperture: off each end of its (longer, shorter) edge
+cluster_tol_mm = 0.5         # outline files without curves: vertices this close to a long face form a cluster
+keep_every = 5               # ... and every Nth loose vertex is a spline knot
+# vertical structure
+half_height_mm = 50.0        # electrodes and housing span z = -H .. +H
+aperture_mm = [40.0, 40.0]   # beam channel full height (inside, outside) the radial taper
+aperture_r_mm = [148.0, 247.0]   # radii where the taper starts and ends
+dummy_aperture_mm = []       # dummy dees' (inside, outside) height; [] = aperture_mm
+# dees
+r_max_mm = 0.0               # dees and model end here; 0 = [machine] r_max_cavity_m
+housing_clearance_mm = 10.0  # the dee metal of gaps 1 .. n stays this far off the housing
+dee_wall_mm = 5.0            # radial thickness of a dee's solid inner wall
+dee_inner = "arc"            # dees 1 .. n-1 close on an "arc" about the axis or "hug" the housing
+hug_ds_mm = 4.0              # "hug": sampling along the closure
+hug_ring_n = 180             # "hug": rays of the end-wall ring
+dee_rmin = []                # inner ends moved out by hand (override pinch / hug)
+dee_tip_width_mm = 4.0       # a pinched dee's tip is cut back to a face this wide; 0 = off
+dummy_tip_width_mm = 4.0     # a dummy tip crossing outside the housing is cut back to this; 0 = vertex
+dummy_overlap_mm = 6.0       # dummy dees reach this far into the housing
+dee0_clearance_mm = 0.0      # cut dee0's tip back until it clears the housing by this; 0 = off
+dee0_trim_mm = 0.0           # or cut it back this far along both edges; 0 = off
+dee0_nose_mm = 0.0           # round dee0's vertex with this radius in plan view; 0 = vertex
+# ground
+ground = "dummies"           # "dummies" (wedges fused onto the housing) | "star" (one 2D layout)
+star_tip_gap_mm = 0.0        # star: ground gap round the dee tips; 0 = [machine] gap_width_min_m
+star_min_ground_mm = 2.0     # star: thinnest ground allowed between two dees' keep-outs
+gap0_face_mm = 0.0           # star: fill gap 0's dummy side down to the housing where it is this close; 0 = off
+# hardware
+posts = []
+gap0_posts_mm = []           # [s_inner, s_outer]: a post pair on dee0's gap-0 edge
+windows = []
+holes = []
+boxes = []
+post_size_mm = 10.0          # post width and depth; window / hole plate depth
+post_offset_mm = 5.0         # post centre from its edge (half the size: face flush)
+post_overhang_mm = 5.0       # posts and plates reach this far past the aperture
+post_shape = "square"        # "square" | "cylinder" (a post_facets-gon: no 90 deg edges in the gap)
+post_facets = 16
+post_wall_join_mm = 2.0      # carry a post end this close to a hug dee's end wall into it; 0 = never
+# mesh
+lc_mm = 8.0                  # surface mesh size
+lc_outer_mm = 0.0            # > lc_mm: graded, lc_mm inside r_fine_mm, this beyond r_coarse_mm
+r_fine_mm = 150.0
+r_coarse_mm = 220.0
+lc_posts_mm = 0.0            # < lc_mm: refine round every post, window block and hole
+nose_lc_mm = 2.0             # a round dee0 nose: this size on it, twice it out to the ground; 0 = off
+mesh_algorithm = 6           # gmsh Mesh.Algorithm (6 = Frontal-Delaunay)
+mesh_size_min_mm = 0.0       # gmsh Mesh.MeshSizeMin; 0 = lc_mm / 2
+mesh_flip_min_deg = 5.0      # repair triangles with an angle below this by edge flips; 0 = off
+occ_fuzzy_mm = 0.05          # OCC fuzzy boolean tolerance; 0 = exact booleans
+# model
+bem_only = true              # the BEM field is the whole machine (no RF-cavity map to blend onto)
+plot_dees = true             # write <model>_dees.png (the 2D layout) next to the model

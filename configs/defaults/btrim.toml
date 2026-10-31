@@ -1,0 +1,10 @@
+# Defaults of [btrim]: a first-harmonic trim b(r) cos(theta - phase) of the median-plane B_z, added to the 3D magnet
+# map as a vacuum field (B_r, B_theta and the z dependence from the median-plane expansion; see PyCentralRegion/btrim.py).
+# tests/test_config.py checks that these values equal the BTrimConfig defaults.
+
+[btrim]
+amplitude_t = 0.0           # first-harmonic amplitude of the median-plane B_z [T]; 0 = no trim
+phase_deg = 0.0             # azimuth of the maximum [deg]
+r_min_m = 0.05              # full amplitude between r_min_m and r_max_m ...
+r_max_m = 0.135
+edge_m = 0.01               # ... falling to 0 over edge_m on either side (C2 smoothstep); r_min_m >= edge_m

@@ -1,0 +1,65 @@
+# Defaults of the [mobo] section: a multi-objective Bayesian optimisation campaign (pcr optimize).
+# A campaign file holds [mobo] only and names the run TOML every evaluation starts from (base_config_file); see
+# configs/examples/toy/campaign.toml (runs in seconds) and configs/examples/hchc1p5/mobo_pilot.toml.
+# tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/mobo/space.py.
+#
+#   pcr optimize        campaign.toml [--max-evals N] [--max-hours H] [--dry-run]   run or continue the campaign
+#   pcr optimize-verify campaign.toml (--ids 3 7 | --pareto)                        re-evaluate at the verify fidelity
+#   pcr optimize-status campaign.toml                                               table, Pareto set, best values
+
+[mobo]
+campaign_dir = ""              # campaign folder: evals.jsonl (the store), evals/<id>/, geometries/<key>/, driver.lock
+base_config_file = ""          # run TOML every evaluation starts from
+physics_python = ""            # absolute path of the evaluations' interpreter (the physics env); "" = the driver's own
+evaluator = "PyCentralRegion.cli evaluate"   # module (and arguments) run with -m: --config --set ... --out <eval_dir>
+fixed = []                     # overrides of every evaluation, applied before the fidelity's, e.g. ["btrim.r_min_m=0.05"]
+sampler = "tpe"                # tpe (optuna TPESampler, multivariate) | gp (optuna GPSampler; needs torch); both constrained
+seed = 0                       # with the evaluation's index it seeds the sampler of every proposal (reproducible)
+n_startup = 10                 # evaluations (warm start included) before the sampler's model replaces random sampling
+max_evals = 20                 # budget: search-fidelity evaluations of the whole campaign (a rerun continues to it)
+max_hours = 0.0                # budget of one `pcr optimize` run: no evaluation starts after it; 0 = no limit
+cheap_per_geometry = 3         # after every new geometry: this many evaluations with the geometry held, cheap variables free
+failed_as_infeasible = false   # false: a failed evaluation is a pending trial (not proposed again, no values invented);
+                               # true: a complete trial with the worst values seen and an extra violated constraint
+search_fidelity = "search"     # the fidelity the sampler learns from
+verify_fidelity = "verify"     # the fidelity of pcr optimize-verify
+
+# Design variables, one table each. The optimiser works on u_<name> in [0, 1] mapped onto [low, high]:
+#   [[mobo.variables]]
+#   name = "phase"             # short name
+#   target = "track.phases_deg"   # dotted run-config key the value overrides (not paths.model3d / paths.fields / run.out_dir)
+#   low = -40.0
+#   high = 0.0
+#   log = false                # logarithmic mapping (low > 0)
+#   integer = false            # integer values (every integer gets the same share of [0, 1])
+#   as_list = true             # the target is a list: it is set to [value]
+#   kind = "cheap"             # "geometry": needs a new build + BEM (shared per geometry key); "cheap": only re-tracking
+variables = []
+
+# Objectives, one table each, read from result.json's scores by dotted path:
+#   [[mobo.objectives]]
+#   metric = "I_final"
+#   direction = "maximize"     # maximize | minimize
+#   scale = 1.0                # the sampler sees scale * metric (> 0)
+objectives = []
+
+# Constraints, one table each (optuna's convention: value - metric for ">=", metric - value for "<=", feasible <= 0):
+#   [[mobo.constraints]]
+#   metric = "E_med"
+#   op = ">="                  # ">=" | "<="
+#   value = 2.9
+constraints = []
+
+# Points evaluated first, in physical units; a variable a point omits takes the base config's value:
+#   warm_start = [{phase = -15.0, volt = 1.0}]
+warm_start = []
+
+# Fidelities: named override lists. An evaluation runs with the base config, then `fixed`, then its fidelity's
+# overrides, then the variables. timeout_min stops an evaluation that runs longer (recorded failed); 0 = no limit.
+[mobo.fidelities.search]
+overrides = []
+timeout_min = 0.0
+
+[mobo.fidelities.verify]
+overrides = []
+timeout_min = 0.0

@@ -1011,6 +1011,44 @@ def check_variable_segments(design_or_cavities, trajectory,
     return findings
 
 
+def neutralise_inert_segments(design_or_cavities, trajectory, verbose: bool = True) -> List[tuple]:
+    """Straighten every variable segment that a reference trajectory never crosses.
+
+    Such a segment changes no crossing, yet it puts a kink and a jog into the dee edge, and snapping its node
+    between turns (``snap_nodes_between_turns``) could only move it outward past a real crossing, which would change
+    the beam dynamics. Zero excursion and rotation make it part of the plain radial line at the gap's base angle.
+    Run it BEFORE the snap, on the radii the optimizer produced. Geometry is updated IN PLACE.
+
+    Returns a list of (gap, segment, r_lo, r_hi, old_angle, old_rotation, r_first_crossing) [m, deg].
+    """
+    cavities = getattr(design_or_cavities, 'rf_cavities', design_or_cavities)
+    changed = []
+    for gi, cav in enumerate(cavities):
+        if cav.n_variable_segments == 0:
+            continue
+        cr = gap_crossing_radii(cav, trajectory)
+        edges = [cav.r_min] + [float(v) for v in cav.segment_radii]
+        ang = list(cav.segment_angles)
+        rot = list(cav.segment_rotations or [0.0] * cav.n_variable_segments)
+        touched = False
+        for i in range(cav.n_variable_segments):
+            lo, hi = edges[i], edges[i + 1]
+            if np.any((cr >= lo) & (cr <= hi)) or (ang[i] == 0.0 and rot[i] == 0.0):
+                continue
+            changed.append((gi, i, lo, hi, ang[i], rot[i], float(cr[0]) if len(cr) else float('nan')))
+            ang[i], rot[i], touched = 0.0, 0.0, True
+        if touched:
+            cav.update_geometry(segment_angles=ang, segment_rotations=rot)
+    if verbose:
+        if not changed:
+            print("[neutralise] every variable segment has at least one beam crossing; none straightened")
+        for gi, i, lo, hi, a0, r0, first in changed:
+            print(f"[neutralise] gap{gi} segment {i} spans r {lo * 1e3:.2f}..{hi * 1e3:.2f} mm but the orbit first "
+                  f"reaches this gap at {first * 1e3:.2f} mm: angle {a0:+.4f} -> 0, rotation {r0:+.4f} -> 0 "
+                  f"(radial line at {cavities[gi].base_angle:.1f} deg)")
+    return changed
+
+
 def snap_nodes_between_turns(design_or_cavities, trajectory,
                              verbose: bool = True):
     """Shift each gap's segment node radii midway between its turn crossings.

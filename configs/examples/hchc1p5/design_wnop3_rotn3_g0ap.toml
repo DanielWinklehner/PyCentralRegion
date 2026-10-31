@@ -1,0 +1,30 @@
+# Design wnop3_rotn3_g0ap of the worked example (built and tracked 2026-10-31 as the "test drive"): the wnop3 gap
+# geometry with the free dee opening 32.55 deg, the spiral inflector turned +4.726 deg so its exit-plate corner sits on
+# gap 0's ray, dee 0's nose rounded (R 3 mm), junctions of gaps 2 / 3 moved to 124.6 / 208.5 mm, no posts, only gap 0's
+# counter post with the R 10 mm round hole. Its 3D tracking at -15 deg (every particle, SC 128^3 every step) gave
+# T = 50.1 % = 4.02 mA at 3.094 +- 0.070 MeV.
+#   pcr build  configs/examples/hchc1p5/design_wnop3_rotn3_g0ap.toml     (electrodes -> paths.model3d)
+#   pcr fields configs/examples/hchc1p5/design_wnop3_rotn3_g0ap.toml     (3D BEM -> paths.fields)
+#   pcr track  configs/examples/hchc1p5/design_wnop3_rotn3_g0ap.toml     (bunch tracking -> run.out_dir)
+# Stages reuse an output file that already exists; point a path elsewhere to rebuild.
+
+include = ["machine.toml"]
+
+[run]
+name = "wnop3_rotn3_g0ap"
+out_dir = "E:/HCHC1.5/Results/CR/pcr/wnop3_rotn3_g0ap"
+
+[paths]
+seed = "E:/HCHC1.5/Results/CR/optimized_cavity_geometry_wnop3_bo_cold05c2s.pkl"
+model3d = "E:/HCHC1.5/Results/CR/cr_model_wnop3_rotn3_g0ap_model3d.pkl"
+fields = "E:/HCHC1.5/Results/CR/bunch_fields3d_wnop3_rotn3_g0ap.pkl"
+
+[machine]
+dee_opening_deg = 32.547930952023954   # the seed optimization's free opening
+
+[inflector]
+rotation_deg = 4.726034523988023       # the electrode builder's "corner" rotation for this seed (gap-0 ray 28.726 deg)
+
+[track]
+phases_deg = [-15.0]                   # the phase the 4k scan picked
+probes_deg = [25.0, 45.0, 160.0]

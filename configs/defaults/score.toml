@@ -1,0 +1,63 @@
+# Defaults of the [score] section: the scoring of 3D bunch-tracking runs (PyCentralRegion.analysis, `pcr score`).
+# The values reproduce the 2026-10-31 run scoring of the 3D campaign, so new scores compare with its tables.
+# Score keys that carry a number take it from here: halo3 from halo_sigma, I_2pct from energy_windows, acc90 from
+# acceptance_levels, valley_rad20 from slit_budgets, ratio_t3 from proxy_turns.
+# tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/analysis/objectives.py.
+
+[score]
+# fallbacks for what a run's json may not record (runs of the original design deck)
+harmonic = 4                # RF harmonic when the json lacks rf_mhz or f_rev_mhz (else h = rf / f_rev)
+r_max_m = 0.38              # loss radius when the run records no json['limits']
+z_max_m = 0.030             # loss half-height when the run records no json['limits']
+b0_t = 0.0                  # |B| at the bunch for the vortex prediction when the json has no field check;
+                            # 0 = the isochronous central field 2 pi f_rev m / q of the hand-off species
+
+# which runs are scored
+min_tracks = 5000           # fewer recorded tracks: the run is skipped
+min_survivors = 200         # fewer tracked survivors: the run is skipped
+
+# final energy
+energy_windows = [0.05, 0.02, 0.01]   # +-rel windows: I_<p>pct around the median, I_<p>pct_best best-placed
+
+# acceptance in hand-off release phase
+phase_bin_deg = 5.0         # bins of the survival curve
+phase_range_deg = 120.0     # the bins span +-range (phases beyond fall into the end bins)
+min_bin_count = 40          # bins with fewer tracked particles do not count
+acceptance_levels = [0.9, 0.8]        # acc<level>: the widest run of bins with survival >= level
+survival_bands_deg = [30.0, 40.0]     # S30: survival for |phase| <= 30 deg; S30_40: 30 < |phase| <= 40
+compression_clip_sigma = 2.5          # the compression slope is fitted to survivors within this many sigma
+loss_turn_edges = [0.5, 1.0, 2.0]     # classes of the turn of loss (turns after release)
+phase_band_q = 0.95         # band<q>: the central release-phase band holding this share of the survivors
+handoff_quantiles = 5       # survival per quantile of the hand-off |z| and |z'|
+
+# bunch shape in the bunch frame (r radial, l ahead), per turn
+n_snapshots = 16            # instants per turn
+core_q = 0.95               # core: this share of the particles, smallest Mahalanobis distance
+halo_sigma = 3.0            # halo<s>: the share beyond s sigma of the Gaussian-equivalent core
+halo_born_turns = [1, 2]    # halo_born_t<t>: share of the last-turn halo that was already halo at turn t
+map_core_sigma = 2.0        # particles within this many core sigma fit the measured one-turn map
+proxy_turns = [2, 3]        # flat keys ratio / sig_r / sig_l / s_round / fan of these turns (early-turn proxies)
+
+# per-particle orbit centres (the centre fan)
+fan_degree = 3              # polynomial in release phase that 'explains' the centres
+turn_fill = 0.8             # a revolution needs this share of the fullest one's records, a fan turn this share
+                            # of the survivors with a centre
+
+# virtual probes (radial half-planes) and the turn structure
+probe_angles_deg = [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
+probe_passes = 3            # the last this many complete passes
+pass_complete = 0.95        # a pass is complete when this share of the survivors crossed it
+probe_halo_sigma = 2.5      # probe halo: beyond this many sigma from the own turn centre
+hist_bin_mm = 1.0           # radial histogram of the valley / peak ratio
+hist_smooth_bins = 3        # moving average over this many bins
+
+# collimation trade-off: one slit at an early pass, turn centres held, no space-charge feedback
+slit_budgets = [0.05, 0.10, 0.20, 0.30]   # share of the survivors the slit may take
+slit_passes = [1, 2, 3]     # passes a slit may sit at
+slit_min_share = 0.9        # a pass needs this share of the survivors to carry a slit
+slit_splits = 11            # splits of a radial budget between the inner and the outer jaw
+
+# operating point of a dee-voltage x RF-phase bunch grid (analysis.pick_operating_point)
+pick_e_min_mev = 2.9        # the bunch must reach this final energy
+pick_t_tol = 0.005          # within this (absolute) transmission of the best, the smallest dE/E wins
+pick_v_max = 1.10           # cap on the dee-voltage scale (wall power grows as V^2)

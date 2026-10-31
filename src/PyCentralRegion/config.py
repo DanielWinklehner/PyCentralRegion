@@ -299,23 +299,26 @@ class TrackConfig:
     fast3d: bool = True              # numba 3D fast path
     fast3d_interp: str = 'point'
     volt_scale: float = 1.0          # dee voltage / the model's voltage
-    phases_deg: tuple = ()           # RF phases of the phase scan; empty = the seed's phase only
+    phases_deg: tuple = ()           # RF phases; several = a phase scan; empty = the seed's phase and +-10 deg
     n_scan: int = 4000               # particles per phase-scan run
     n_final: int = 0                 # particles of the final run; 0 = the whole hand-off bunch
     seed_scan: int = 0               # bunch sampling seeds
     seed_final: int = 2
     sc: bool = True                  # space charge
-    sc_cells: int = 64               # FFT grid cells per axis (0 = from sc_h_m)
-    sc_every: int = 5                # steps between Poisson solves
+    sc_cells: int = 64               # phase scan: FFT grid nodes per axis (0 = cell size sc_h_m)
+    sc_every: int = 5                # phase scan: steps between Poisson solves
     sc_final_cells: int = 128        # the final run's grid and solve interval
     sc_final_every: int = 1
-    sc_h_m: float = 0.0              # FFT cell size when sc_cells = 0
-    sc_max_cells: int = 0            # cap on the cells per axis (0 = none)
-    sc_window_q: float = 0.002       # outlier quantile cut of the FFT window
-    sc_frame: str = 'bunch'          # 'bunch' (grid along the bunch) | 'lab'
+    sc_h_m: float = 5e-4             # FFT cell size when the cells per axis are 0
+    sc_max_cells: int = 8000000      # cap on the total FFT cells when the cell size sets the grid
+    sc_window_q: float = 0.002       # particles outside the [q, 1 - q] quantiles per axis neither deposit nor feel SC
+    sc_frame: str = 'bunch'          # 'bunch' (grid turned onto the mean horizontal velocity) | 'lab'
     sc_gpu: bool = True
     sc_current_ma: float = 0.0       # 0 = the hand-off file's current
     n_tracks: int = 20000            # particles whose full tracks are stored (final run)
     track_every: int = 4             # steps between stored track points
     probes_deg: tuple = (25.0, 45.0)  # azimuths of the radial probes (final run)
-    snapshot_ns: tuple = ()          # times [ns] of full-beam snapshots (final run)
+    snapshot_ns: tuple = (10.0, 20.0, 30.0, 40.0)   # times [ns] of full-beam snapshots (final run)
+    obstacles: str = 'raster'        # metal test: 'raster' (the cached slices) | 'mesh' (the model's triangles)
+    extra_posts_mm: tuple = ()       # full-height grounded posts [[x, y, r], ...] mm, obstacle test only
+    extra_boxes_mm: tuple = ()       # full-height grounded boxes [[xmin, xmax, ymin, ymax], ...] mm, obstacle test only
