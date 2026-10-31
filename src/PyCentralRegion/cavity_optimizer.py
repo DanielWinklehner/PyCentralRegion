@@ -235,6 +235,14 @@ class CavityGeometryOptimizer:
     the other gaps, the opening delta and the RF parameters are optimized as
     usual. The worker builder must apply the same geometry and freeze the same
     gaps.
+
+    ``frozen_gap_refit`` (opt-in, with ``optimize_opening_angle``): a frozen
+    gap's base angle still follows the opening delta, so on its own its held
+    segment turns rigidly with it. ``frozen_gap_refit(g, cavity)`` is called
+    after the base angle has moved and must set the cavity's segment geometry
+    in place for it (e.g. a first gap re-fitted to the housing exit plate,
+    which does not turn with the dees). The worker builder must pass the same
+    hook.
     """
 
     def __init__(self,
@@ -260,7 +268,8 @@ class CavityGeometryOptimizer:
                  housing_clearance_m: float = 0.005,
                  housing_weight: float = 100.0,
                  housing_keepout_r_min=0.0,
-                 frozen_gaps=None):
+                 frozen_gaps=None,
+                 frozen_gap_refit=None):
         if getattr(orbit_finder, 'gap_model', 'thin') not in ('thin', 'bem2d'):
             raise ValueError(f"unsupported gap_model "
                              f"'{getattr(orbit_finder, 'gap_model', 'thin')}'")
@@ -388,6 +397,9 @@ class CavityGeometryOptimizer:
                 [float(a) for a in cav.segment_angles],
                 [float(r) for r in cav.segment_radii],
                 [float(r) for r in (cav.segment_rotations or [0.0] * self.n_segments)])
+        # re-fit of a frozen gap for a moved base angle (see the class doc); last result per gap cached
+        self.frozen_gap_refit = frozen_gap_refit
+        self._frozen_refit_last = {}
 
         # BEM-in-the-loop state (gap_model='bem2d' finders only).
         self.bem_build_kwargs = bem_build_kwargs
@@ -478,9 +490,11 @@ class CavityGeometryOptimizer:
         rotations_per_gap = [] if self.rotatable_segments else None
         free = getattr(self, '_free_gaps', list(range(self.n_gaps)))
         frozen = getattr(self, '_frozen_geom', {})
+        opening_delta = (float(params[self._n_geo])
+                         if self.optimize_opening_angle else None)
         for g in range(self.n_gaps):
             if g in frozen:
-                a, r, rot = frozen[g]
+                a, r, rot = self._frozen_geometry(g, opening_delta)
                 angles_per_gap.append(list(a))
                 radii_per_gap.append(list(r))
                 if self.rotatable_segments:
@@ -491,15 +505,33 @@ class CavityGeometryOptimizer:
             radii_per_gap.append(list(params[base + n:base + 2 * n]))
             if self.rotatable_segments:
                 rotations_per_gap.append(list(params[base + 2 * n:base + 3 * n]))
-        opening_delta = (float(params[self._n_geo])
-                         if self.optimize_opening_angle else None)
         rf_params = np.asarray(params[self._rf_offset:], dtype=float)
         return angles_per_gap, radii_per_gap, rotations_per_gap, opening_delta, rf_params
+
+    def _frozen_geometry(self, g: int, opening_delta: Optional[float]):
+        """Held (angles, radii, rotations) of frozen gap g; with frozen_gap_refit and a non-zero opening
+        delta, re-fitted for the gap's moved base angle instead."""
+        held = self._frozen_geom[g]
+        refit = getattr(self, 'frozen_gap_refit', None)
+        if refit is None or not opening_delta or self.dee_system is None:
+            return held
+        last = getattr(self, '_frozen_refit_last', {}).get(g)
+        if last is not None and last[0] == opening_delta:
+            return last[1]
+        cav = self.orbit_finder.design.rf_cavities[g]
+        cav.update_geometry(base_angle=self._gap_base_angles(opening_delta)[g])
+        refit(g, cav)
+        out = ([float(a) for a in cav.segment_angles],
+               [float(r) for r in cav.segment_radii],
+               [float(r) for r in (cav.segment_rotations or [0.0] * self.n_segments)])
+        self._frozen_refit_last[g] = (opening_delta, out)
+        return out
 
     def _seed_x0_from_cavities(self, x0) -> np.ndarray:
         """x0 with the geometry blocks of the FREE gaps replaced by the
         cavities' current segment geometry (warm start from a previous winner
-        applied to the design; the RF entries are left as built)."""
+        applied to the design; the RF entries are left as built). With an
+        optimized opening angle the delta is read off the cavities too."""
         x0 = np.asarray(x0, dtype=float).copy()
         n, blk = self.n_segments, self._blk
         free = getattr(self, '_free_gaps', list(range(self.n_gaps)))
@@ -511,6 +543,12 @@ class CavityGeometryOptimizer:
             if self.rotatable_segments:
                 rots = cav.segment_rotations or [0.0] * n
                 x0[base + 2 * n:base + 3 * n] = [float(r) for r in rots][:n]
+        if self.optimize_opening_angle and self.dee_system is not None:
+            gaps = self.dee_system.gaps            # entry/exit per dee
+            ops = [(float(gaps[2 * j + 1].base_angle) - float(gaps[2 * j].base_angle)) % 360.0
+                   for j in range(self.dee_system.n_dees)]
+            x0[self._n_geo] = float(np.clip(np.mean(ops) - self.dee_system.opening_angle,
+                                            -self.opening_delta_max, self.opening_delta_max))
         return x0
 
     def _rotations_for_gap(self, rotations_per_gap, g):

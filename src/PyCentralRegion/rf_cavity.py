@@ -664,7 +664,26 @@ class RFCavity:
 
         u_xy = u[:, :2]
         u_z = u[:, 2]
+        # Thin-gap VERTICAL LENS (2026-10-21, off unless z_lens_eta != 0): the leading,
+        # time-variation term of the dee-gap electric lens (Rose 1938; Wangler's RF
+        # defocusing impulse), Delta p_z = -eta * q V T omega sin(phi) z / v^2, with the
+        # SAME phase, voltage and transit-time factor as the energy kick and v the mean
+        # of the speeds before and after the gap (finite for a particle the gap stops;
+        # v_in * v_out was not). Focusing while the gap voltage falls (sin phi > 0),
+        # defocusing while it rises. eta = 1 is a long planar slot, 1/2 the axisymmetric
+        # gap; posts and windows sit in between, so eta is calibrated against the 3D BEM.
+        # The velocity-change (immersion-lens) term is not included. Applied BEFORE the
+        # perpendicular re-solve below, and |u_z| is capped at what the new energy
+        # allows beside u_along, so the energy gain stays exact.
         u_along = np.sum(u_xy * dir_along, axis=1)   # parallel to gap line -> conserved
+        eta_z = float(getattr(self, 'z_lens_eta', 0.0) or 0.0)
+        if eta_z != 0.0:
+            v_bar = 0.5 * (speed + c * bg_new / np.sqrt(1.0 + bg_new ** 2))
+            u_z = u_z - eta_z * (1e-6 * design.species.q * v_gap * ttf / design.species.mass_mev) * (
+                self.omega * c / (v_bar * v_bar)) * np.sin(
+                self.omega * t_cavity + total_phase) * r_cavity[:, 2]
+            uz_lim = np.sqrt(np.maximum(bg_new ** 2 - u_along ** 2, 0.0))
+            u_z = np.clip(u_z, -uz_lim, uz_lim)
         u_perp_old = np.sum(u_xy * perp, axis=1)     # along gap normal -> kicked
 
         # Re-solve the perpendicular (kicked) component for the new energy,
@@ -799,7 +818,9 @@ def create_dee_system(r_min: float,
                       segment_angles: Optional[List[float]] = None,
                       segment_radii: Optional[List[float]] = None,
                       gap_width_inner: Optional[float] = None,
-                      gap_taper_radius: Optional[float] = None) -> DeeSystem:
+                      gap_taper_radius: Optional[float] = None,
+                      gap_angle_deg: Optional[float] = None,
+                      gap_width_min: Optional[float] = None) -> DeeSystem:
     """Create an N-dee RF system from (center angle, opening angle).
 
     Parameters
@@ -811,6 +832,10 @@ def create_dee_system(r_min: float,
         Default: 180/harmonic (the classical synchronous dee angle).
     phases : list of float, optional
         RF phase of each dee's ENTRY gap [deg]; the exit gap is +180 deg.
+    gap_angle_deg, gap_width_min : float, optional
+        Angular gap law, forwarded to every ``RFCavity``: a constant-angle
+        wedge of ``gap_angle_deg`` floored at ``gap_width_min``. Mutually
+        exclusive with the taper pair below.
     gap_width_inner, gap_taper_radius : float, optional
         Linear gap-width taper toward the center (see RFCavity): width is
         ``gap_width_inner`` at ``r_min``, growing to the nominal ``gap_width``
@@ -838,6 +863,8 @@ def create_dee_system(r_min: float,
                 segment_radii=list(segment_radii) if segment_radii else None,
                 gap_width_inner=gap_width_inner,
                 gap_taper_radius=gap_taper_radius,
+                gap_angle_deg=gap_angle_deg,
+                gap_width_min=gap_width_min,
             ))
     return DeeSystem(center_angles, opening_angle, gaps)
 

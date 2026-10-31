@@ -929,6 +929,7 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
             vp_s = cav[15]
             cav_lo = cav[16]
             cav_hi = cav[17]
+            cav_zlens = cav[18]      # thin-gap vertical lens eta per cavity (0 = off)
             n_cav = len(cav_seg_start) - 1
             for c in range(n_cav):
                 # `check_crossings_batch` returns no crossings for a cavity with
@@ -1044,6 +1045,14 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
                     uy = gc * vy
                     uz = gc * vz
                     u_along = ux * seg_dir[s, 0] + uy * seg_dir[s, 1]
+                    if cav_zlens[c] != 0.0:
+                        # RFCavity.apply_kicks_batch's thin-gap vertical lens, same order
+                        v_bar = 0.5 * (speed + CLIGHT * bg_new / np.sqrt(1.0 + bg_new * bg_new))
+                        uz = uz - cav_zlens[c] * (1e-6 * q_state * v_gap * ttf / mass_mev) * (
+                            cav_omega[c] * CLIGHT / (v_bar * v_bar)) * np.sin(
+                            cav_omega[c] * t_cavity + cav_phase[c]) * rk_out[a, 2]
+                        uz_lim = np.sqrt(max(bg_new * bg_new - u_along * u_along, 0.0))
+                        uz = min(max(uz, -uz_lim), uz_lim)
                     u_perp = ux * seg_perp[s, 0] + uy * seg_perp[s, 1]
                     u_perp_new = np.sign(u_perp) * np.sqrt(
                         max(bg_new * bg_new - u_along * u_along - uz * uz, 0.0))
@@ -1187,7 +1196,7 @@ def _interp_point(x, xp, fp):
 # Same arithmetic order as the block inside ``_chunk3d_impl``.
 @njit(cache=True)
 def _kick_chain_point(vx, vy, vz, rx, ry, sp, dt, t, omega, phase, voltage, gw,
-                      q_state, mass_mev, dirx, diry, perpx, perpy):
+                      q_state, mass_mev, dirx, diry, perpx, perpy, eta_z=0.0, rz=0.0):
     speed = np.sqrt(vx * vx + vy * vy + vz * vz)
     bet = speed / CLIGHT
     gamma = 1.0 / np.sqrt(1.0 - bet * bet)
@@ -1205,6 +1214,12 @@ def _kick_chain_point(vx, vy, vz, rx, ry, sp, dt, t, omega, phase, voltage, gw,
     uy = gc * vy
     uz = gc * vz
     u_along = ux * dirx + uy * diry
+    if eta_z != 0.0:
+        v_bar = 0.5 * (speed + CLIGHT * bg_new / np.sqrt(1.0 + bg_new * bg_new))
+        uz = uz - eta_z * (1e-6 * q_state * voltage * ttf / mass_mev) * (
+            omega * CLIGHT / (v_bar * v_bar)) * np.sin(omega * t_cavity + phase) * rz
+        uz_lim = np.sqrt(max(bg_new * bg_new - u_along * u_along, 0.0))
+        uz = min(max(uz, -uz_lim), uz_lim)
     u_perp = ux * perpx + uy * perpy
     u_perp_new = np.sign(u_perp) * np.sqrt(
         max(bg_new * bg_new - u_along * u_along - uz * uz, 0.0))
@@ -1216,7 +1231,7 @@ def _kick_chain_point(vx, vy, vz, rx, ry, sp, dt, t, omega, phase, voltage, gw,
 
 
 def _kick_chain_numpy(v, r, sp, dt, t, omega, phase, voltage, gw,
-                      q_state, mass_mev, dir_along, perp):
+                      q_state, mass_mev, dir_along, perp, eta_z=0.0):
     """``RFCavity.apply_kicks_batch`` (rf_cavity.py:584-637) verbatim, as NumPy."""
     c = CLIGHT
     speed = np.linalg.norm(v, axis=1)
@@ -1235,6 +1250,12 @@ def _kick_chain_numpy(v, r, sp, dt, t, omega, phase, voltage, gw,
     u_xy = u[:, :2]
     u_z = u[:, 2]
     u_along = np.sum(u_xy * dir_along, axis=1)
+    if eta_z != 0.0:
+        v_bar = 0.5 * (speed + c * bg_new / np.sqrt(1.0 + bg_new ** 2))
+        u_z = u_z - eta_z * (1e-6 * q_state * voltage * ttf / mass_mev) * (
+            omega * c / (v_bar * v_bar)) * np.sin(omega * t_cavity + phase) * r[:, 2]
+        uz_lim = np.sqrt(np.maximum(bg_new ** 2 - u_along ** 2, 0.0))
+        u_z = np.clip(u_z, -uz_lim, uz_lim)
     u_perp_old = np.sum(u_xy * perp, axis=1)
     u_perp_new_sq = bg_new ** 2 - u_along ** 2 - u_z ** 2
     u_perp_new = np.sign(u_perp_old) * np.sqrt(np.maximum(u_perp_new_sq, 0.0))
@@ -1360,10 +1381,24 @@ def selftest(n: int = 4096, seed: int = 20260916) -> dict:
     kick_ok = bool(np.array_equal(v_ref, v_mine) and np.array_equal(de_ref, de_mine))
     kick_max = float(np.max(np.abs(v_ref - v_mine)))
     kick_rows = int(np.sum(np.abs(v_ref - v_mine).max(axis=1) > 0))
+    # the same chain with the thin-gap vertical lens on (z_lens_eta, 2026-10-21): a measurement
+    v_ref_l, _ = _kick_chain_numpy(kv, kr, ksp, kw['dt'], kw['t'], kw['omega'],
+                                   kw['phase'], kw['voltage'], kw['gw'],
+                                   kw['q_state'], kw['mass_mev'], kdir, kperp, eta_z=0.8)
+    v_mine_l = np.empty_like(v_ref_l)
+    for i in range(n):
+        v_mine_l[i] = _kick_chain_point(kv[i, 0], kv[i, 1], kv[i, 2], kr[i, 0], kr[i, 1],
+                                        ksp[i], kw['dt'], kw['t'], kw['omega'], kw['phase'],
+                                        kw['voltage'], kw['gw'], kw['q_state'], kw['mass_mev'],
+                                        kdir[i, 0], kdir[i, 1], kperp[i, 0], kperp[i, 1],
+                                        0.8, kr[i, 2])[:3]
+    lens_ok = bool(np.array_equal(v_ref_l, v_mine_l))
+    lens_max = float(np.max(np.abs(v_ref_l - v_mine_l)))
 
     return {'n_samples': int(n),
             'kick_point_exact_vs_numpy': kick_ok, 'kick_point_max_abs': kick_max,
             'kick_point_rows_differing': kick_rows,
+            'kick_lens_point_exact_vs_numpy': lens_ok, 'kick_lens_point_max_abs': lens_max,
             'sin_exact': sin_ok, 'cos_exact': cos_ok, 'sign_exact': sgn_ok,
             'interp_exact': interp_ok_tab,
             'boris_point_exact_vs_batch': boris_ok, 'boris_point_max_abs': boris_max,
@@ -1666,11 +1701,19 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
         pts = np.vstack([cavd['seg_p1'][lo_i:hi_i], cavd['seg_p2'][lo_i:hi_i]])
         cav_lo[c, :] = pts.min(axis=0)
         cav_hi[c, :] = pts.max(axis=0)
+    # the thin-gap vertical lens (RFCavity.z_lens_eta, 2026-10-21), one eta per packed cavity
+    cav_zlens = np.zeros(n_cav)
+    if use_kicks:
+        if len(design.rf_cavities) != n_cav:
+            raise FastPathUnavailable(f"{len(design.rf_cavities)} cavities but {n_cav} packed")
+        for c, cv in enumerate(design.rf_cavities):
+            cav_zlens[c] = float(getattr(cv, 'z_lens_eta', 0.0) or 0.0)
     cav = (bool(cavd['use_kicks']), cavd['cav_seg_start'], cavd['seg_p1'], cavd['seg_p2'],
            cavd['seg_dir'], cavd['seg_perp'], cavd['cav_omega'], cavd['cav_phase'],
            cavd['cav_voltage'], cavd['cav_gap_w'], cavd['cav_gap_w_inner'],
            cavd['cav_taper_r'], cavd['cav_r_min'], cavd['vp_start'], cavd['vp_r'],
-           cavd['vp_s'], np.ascontiguousarray(cav_lo), np.ascontiguousarray(cav_hi))
+           cavd['vp_s'], np.ascontiguousarray(cav_lo), np.ascontiguousarray(cav_hi),
+           cav_zlens)
 
     n = int(pd_init.numpart)
     r0 = np.ascontiguousarray(np.array(pd_init.x_vec, dtype=float))
