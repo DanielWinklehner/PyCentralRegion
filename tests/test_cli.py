@@ -31,6 +31,30 @@ def test_stage_commands_take_a_run_file(command, capsys):
     assert exc.value.code == 0 and '--set' in capsys.readouterr().out
 
 
+def test_score_writes_plain_json_once(tmp_path, capsys):
+    """`pcr score` on a run folder in the tracker's layout: score.json holds plain JSON (NaN as null), and a second
+    call reuses it instead of scoring again."""
+    pytest.importorskip('scipy')
+    import pickle
+    from test_analysis import _spiral_run                    # the synthetic accelerated bunch of the analysis tests
+    from PyCentralRegion.analysis import runs as R
+    run = _spiral_run(n=300, halo=0.1)
+    keys = ('ids', 'steps', 'xyz', 'stop_step', 'birth_step', 'n_steps', 'steps_per_turn', 'E_mev')
+    final = {'phase': 0.0, 'n': run.n_tracks, 'transmission': run.info['final']['transmission'],
+             'tracks': {k: getattr(run, k) for k in keys}}
+    out = tmp_path / 'design_a'
+    out.mkdir()
+    with open(out / R.TRACK_PKL, 'wb') as fh:
+        pickle.dump({'final': final, 'ref': {0.0: {'traj': run.ref_xyz}}}, fh)
+    (out / R.TRACK_JSON).write_text(json.dumps(run.info))
+    toml = tmp_path / 'run.toml'
+    toml.write_text(f'[run]\nout_dir = "{out.as_posix()}"\n[score]\nmin_tracks = 50\nmin_survivors = 20\n')
+    assert cli.main(['score', str(toml)]) == 0
+    scores = json.loads((out / 'score.json').read_text())
+    assert scores['tag'] == 'design_a' and 0.0 < scores['valley_all'] < 0.1 and scores['I_final'] > 0
+    assert cli.main(['score', str(toml)]) == 0 and 'exists: reused' in capsys.readouterr().out
+
+
 @pytest.mark.parametrize('command, option', [('optimize', '--max-evals'), ('optimize-verify', '--pareto'),
                                              ('optimize-status', 'campaign TOML')])
 def test_campaign_commands_reach_the_driver(command, option, capsys):

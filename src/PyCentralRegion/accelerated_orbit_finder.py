@@ -547,7 +547,7 @@ class AcceleratedOrbitFinder:
         # Compiled MULTI-PARTICLE 3D fast path (fast_track3d.py): the whole
         # bunch advanced for a chunk of steps in one njit kernel, with the same
         # callback replaying the recorded steps. OFF by default; the 3D bunch
-        # deck turns it on from HCHC60_FAST3D=1. 'point' inlines the field
+        # tracker (simulate3d) sets it from [track] fast3d. 'point' inlines the field
         # interpolation per particle (fast, 1 ulp from the Python path);
         # 'batch' calls interpolators._interp3d_batch3 itself and is bit-exact.
         self.fast3d = False
@@ -568,7 +568,7 @@ class AcceleratedOrbitFinder:
         # its solve count, timings and mean |E_sc| land in the result metadata
         # under 'space_charge'. Disables the single-particle fast path.
         self.space_charge = None
-        # Multiparticle objective options (MiniDAR 2026-10-20, Daniel: "optimize for transmission, mean
+        # Multiparticle objective options (2026-10-20, Daniel: "optimize for transmission, mean
         # energy, and centeredness, only using turns 3 and beyond"):
         #   center_source  'reference' (default): the 'center' block measures the reference particle's
         #                  orbit centre; 'bunch': the orbit centre of the BUNCH CENTROID (mean of the
@@ -692,7 +692,7 @@ class AcceleratedOrbitFinder:
             # identity test against static_efields alone misses it and
             # superpose_efield SUMS the two: the inflector's E_x / E_y applied twice
             # (E_z only once, since the slice drops it). Measured 2026-09-16 at the
-            # HCHC-60 injection point: E_x -748624 V/m tracked where -374312 is
+            # injection point of a 60 MeV H2+ machine: E_x -748624 V/m tracked where -374312 is
             # correct, with E_z right - an error that survives a sanity check.
             # InflectorModel caches both forms (_field, _field2d) and there is one
             # instance per process, so identity still settles it.

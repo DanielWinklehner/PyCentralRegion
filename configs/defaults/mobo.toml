@@ -1,11 +1,19 @@
 # Defaults of the [mobo] section: a multi-objective Bayesian optimisation campaign (pcr optimize).
 # A campaign file holds [mobo] only and names the run TOML every evaluation starts from (base_config_file); see
-# configs/examples/toy/campaign.toml (runs in seconds) and configs/examples/hchc1p5/mobo_pilot.toml.
+# configs/examples/toy/campaign.toml (runs in seconds), configs/examples/hchc1p5/mobo_pilot.toml (cheap variables on
+# existing fields) and configs/examples/hchc1p5/mobo_campaign.toml (geometry and cheap variables).
 # tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/mobo/space.py.
 #
 #   pcr optimize        campaign.toml [--max-evals N] [--max-hours H] [--dry-run]   run or continue the campaign
-#   pcr optimize-verify campaign.toml (--ids 3 7 | --pareto)                        re-evaluate at the verify fidelity
+#   pcr optimize-verify campaign.toml (--ids 3 7 | --pareto) [--fidelity NAME]     re-evaluate at the verify fidelity
 #   pcr optimize-status campaign.toml                                               table, Pareto set, best values
+#
+# The campaign folder is the whole state (evals.jsonl, one folder per evaluation, one per geometry): running
+# pcr optimize again continues where it stopped. Stopping the driver (Ctrl+C, closing its window, killing it, the end
+# of max_hours) stops the running evaluation with every process it started; that evaluation is recorded failed
+# ("interrupted"), does not count against max_evals and is not run again (to evaluate that design anyway, give it as
+# a warm_start point). A geometry's model and fields are written whole and serve its later evaluations; what a build
+# stopped before its model left is moved to geometries/<key>/stopped-<id>/, so that geometry can be built again.
 
 [mobo]
 campaign_dir = ""              # campaign folder: evals.jsonl (the store), evals/<id>/, geometries/<key>/, driver.lock
@@ -16,24 +24,30 @@ fixed = []                     # overrides of every evaluation, applied before t
 sampler = "tpe"                # tpe (optuna TPESampler, multivariate) | gp (optuna GPSampler; needs torch); both constrained
 seed = 0                       # with the evaluation's index it seeds the sampler of every proposal (reproducible)
 n_startup = 10                 # evaluations (warm start included) before the sampler's model replaces random sampling
-max_evals = 20                 # budget: search-fidelity evaluations of the whole campaign (a rerun continues to it)
-max_hours = 0.0                # budget of one `pcr optimize` run: no evaluation starts after it; 0 = no limit
+max_evals = 20                 # budget: search-fidelity evaluations of the whole campaign (a rerun continues to it);
+                               # interrupted evaluations do not count
+max_hours = 0.0                # budget of one `pcr optimize` run: no evaluation starts after it, and the one running
+                               # then is stopped (interrupted); 0 = no limit
 cheap_per_geometry = 3         # after every new geometry: this many evaluations with the geometry held, cheap variables free
 failed_as_infeasible = false   # false: a failed evaluation is a pending trial (not proposed again, no values invented);
-                               # true: a complete trial with the worst values seen and an extra violated constraint
+                               # true: a complete trial with the worst values seen and an extra violated constraint.
+                               # (A run the scorer skips - too few survivors - is not a failure: it always enters with
+                               # the metrics it has and the worst values seen for the rest.)
 search_fidelity = "search"     # the fidelity the sampler learns from
 verify_fidelity = "verify"     # the fidelity of pcr optimize-verify
 
 # Design variables, one table each. The optimiser works on u_<name> in [0, 1] mapped onto [low, high]:
 #   [[mobo.variables]]
 #   name = "phase"             # short name
-#   target = "track.phases_deg"   # dotted run-config key the value overrides (not paths.model3d / paths.fields / run.out_dir)
+#   target = "track.phases_deg"   # dotted run-config key the value overrides (not paths.model3d / paths.fields /
+#                                 # run.out_dir); an integer part indexes an array of tables: geometry.windows.1.z_hi_mm
 #   low = -40.0
 #   high = 0.0
 #   log = false                # logarithmic mapping (low > 0)
 #   integer = false            # integer values (every integer gets the same share of [0, 1])
 #   as_list = true             # the target is a list: it is set to [value]
 #   kind = "cheap"             # "geometry": needs a new build + BEM (shared per geometry key); "cheap": only re-tracking
+# Every target is checked against its [section] (at both ends of its range) before anything runs.
 variables = []
 
 # Objectives, one table each, read from result.json's scores by dotted path:
@@ -50,7 +64,8 @@ objectives = []
 #   value = 2.9
 constraints = []
 
-# Points evaluated first, in physical units; a variable a point omits takes the base config's value:
+# Points evaluated first, in physical units; a variable a point omits takes the base config's value (set there, or
+# its section's default), so {} is the base design itself:
 #   warm_start = [{phase = -15.0, volt = 1.0}]
 warm_start = []
 

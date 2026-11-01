@@ -49,16 +49,14 @@ def build_stage(cfg):
 def score_stage(cfg):
     """Score the tracked run in run.out_dir with [score]; writes run.out_dir/score.json (reused when it exists)."""
     from .analysis.metrics import score_run
-    from .analysis.runs import load_run_dir
+    from .analysis.runs import clean, load_track_run, save_score
     out_dir = Path(config.require(config.section(cfg, 'run').out_dir, 'run.out_dir'))
     path = out_dir / 'score.json'
     if path.exists():
         print(f"[score] {path} exists: reused", flush=True)
         return json.loads(path.read_text())
-    scores = score_run(load_run_dir(out_dir), config.section(cfg, 'score'))
-    tmp = path.with_suffix('.json.part')
-    tmp.write_text(json.dumps(scores, indent=1, default=str))
-    tmp.replace(path)
+    scores = clean(score_run(load_track_run(out_dir), config.section(cfg, 'score')))   # plain JSON: NaN -> null
+    save_score(scores, path)
     return scores
 
 

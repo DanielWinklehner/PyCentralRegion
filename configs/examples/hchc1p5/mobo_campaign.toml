@@ -1,0 +1,183 @@
+# The full MOBO campaign on the worked example, after the pilot: the beam channel's aperture and the spiral
+# inflector's rotation (geometry: every new value needs an electrode build and a 3D BEM, ~15 min) together with the
+# RF phase, the dee-voltage scale, a first-harmonic magnetic trim and a radial slit (cheap: they re-track on that
+# geometry's fields, 1-2 min each). After every new geometry the driver runs cheap_per_geometry cheap evaluations on
+# it; every geometry gets its own model and fields under <campaign_dir>/geometries/<key>/.
+#   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml --dry-run   (prints the first evaluation's command)
+#   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml             (runs until max_evals; a rerun continues;
+#                                                                                --max-hours H for a time slot)
+#   pcr optimize-status configs/examples/hchc1p5/mobo_campaign.toml
+#   pcr optimize-verify configs/examples/hchc1p5/mobo_campaign.toml --pareto    (every particle, SC 128^3 every step)
+# Every evaluation uses the GPU: run the campaign when nothing else does. Stopping the driver (Ctrl+C, closing its
+# window, the end of --max-hours) stops the running evaluation with everything it started.
+#
+# Every electrode option the variables do not set comes from the base design's [geometry] section (the deck's build of
+# wnop3_rotn3_g0ap: star ground, hug dees, dee 0's nose, the moved junctions, gap 0's counter post and round hole).
+#
+# What this loop does not see:
+# * The RF cavity frequency. The channel aperture changes the dee capacitance and so the resonant frequency of the
+#   cavity; the BEM fields here are electrostatic at the fixed harmonic and frequency of [machine]. Check the final
+#   design's frequency (and the voltage it then reaches) separately, with the RF cavity model.
+# * The gap-0 hole does not follow the inflector. The base's hole (geometry.holes[0], s 46.12 mm along dee 0's gap-0
+#   edge) sits where the hand-off bunch meets that edge at 4.726 deg; the crossing moves by about -1 mm per degree of
+#   rotation (s 55.5 / 51.6 / 48.3 / 44.6 / 40.1 mm at -3.27 / +0.73 / +4.73 / +8.73 / +12.73 deg, from
+#   geometry.build.gap0_hole), so at the ends of the si_rot range the R 10 mm hole is 6-9 mm off the beam and the
+#   rotation's scores include that misalignment. Re-centre the hole of a chosen rotation (`python -m
+#   PyCentralRegion.geometry.build hole ...`) before reading a rotation trend as physics.
+
+[mobo]
+campaign_dir = "E:/HCHC1.5/Results/CR/mobo/campaign_wnop3_rotn3_g0ap"
+base_config_file = "design_wnop3_rotn3_g0ap.toml"
+physics_python = "C:/Users/Daniel/anaconda3/envs/accel-dev-env/python.exe"
+sampler = "gp"                 # constrained 3-objective GP (logCEHVI) over 13 coordinates; "tpe" works on the same store
+seed = 0
+n_startup = 16                 # the warm start and 15 random designs (4 geometries with their cheap followers)
+max_evals = 120                # ~30 geometries x (1 + cheap_per_geometry): about 11 h of evaluations
+cheap_per_geometry = 3
+failed_as_infeasible = false   # a failed build, BEM or tracking blocks only its own design (a design that loses its
+                               # beam is learnt either way: the scorer skips it, and it enters with the worst values)
+fixed = [
+    'geometry.si_rotation="fixed"',      # the builder turns the housing by [inflector] rotation_deg (a variable here;
+                                         # the base's "corner" rule gives 4.726 deg, the same build at that angle)
+    "btrim.r_min_m=0.05", "btrim.r_max_m=0.135",   # radial extent of the trim (its shape is not optimised here)
+]
+# The base design first: its channel (26 mm inside r = 100 mm, 32 mm beyond r = 140 mm: centre 120, length 40, as its
+# [geometry] sets it and its model cr_model_wnop3_rotn3_g0ap_model3d.pkl has it), every other variable at the base
+# config's value (the rotation 4.726 deg, phase -15 deg, no trim, no slit).
+warm_start = [{ap_inner = 26.0, ap_outer = 32.0, ap_center = 120.0, ap_length = 40.0}]
+
+# --- geometry: the beam channel (full heights of the dees' opening; the dummy dees share them) ---------------------
+# Bounds (checked at build time; `python -m PyCentralRegion.geometry.build bounds design_wnop3_rotn3_g0ap.toml` prints
+# them): every height <= 2 x (plate_half_gap_mm - dee_wall_mm) = 2 x (25 - 5) = 40 mm (the base's +-25 mm pole-nose
+# faces and 5 mm dee plates: the +-20 mm upper limit of the opening agreed with IBA); the inner height >= 2 x the
+# housing exit's half height = 2 x 10.74 mm = 21.5 mm (the exit circle's largest |z| in the sp1Lo_c1 housing
+# outline). The taper runs linearly over centre -+ length / 2; centre >= length / 2 + 10 mm at every corner of the
+# box keeps the taper's inner end at r >= 10 mm (it must be > 0).
+[[mobo.variables]]
+name = "ap_inner"
+target = "geometry.aperture_inner_mm"    # inside the taper [mm]
+low = 22.0
+high = 40.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "ap_outer"
+target = "geometry.aperture_outer_mm"    # beyond it [mm] (smaller than ap_inner is allowed: an inverted taper)
+low = 26.0
+high = 40.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "ap_center"
+target = "geometry.aperture_taper_center_mm"   # [mm]
+low = 90.0
+high = 220.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "ap_length"
+target = "geometry.aperture_taper_length_mm"   # [mm]
+low = 10.0
+high = 160.0
+kind = "geometry"
+
+# --- geometry: the spiral inflector's rotation about the machine axis (housing, exit and hand-off bunch turn with it,
+# gap 0's variable segment follows the exit plate: geometry.gap0_on_plate; the tracker checks that the model was built
+# with the same angle; the gap-0 hole does not follow: see the header) ---------------------------------------------
+[[mobo.variables]]
+name = "si_rot"
+target = "inflector.rotation_deg"        # +-8 deg about the base design's 4.726 deg (exit-plate corner on gap 0's ray)
+low = -3.274
+high = 12.726
+kind = "geometry"
+
+# --- cheap: RF, dee voltage, magnetic trim -------------------------------------------------------------------------
+[[mobo.variables]]
+name = "phase"
+target = "track.phases_deg"              # one RF phase per evaluation [deg]
+low = -40.0
+high = 0.0
+as_list = true
+
+[[mobo.variables]]
+name = "volt"
+target = "track.volt_scale"              # dee voltage / the 65 kV the BEM fields are normalised to
+low = 0.95
+high = 1.10
+
+[[mobo.variables]]
+name = "trim_amp"
+target = "btrim.amplitude_t"             # first-harmonic trim amplitude [T]
+low = 0.0
+high = 2e-3
+
+[[mobo.variables]]
+name = "trim_phase"
+target = "btrim.phase_deg"               # its azimuth [deg]
+low = -180.0
+high = 180.0
+
+# --- cheap: a radial slit inside dee 3 (an obstacle in a field-free region: the fields are unchanged) ---------------
+[[mobo.variables]]
+name = "slit_hw"
+target = "slit.half_width_mm"            # half the opening [mm]; 0 = no slit (the warm start)
+low = 0.0
+high = 8.0
+
+[[mobo.variables]]
+name = "slit_az"
+target = "slit.azimuth_deg"              # inside dee 3 (315 -+ 16.3 deg at the nominal opening), ~3 deg in from
+                                         # its edges
+low = 302.0
+high = 328.0
+
+[[mobo.variables]]
+name = "slit_pass"
+target = "slit.pass_index"               # centred on the reference particle's crossing number 1, 2 or 3 of that ray
+low = 1
+high = 3
+integer = true
+
+[[mobo.variables]]
+name = "slit_offset"
+target = "slit.offset_mm"                # added to that centre [mm]
+low = -5.0
+high = 5.0
+
+# --- objectives and constraints ------------------------------------------------------------------------------------
+[[mobo.objectives]]
+metric = "I_final"                       # T x injected current [mA]
+direction = "maximize"
+
+[[mobo.objectives]]
+metric = "valley_all"                    # share of probe crossings between the turns, mean of the 8 probes
+direction = "minimize"
+
+[[mobo.objectives]]
+metric = "ratio"                         # aspect ratio of the bunch core at the last turn
+direction = "minimize"
+
+[[mobo.constraints]]
+metric = "E_med"                         # median final energy [MeV]
+op = ">="
+value = 2.9
+
+# Clean turns need the energy spread too: turn_sigR <= 3 mm (8 sigma at a 24 mm turn separation) needs
+# dE_E_robust <= ~1.3 % at R = 330 mm (README, "Constraint"). The designs so far sit near 1.9 %, so with it enabled
+# from the start no evaluation is feasible and the sampler has nothing to steer by. Enable it here once the Pareto
+# set comes near it: the store keeps every evaluation's scores, so the earlier ones are judged by it as well.
+# [[mobo.constraints]]
+# metric = "dE_E_robust"
+# op = "<="
+# value = 0.013
+
+# --- fidelities ----------------------------------------------------------------------------------------------------
+[mobo.fidelities.search]       # what the sampler learns from: 10k particles (all of them tracked for the 8 probes'
+                               # valley share), SC 64^3 every 5 steps, 7 turns
+overrides = ["track.turns=7", "track.n_final=10000", "track.sc_final_cells=64", "track.sc_final_every=5",
+             "track.n_tracks=10000"]
+timeout_min = 60.0             # a new geometry: build + 3D BEM + tracking
+
+[mobo.fidelities.verify]       # pcr optimize-verify: every particle, SC 128^3 every step, 8 turns
+overrides = ["track.n_final=0", "track.sc_final_cells=128", "track.sc_final_every=1", "track.turns=8"]
+timeout_min = 240.0

@@ -1,0 +1,76 @@
+# Toy MOBO campaign: the shape of a real campaign (cheap and geometry variables, a log and an integer variable, a
+# list-valued target, three objectives, a constraint, a warm start, two fidelities) answered by the analytic toy
+# evaluator, so the whole loop runs in seconds without the physics stack or a GPU. It is the dry run of the driver:
+#   pcr optimize        configs/examples/toy/campaign.toml          (30 evaluations, a few seconds)
+#   pcr optimize-status configs/examples/toy/campaign.toml
+#   pcr optimize-verify configs/examples/toy/campaign.toml --pareto
+# The toy's Pareto front is valley_all = 1 - sqrt(1 - I_final) for I_final <= sqrt(2/3) (see PyCentralRegion.mobo.toy).
+
+[mobo]
+campaign_dir = "../../../output/mobo_toy"
+base_config_file = "base.toml"
+evaluator = "PyCentralRegion.mobo.toy"
+sampler = "tpe"
+seed = 1
+n_startup = 10
+max_evals = 30
+cheap_per_geometry = 2
+warm_start = [{phase = -20.0, volt = 1.0, trim = 1e-3, width = 3.0, posts = 2}]
+
+[[mobo.variables]]
+name = "phase"
+target = "toy.phases_deg"
+low = -40.0
+high = 0.0
+as_list = true
+
+[[mobo.variables]]
+name = "volt"
+target = "toy.volt_scale"
+low = 0.95
+high = 1.10
+
+[[mobo.variables]]
+name = "trim"
+target = "toy.trim_t"
+low = 1e-5
+high = 1e-2
+log = true
+
+[[mobo.variables]]
+name = "width"
+target = "toy.gap_width_mm"
+low = 2.0
+high = 8.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "posts"
+target = "toy.n_posts"
+low = 0
+high = 4
+integer = true
+kind = "geometry"
+
+[[mobo.objectives]]
+metric = "I_final"
+direction = "maximize"
+
+[[mobo.objectives]]
+metric = "valley_all"
+direction = "minimize"
+
+[[mobo.objectives]]
+metric = "ratio"
+direction = "minimize"
+
+[[mobo.constraints]]
+metric = "E_med"
+op = ">="
+value = 2.9
+
+[mobo.fidelities.search]
+overrides = ["toy.noise=0.01"]     # the search fidelity is noisy, like 10k particles at SC 64^3
+
+[mobo.fidelities.verify]
+overrides = []                     # the verify fidelity is exact, like every particle at SC 128^3

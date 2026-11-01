@@ -1,27 +1,40 @@
+"""Single-particle acceleration: bunch phase, RF frequency and injection point that reach a target energy.
+
+Shows: the injection SEO (SEOFinder.find_seo_newton) at 100 mm, four double-gap thin-gap cavities
+(create_four_cavity_system, h = 4), and AcceleratedOrbitFinder.optimize (Nelder-Mead over bunch phase,
+RF frequency, r0 and vr0) with a CSV checkpoint of every evaluation; then the accelerated orbit's energy,
+radius, turn separation, RF phase, energy gain per turn and orbit-centring diagnostics.
+Inputs: <resources>/midplane_field_0.5mm.comsol (COMSOL midplane export of a muon cyclotron, 0.5 mm grid).
+Runtime: about 30 s (the field map load and the injection SEO; the optimization itself takes seconds).
+Outputs: <out>/acceleration_optimization.csv (read by example 03), accelerated_orbit_analysis.png,
+optimized_orbit.pkl, optimization_summary.txt.
+
+Usage:
+    python examples/02_optimize_acceleration.py [--resources DIR] [--out DIR]
 """
-02_optimize_acceleration.py - Optimize Accelerated Cyclotron OrbitsDemonstrates RF parameter optimization for particle acceleration.
-Finds optimal bunch phase and RF frequency for reaching target energy.Updated to use unified AcceleratedOrbitFinder (n_particles=1 for single particle).Usage:
-python 02_optimize_acceleration.py
-"""
-import sys
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
-from PyPATools.species import IonSpecies
-from PyPATools.particles import ParticleDistribution
 from PyPATools.field import Field
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+
+import _common
 from PyCentralRegion.central_region import CentralRegion
 from PyCentralRegion.seo_finder import SEOFinder
 from PyCentralRegion.rf_cavity import create_four_cavity_system
 from PyCentralRegion.accelerated_orbit_finder import (AcceleratedOrbitFinder,
                                                       make_single_particle_beam)
 
+FIELD_FILE = 'midplane_field_0.5mm.comsol'
+
+
 def main():
+    args = _common.parse(_common.arguments(__doc__))
+    field_path = _common.require(args.resources / FIELD_FILE)
+    output_dir = args.out
     print("=" * 70)
     print("ACCELERATED ORBIT OPTIMIZATION (SINGLE PARTICLE)")
-    print("=" * 70)# ========================================================================
+    print("=" * 70)
+
+    # ========================================================================
     # Setup: Create design and load field
     # ========================================================================
 
@@ -37,14 +50,6 @@ def main():
     print(f"   Mass: {design.species.mass_mev:.3f} MeV/c^2")
     print(f"   Charge: {design.species.q}e")
     print(f"   Target energy: {target_energy_mev} MeV")
-
-    # Load magnetic field
-    field_path = Path(__file__).parent.parent / 'resources' / 'midplane_field_0.5mm.comsol'
-
-    if not field_path.exists():
-        print(f"\nERROR: Field file not found: {field_path}")
-        print("Please ensure midplane_field_0.5mm.comsol is in resources/")
-        sys.exit(1)
 
     print(f"\n2. Loading magnetic field from {field_path.name}...")
     design.set_magnetic_field(field_path, interpolator_backend='fast')
@@ -131,9 +136,6 @@ def main():
     print("OPTIMIZING ACCELERATION PARAMETERS")
     print("=" * 70)
 
-    # Create output directory for checkpoint
-    output_dir = Path(__file__).parent.parent / 'output'
-    output_dir.mkdir(exist_ok=True)
     checkpoint_file = output_dir / 'acceleration_optimization.csv'
 
     # Create optimizer (n_particles=1 for single particle mode)
@@ -196,22 +198,26 @@ def main():
     print(f"  RF frequency: {result.rf_frequency_mhz:.6f} MHz")
     print(f"  Initial radius: {result.initial_r_mm:.2f} mm")
 
+    metrics = result.turn_metrics
     print(f"\nTurn metrics:")
-    if len(result.turn_metrics['r_center']) > 0:
-        print(f"  Initial radius: {result.turn_metrics['r_center'][0] * 1000:.2f} mm")
-        print(f"  Final radius: {result.turn_metrics['r_center'][-1] * 1000:.2f} mm")
-        print(f"  Max breathing: {np.max(result.turn_metrics['r_spread']) * 1000:.2f} mm")
-        if len(result.turn_metrics['dr']) > 0:
-            print(f"  Mean turn separation: {np.mean(result.turn_metrics['dr']) * 1000:.2f} mm")
-            print(f"  Turn separation std: {np.std(result.turn_metrics['dr']) * 1000:.2f} mm")
+    if len(metrics['r_avg']) > 0:
+        print(f"  Mean radius, first / last turn: {metrics['r_avg'][0] * 1e3:.2f} / "
+              f"{metrics['r_avg'][-1] * 1e3:.2f} mm")
+        # first-harmonic fit with the acceleration spiral removed (the centroid
+        # metric r_center is biased by ~dr/2pi on an accelerated orbit)
+        print(f"  Largest orbit-centre offset: {np.max(metrics['r_center_h1']) * 1e3:.2f} mm")
+        if len(metrics['dr']) > 0:
+            print(f"  Turn separation: {np.mean(metrics['dr']) * 1e3:.2f} "
+                  f"+- {np.std(metrics['dr']) * 1e3:.2f} mm")
 
-    print(f"\nRF cavity performance:")
-    total_crossings = sum(cav.n_crossings for cav in design.rf_cavities)
-    total_energy = sum(cav.total_energy_gain for cav in design.rf_cavities)
-    print(f"  Total cavity crossings: {total_crossings}")
-    print(f"  Total energy gain: {total_energy / 1.602176634e-13:.3f} MeV")
-    print(f"  Average energy per crossing: {total_energy / total_crossings / 1.602176634e-16:.2f} keV"
-          if total_crossings > 0 else "  N/A")
+    # energy gain per turn from the per-turn statistics: every turn crosses each gap once
+    turn_energy = np.array([t.mean_energy_mev for t in result.turn_statistics])
+    gain_kev = np.diff(turn_energy) * 1e3
+    n_gaps = len(design.rf_cavities)
+    if len(gain_kev) > 0:
+        print(f"\nEnergy gain: {gain_kev.sum() / 1e3:.3f} MeV in {len(gain_kev)} turns, "
+              f"{gain_kev.mean():.0f} keV per turn = {gain_kev.mean() / n_gaps:.1f} keV per "
+              f"gap crossing ({n_gaps} gaps of {cavity_voltage / 1e3:.0f} kV)")
 
     # ========================================================================
     # Visualization
@@ -291,7 +297,7 @@ def main():
         ax4.set_title('Turn Separation')
         ax4.grid(True, alpha=0.3)
 
-    # Plot 5: Breathing (radial oscillation amplitude)
+    # Plot 5: rms of the radius over each turn (flutter scalloping, centre offset, spiral)
     ax5 = plt.subplot(3, 4, 5)
     if len(result.turn_metrics['r_spread']) > 0:
         r_spread_mm = result.turn_metrics['r_spread'] * 1000
@@ -299,7 +305,7 @@ def main():
                  linewidth=2, markersize=4, color='orange')
         ax5.set_xlabel('Turn Number')
         ax5.set_ylabel('Radial Spread (mm)')
-        ax5.set_title('Betatron Oscillation Amplitude')
+        ax5.set_title('Radius rms over a Turn')
         ax5.grid(True, alpha=0.3)
 
     # Plot 6: Poincare section (r vs vr)
@@ -324,20 +330,17 @@ def main():
     ax7.set_title('Synchrotron Oscillation')
     ax7.grid(True, alpha=0.3)
 
-    # Plot 8: Energy gain per cavity crossing
+    # Plot 8: Energy gain per turn, against the crest gain of all gaps
     ax8 = plt.subplot(3, 4, 8)
-    if len(result.rf_crossings) > 0:
-        crossing_turns = [c.turn for c in result.rf_crossings]
-        energy_gains = [c.energy_gain_kev for c in result.rf_crossings]
-        cavity_ids = [c.cavity_id for c in result.rf_crossings]
-
-        scatter = ax8.scatter(crossing_turns, energy_gains, c=cavity_ids,
-                              cmap='tab10', s=10, alpha=0.6)
-        plt.colorbar(scatter, ax=ax8, label='Cavity ID')
-        ax8.set_xlabel('Turn Number')
-        ax8.set_ylabel('Energy Gain (keV)')
-        ax8.set_title('Energy Gain per RF Crossing')
-        ax8.grid(True, alpha=0.3)
+    ax8.plot(np.arange(1, len(gain_kev) + 1), gain_kev, 'o-', linewidth=2, markersize=4,
+             color='teal')
+    ax8.axhline(y=n_gaps * cavity_voltage / 1e3, color='r', linestyle='--',
+                label=f'Crest: {n_gaps} x {cavity_voltage / 1e3:.0f} kV')
+    ax8.set_xlabel('Turn Number')
+    ax8.set_ylabel('Energy Gain (keV / turn)')
+    ax8.set_title('Energy Gain per Turn')
+    ax8.legend(fontsize=8)
+    ax8.grid(True, alpha=0.3)
 
     # Plot 9: Radius vs Energy
     ax9 = plt.subplot(3, 4, 9)
@@ -365,27 +368,30 @@ def main():
         ax10.set_title('Optimization Convergence')
         ax10.grid(True, alpha=0.3)
 
-    # Plot 11: RF crossing phases distribution
+    # Plot 11: Orbit-centre offset per turn, both metrics
     ax11 = plt.subplot(3, 4, 11)
-    if len(result.rf_crossings) > 0:
-        crossing_phases = [c.phase_deg for c in result.rf_crossings]
-        ax11.hist(crossing_phases, bins=36, alpha=0.7, edgecolor='black')
-        ax11.set_xlabel('Crossing Phase (degrees)')
-        ax11.set_ylabel('Count')
-        ax11.set_title('RF Crossing Phase Distribution')
-        ax11.grid(True, alpha=0.3)
+    turn_nums = np.arange(1, len(metrics['r_center']) + 1)
+    ax11.plot(turn_nums, metrics['r_center_h1'] * 1e3, 'o-', linewidth=2, markersize=4,
+              label='first-harmonic fit')
+    ax11.plot(turn_nums, metrics['r_center'] * 1e3, 's--', markersize=3, alpha=0.6,
+              label='centroid (spiral-biased)')
+    ax11.set_xlabel('Turn Number')
+    ax11.set_ylabel('Orbit-Centre Offset (mm)')
+    ax11.set_title('Orbit Centering')
+    ax11.legend(fontsize=8)
+    ax11.grid(True, alpha=0.3)
 
-    # Plot 12: Orbit centering (mean radius per turn)
+    # Plot 12: Orbit-centre (turn centroid) drift in the plane
     ax12 = plt.subplot(3, 4, 12)
-    if len(result.turn_metrics['r_center']) > 0:
-        turn_nums = np.arange(len(result.turn_metrics['r_center'])) + 1
-        ax12.plot(turn_nums, result.turn_metrics['r_center'] * 1000,
-                 'o-', linewidth=2, markersize=4, color='blue', label='Actual')
-        ax12.set_xlabel('Turn Number')
-        ax12.set_ylabel('Mean Radius (mm)')
-        ax12.set_title('Orbit Centering')
-        ax12.legend()
-        ax12.grid(True, alpha=0.3)
+    scatter = ax12.scatter(metrics['x_center'] * 1e3, metrics['y_center'] * 1e3,
+                           c=turn_nums, cmap='viridis', s=25)
+    ax12.plot(metrics['x_center'] * 1e3, metrics['y_center'] * 1e3, '-', color='gray', alpha=0.5)
+    plt.colorbar(scatter, ax=ax12, label='Turn')
+    ax12.set_xlabel('x (mm)')
+    ax12.set_ylabel('y (mm)')
+    ax12.set_title('Turn Centroid Drift')
+    ax12.set_aspect('equal', adjustable='datalim')
+    ax12.grid(True, alpha=0.3)
 
     # Overall title
     fig.suptitle(f'Accelerated Orbit Optimization: {species}, '

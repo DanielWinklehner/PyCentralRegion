@@ -516,6 +516,7 @@ class BunchTracker:
                              'stop_step': np.array([hit_step.get(int(i), n_steps + 1) for i in track_ids]),
                              'n_steps': int(n_steps), 'steps_per_turn': int(tc.steps_per_turn),
                              'birth_step': np.asarray(np.round((birth - t_clock0) / dt), dtype=int)[track_ids],
+                             'handoff_ids': np.asarray(getattr(bunch, 'handoff_index', ids))[track_ids],
                              'E_mev': kinetic_energy_mev(fb.last[track_ids, 3:6], mass)}
         return ok
 

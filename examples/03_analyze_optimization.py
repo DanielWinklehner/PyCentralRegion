@@ -1,20 +1,23 @@
-"""
-03_analyze_optimization.py - Analyze Optimization Checkpoint Data
+"""Post-processing of an optimization checkpoint: convergence, explored parameter space, best solutions.
 
-Post-processing tool to visualize and analyze optimization progress
-from checkpoint CSV files generated during accelerated orbit optimization.
+Shows: the per-evaluation checkpoint CSV that AcceleratedOrbitFinder writes (checkpoint_file=...) read with
+pandas - success rate, best solution, explored bunch-phase / RF-frequency ranges, cost and energy
+distributions - and the top-10 solutions exported as CSV.
+Inputs: a checkpoint CSV; default <out>/acceleration_optimization.csv, written by example 02.
+Runtime: seconds.
+Outputs: <out>/best_solutions.csv, <out>/optimization_analysis.png.
 
 Usage:
-    python 03_analyze_optimization.py [checkpoint_file.csv]
-
-If no file specified, looks for 'output/acceleration_optimization.csv'
+    python examples/03_analyze_optimization.py [CHECKPOINT.csv] [--out DIR]
 """
-
 import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
 import pandas as pd
+
+import _common
 
 
 def load_checkpoint(filename):
@@ -51,8 +54,6 @@ def analyze_optimization(df):
         # Best solution
         best_idx = successful_runs['cost'].idxmin()
         best_run = successful_runs.loc[best_idx]
-
-        print(best_run.keys())
 
         print(f"\n--- BEST SOLUTION ---")
         print(f"Iteration: {int(best_run['iteration'])}")
@@ -147,10 +148,9 @@ def plot_optimization_progress(df, successful_runs, output_dir):
                               s=20, alpha=0.6)
         plt.colorbar(scatter, ax=ax2, label='Cost')
 
-        # Target line if identifiable
-        target_energy = successful_runs['final_energy_mev'].max()
-        ax2.axhline(y=target_energy, color='r', linestyle='--',
-                    alpha=0.5, label=f'Target: {target_energy:.1f} MeV')
+        e_max = successful_runs['final_energy_mev'].max()
+        ax2.axhline(y=e_max, color='r', linestyle='--',
+                    alpha=0.5, label=f'Highest reached: {e_max:.2f} MeV')
 
     ax2.set_xlabel('Iteration')
     ax2.set_ylabel('Final Energy (MeV)')
@@ -256,7 +256,8 @@ def plot_optimization_progress(df, successful_runs, output_dir):
     if successful_runs is not None and len(successful_runs) > 0:
         energies = successful_runs['final_energy_mev'].values
         ax8.hist(energies, bins=30, alpha=0.7, edgecolor='black')
-        ax8.axvline(x=energies[successful_runs['cost'].idxmin()],
+        # idxmin is an index LABEL (the failed rows are filtered out), not a position
+        ax8.axvline(x=successful_runs.loc[successful_runs['cost'].idxmin(), 'final_energy_mev'],
                     color='r', linestyle='--', linewidth=2, label='Best solution')
 
     ax8.set_xlabel('Final Energy (MeV)')
@@ -332,17 +333,13 @@ def main():
     print("OPTIMIZATION CHECKPOINT ANALYSIS")
     print("=" * 70)
 
-    # Get checkpoint file
-    if len(sys.argv) > 1:
-        checkpoint_file = Path(sys.argv[1])
-    else:
-        checkpoint_file = Path(__file__).parent.parent / 'output' / 'acceleration_optimization.csv'
-
-    if not checkpoint_file.exists():
-        print(f"\nERROR: Checkpoint file not found: {checkpoint_file}")
-        print("\nUsage: python 03_analyze_optimization.py [checkpoint_file.csv]")
-        print("   or: Run after 02_optimize_acceleration.py to use default location")
-        sys.exit(1)
+    ap = _common.arguments(__doc__)
+    ap.add_argument('checkpoint', nargs='?', type=Path,
+                    help='checkpoint CSV (default: <out>/acceleration_optimization.csv from example 02)')
+    args = _common.parse(ap)
+    checkpoint_file = _common.require(args.checkpoint or args.out / 'acceleration_optimization.csv',
+                                      'run example 02 first, or name a checkpoint CSV')
+    output_dir = args.out
 
     print(f"\nAnalyzing: {checkpoint_file}")
 
@@ -351,9 +348,6 @@ def main():
 
     # Analyze
     successful_runs = analyze_optimization(df)
-
-    # Output directory
-    output_dir = checkpoint_file.parent
 
     # Export best solutions
     if successful_runs is not None:

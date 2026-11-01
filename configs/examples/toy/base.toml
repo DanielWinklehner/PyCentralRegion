@@ -1,0 +1,16 @@
+# Base run of the toy campaign. The toy evaluator (python -m PyCentralRegion.mobo.toy) reads [toy] and, for the
+# geometry, paths.model3d / paths.fields; it scores a design with analytic functions in milliseconds (no physics).
+# The values below are the toy's defaults; the campaign's variables override them.
+
+[run]
+name = "toy"
+
+[toy]
+phases_deg = [-20.0]      # cheap: moves the design along the Pareto front
+volt_scale = 1.0          # cheap: best at 1.02
+trim_t = 1e-3             # cheap, log-scaled: best at 10^-3.5
+gap_width_mm = 3.0        # geometry: best at 4.4 mm
+n_posts = 2               # geometry, integer: best at 2
+fail_above_mm = 1e9       # the toy "build" fails for gap_width_mm above this
+noise = 0.0               # amplitude of a deterministic pseudo-random error on every score (a low fidelity)
+sleep_s = 0.0             # seconds every evaluation takes

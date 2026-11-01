@@ -1,9 +1,9 @@
 """
 handoff.py - Spiral-inflector hand-off bunches as initial beams.
 
-Reads the openPMD plane-crossing files written by the HCHC-60 spiral-inflector
-deck (spec version 1, 2026-09-07: ``BunchTrack.py --save-openpmd``, see
-``Spiral_inflector/Docs/openpmd_plane_crossing_handoff.md``) and turns them
+Reads the openPMD plane-crossing files written by the spiral-inflector deck
+(spyral_inflector, spec version 1, 2026-09-07: ``BunchTrack.py --save-openpmd``,
+see ``Spiral_inflector/Docs/openpmd_plane_crossing_handoff.md``) and turns them
 into a ``ParticleDistribution`` for ``AcceleratedOrbitFinder``.
 
 Two launch modes
@@ -198,6 +198,7 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
     pd = ParticleDistribution(species=species, x_vec=r.copy(), p_vec=np.zeros_like(r))
     pd.set_p_from_v_vec(v.copy())
     pd.birth_time = birth
+    pd.handoff_index = idx                      # the hand-off file's particle of every bunch particle
     pd.reference_state = (x_ref, v_ref)
     pd.macro_charge_c = w_mean * n_total / n
     pd.handoff_meta = {
