@@ -29,3 +29,12 @@ def test_stage_commands_take_a_run_file(command, capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main([command, '--help'])
     assert exc.value.code == 0 and '--set' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('command, option', [('optimize', '--max-evals'), ('optimize-verify', '--pareto'),
+                                             ('optimize-status', 'campaign TOML')])
+def test_campaign_commands_reach_the_driver(command, option, capsys):
+    """The optimize commands go to mobo.driver with their name, which parses the rest itself."""
+    with pytest.raises(SystemExit) as exc:
+        cli.main([command, '--help'])
+    assert exc.value.code == 0 and option in capsys.readouterr().out

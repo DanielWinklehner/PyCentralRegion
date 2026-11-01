@@ -7,7 +7,11 @@
     pcr score    run.toml [--set ...]       metrics of run.out_dir -> run.out_dir/score.json (analysis)
     pcr evaluate --config run.toml [--set ...] --out DIR
                                             build -> fields -> track -> score into DIR; DIR/result.json
-    pcr optimize mobo.toml [...]            multi-objective Bayesian optimisation campaign   (mobo.driver)
+    pcr optimize        campaign.toml [--max-evals N] [--max-hours H] [--dry-run]
+                                            run or continue a multi-objective Bayesian optimisation (mobo.driver)
+    pcr optimize-verify campaign.toml (--ids ID ... | --pareto) [--fidelity NAME]
+                                            re-evaluate evaluations at the verify fidelity
+    pcr optimize-status campaign.toml       table of the evaluations, Pareto set, best values
 
 A stage reuses an output that exists and never overwrites one: point the path elsewhere to recompute. ``--set
 section.key=value`` overrides the files; the value is read as TOML (``--set track.phases_deg=[-15.0]``), else as a
@@ -112,12 +116,18 @@ def _cmd_fields(args):
     return 0
 
 
-def _cmd_optimize(args):
-    from .mobo.driver import main as driver_main
-    return driver_main(args.rest)
+OPTIMIZE_COMMANDS = {'optimize': 'run or continue a MOBO campaign',
+                     'optimize-verify': 're-evaluate campaign evaluations at the verify fidelity',
+                     'optimize-status': 'table of a campaign: evaluations, Pareto set, best values'}
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] in OPTIMIZE_COMMANDS:
+        # the campaign driver parses its own arguments (`pcr optimize --help`); it runs in a small environment of its
+        # own, so nothing of the physics stack is imported on this path
+        from .mobo.driver import main as driver_main
+        return driver_main(argv)
     p = argparse.ArgumentParser(prog='pcr', description=__doc__.split('\n\n')[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='command', required=True)
@@ -134,9 +144,8 @@ def main(argv=None):
     from .mobo.evaluate import add_arguments
     s = add_arguments(sub.add_parser('evaluate', help='build -> fields -> track -> score into --out (result.json)'))
     s.set_defaults(func=_cmd_evaluate)
-    s = sub.add_parser('optimize', help='run or continue a MOBO campaign (pcr optimize --help)')
-    s.add_argument('rest', nargs=argparse.REMAINDER)
-    s.set_defaults(func=_cmd_optimize)
+    for name, text in OPTIMIZE_COMMANDS.items():          # listed for `pcr --help`; main hands them to the driver
+        sub.add_parser(name, help=f"{text} (pcr {name} --help)")
     args = p.parse_args(argv)
     return args.func(args)
 
