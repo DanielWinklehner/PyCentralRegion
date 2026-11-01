@@ -2,16 +2,17 @@
 # The values reproduce the 3D campaign's run scoring of 2026-11-01, so new scores compare with its tables.
 # Score keys that carry a number take it from here: halo3 from halo_sigma, I_2pct from energy_windows, acc90 from
 # acceptance_levels, valley_rad20 and best_slit.20 from slit_budgets, ratio_t3 / sig_r_t3 / compress_t3 from
-# proxy_turns. The metrics an optimizer may use are listed in PyCentralRegion.analysis.objectives.METRICS.
+# proxy_turns (change one and the key changes with it). The metrics an optimizer may use are listed in
+# PyCentralRegion.analysis.objectives.METRICS.
+# The machine is not set here: the harmonic and the loss limits come from the run's track.json, else the [machine]
+# table of its config.json; the species from that table, else the hand-off file (analysis.metrics.run_constants). A run
+# of the original design deck takes the table load_legacy_run is given, else the [machine] defaults.
 # tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/analysis/objectives.py.
 
 [score]
-# fallbacks for what a run's json may not record (runs of the original design deck)
-harmonic = 4                # RF harmonic when the json lacks harmonic, rf_mhz or f_rev_mhz (else h = rf / f_rev)
-r_max_m = 0.38              # loss radius when the run records no json['limits']
-z_max_m = 0.030             # loss half-height when the run records no json['limits']
-b0_t = 0.0                  # |B| at the bunch for the vortex prediction when the json has no field check;
-                            # 0 = the isochronous central field 2 pi f_rev m / q of the hand-off species
+b0_t = 0.0                  # |B| at the bunch for the vortex prediction when the run records no field check;
+                            # 0 = the isochronous central field 2 pi f_rev m / q of the tracked species
+beam = ""                   # label of the injected beam in the score (pcr score); "" = the hand-off file's stem
 
 # which runs are scored
 min_tracks = 5000           # fewer recorded tracks: the run is skipped
@@ -22,8 +23,10 @@ energy_windows = [0.05, 0.02, 0.01]   # +-rel windows: I_<p>pct around the media
 
 # acceptance in hand-off release phase
 phase_bin_deg = 5.0         # bins of the survival curve
-phase_range_deg = 120.0     # the bins span +-range (phases beyond fall into the end bins)
+phase_range_deg = 120.0     # the bins span +-range (phases beyond: in the survival curve's end bins, not in
+                            # release_bins)
 min_bin_count = 40          # bins with fewer tracked particles do not count
+min_bin_survivors = 11      # a release_bins bin with fewer survivors reports no final energy and lag
 acceptance_levels = [0.9, 0.8]        # acc<level>: the widest run of bins with survival >= level
 survival_bands_deg = [30.0, 40.0]     # S30: survival for |phase| <= 30 deg; S30_40: 30 < |phase| <= 40
 compression_clip_sigma = 2.5          # compression slopes are fitted to survivors within this many sigma
@@ -33,11 +36,16 @@ handoff_quantiles = 5       # survival per quantile of the hand-off |z| and |z'|
 
 # bunch shape in the bunch frame (r radial, l ahead), per turn
 n_snapshots = 16            # instants per turn
-core_q = 0.95               # core: this share of the particles, smallest Mahalanobis distance
+core_q = 0.95               # core: this share of the particles, smallest Mahalanobis distance; its Gaussian
+                            # equivalent uses the exact variance factor of core_q (0.842330 at 0.95), where the
+                            # campaign's scoring rounded it to 0.8423: halo, vortex-prediction and one-turn-map keys
+                            # differ from its tables by < 0.5 % (about one particle of a few hundred in a halo share)
 halo_sigma = 3.0            # halo<s>: the share beyond s sigma of the Gaussian-equivalent core
 halo_born_turns = [1, 2]    # halo_born_t<t>: share of the last-turn halo that was already halo at turn t
 map_core_sigma = 2.0        # particles within this many core sigma fit a one-turn map (instantaneous and twin)
-proxy_turns = [2, 3]        # flat keys ratio / sig_r / sig_l / s_round / compress / fan of these turns (proxies)
+proxy_turns = [2, 3]        # flat keys ratio / sig_r / sig_l / s_round / compress / fan of these turns (proxies):
+                            # time-turns [t, t + 1) revolutions; the fan keys count revolutions from each particle's
+                            # own start, about a turn earlier (fan_proj_t3 ~ time-turn 2)
 
 # per-particle orbit centres (the centre fan)
 fan_degree = 3              # polynomial in release phase that 'explains' the centres

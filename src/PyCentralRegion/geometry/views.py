@@ -31,6 +31,18 @@ def _seg_distance(p, a, b) -> float:
     return float(np.linalg.norm(p - (a + t * ab)))
 
 
+def _subplots(nrows: int, ncols: int, show: bool = False, **kw):
+    """(figure, axes): a bare matplotlib Figure for a plot written to a file - no pyplot, so the process's backend and
+    its open figures are left alone (a library call must not switch them) - or, ``show``, a pyplot figure for the
+    screen."""
+    if show:
+        import matplotlib.pyplot as plt
+        return plt.subplots(nrows, ncols, **kw)
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=kw.pop('figsize', None))
+    return fig, fig.subplots(nrows, ncols, **kw)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # reports
 def print_gap_lines(dees, result) -> None:
@@ -290,13 +302,11 @@ def print_posts(posts) -> None:
 # ---------------------------------------------------------------------------------------------------------------------
 # plots
 def plot_dee_boundaries(foot, ol: dict, out=None, orbit=None) -> None:
-    """Left: the boundary chains over the gap centre lines and the housing. Right: dee width against radius."""
-    import matplotlib
-    if out:
-        matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    """Left: the boundary chains over the gap centre lines and the housing. Right: dee width against radius. Written
+    to ``out``, else shown on the screen."""
+    from matplotlib.patches import Circle
 
-    fig, (ax, bx) = plt.subplots(1, 2, figsize=(14.5, 7.2), gridspec_kw={'width_ratios': [1.25, 1.0]})
+    fig, (ax, bx) = _subplots(1, 2, show=not out, figsize=(14.5, 7.2), gridspec_kw={'width_ratios': [1.25, 1.0]})
     colours = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
     ring = np.vstack([ol['outer'], ol['outer'][0]])
     ax.plot(ring[:, 0], ring[:, 1], '-', color='0.6', lw=1.2, zorder=2, label='housing outline')
@@ -325,8 +335,8 @@ def plot_dee_boundaries(foot, ol: dict, out=None, orbit=None) -> None:
     ax.plot([0], [0], '+', color='k', ms=10, mew=1.5, zorder=5)
     r_max = foot[0]['r_max']
     for rr in np.arange(50.0, r_max + 1e-9, 50.0):
-        ax.add_patch(plt.Circle((0, 0), rr, fill=False, color='0.9', lw=0.8, zorder=0))
-    ax.add_patch(plt.Circle((0, 0), r_max, fill=False, color='0.7', lw=1.0, ls=':', zorder=0))
+        ax.add_patch(Circle((0, 0), rr, fill=False, color='0.9', lw=0.8, zorder=0))
+    ax.add_patch(Circle((0, 0), r_max, fill=False, color='0.7', lw=1.0, ls=':', zorder=0))
     ax.set_xlim(-1.08 * r_max, 1.08 * r_max)
     ax.set_ylim(-1.08 * r_max, 1.08 * r_max)
     ax.set_aspect('equal')
@@ -349,31 +359,30 @@ def plot_dee_boundaries(foot, ol: dict, out=None, orbit=None) -> None:
     fig.tight_layout()
     if out:
         fig.savefig(out, dpi=140)
-        plt.close(fig)
         print(f"  wrote {out}")
     else:
+        import matplotlib.pyplot as plt
         plt.show()
 
 
-def plot_sections(model_pkl, z_list=None, out=None, r_max: float = 320.0, orbit=None, posts=None) -> Path:
+def plot_sections(model_pkl, z_list=None, out=None, r_max: float = None, orbit=None, posts=None) -> Path:
     """x-y slices of a built model at a set of heights [mm]: every solid's plane section (electrodes3d.section_loops,
     the even-odd outline the obstacle raster uses), so this shows the metal as the tracker sees it. The heights
-    straddle the channel: inside it the electrodes are hollow and the posts stand alone in the opening."""
+    straddle the channel: inside it the electrodes are hollow and the posts stand alone in the opening. Each panel
+    spans +-r_max [mm], by default 5 % beyond the model's edge (params['r_cut'])."""
     import pickle
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
     from matplotlib.patches import Polygon as MplPolygon
     from PyCentralRegion.electrodes3d import loops_from_mesh, solid_meshes
 
     with open(model_pkl, 'rb') as fh:
         model = pickle.load(fh)
     z_list = [0.0, 10.0, 16.0, 18.0, 24.0, 40.0] if z_list is None else list(z_list)
+    r_max = 1.05 * float(model.params['r_cut']) * MM if r_max is None else float(r_max)
     meshes = solid_meshes(model)
     colour = {'dee0': '#d62728', 'dee1': '#ff7f0e', 'dee2': '#2ca02c', 'dee3': '#9467bd', 'ground': '#1f77b4'}
     cols = min(3, len(z_list))
     rows = int(np.ceil(len(z_list) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(4.6 * cols, 4.6 * rows), squeeze=False)
+    fig, axes = _subplots(rows, cols, figsize=(4.6 * cols, 4.6 * rows), squeeze=False)
     for ax, z in zip(axes.ravel(), z_list):
         n_loops = 0
         for name, m in meshes.items():
@@ -401,7 +410,6 @@ def plot_sections(model_pkl, z_list=None, out=None, r_max: float = 320.0, orbit=
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     out = Path(out) if out else Path(model_pkl).with_name(Path(model_pkl).stem + "_sections.png")
     fig.savefig(out, dpi=150)
-    plt.close(fig)
     print(f"[sections] {len(z_list)} slices -> {out}")
     return out
 
@@ -577,39 +585,10 @@ def view_tracks(step_path, data_pkl, n: int = 60, colour_by: str = 'turn', which
     gmsh.finalize()
 
 
-def si_step_files(export_steps_dir, which: str = 'default') -> list:
-    """The spiral inflector's exported STEPs (baseline frame, mm) in ``export_steps_dir`` (the folder of the housing
-    outline): 'default' = electrodes and apertures, 'all' adds the triplet rods, '+housing' the housing B-rep, or a
-    comma-separated list of file stems."""
-    d = Path(export_steps_dir)
-    avail = {f.stem: f for f in sorted(list(d.glob('*.step')) + list(d.glob('*.stp')))
-             if not f.stem.lower().endswith('_negative')}
-    default = ['000_SI_Anode', '001_SI_Cathode', '004_Entrance_Aperture', '005_ent0', '006_ext0', '011_ext4']
-    w = (which or 'default').strip().lower()
-    if w == 'default':
-        names = default
-    elif w == 'all':
-        names = default + [k for k in avail if k[:3].isdigit() and 7 <= int(k[:3]) <= 19 and k[:3] != '011']
-    elif w in ('+housing', 'housing'):
-        names = default + ['002_Housing', '003_Housing_Cylinder']
-    else:
-        names = [v.strip() for v in which.split(',')]
-    out = []
-    for nm in names:
-        hit = [avail[nm]] if nm in avail else [f for k, f in avail.items() if nm.lower() in k.lower()]
-        if not hit:
-            print(f"[view] no spiral-inflector STEP matching {nm!r} in {d}")
-        out += hit
-    return out
-
-
 def beam_frames(data_pkl, out=None, which: str = 'final', n_max: int = 20000, colour: str = 'E') -> Path:
     """The run's snapshots from above, one panel each: the x-y plane turned so the bunch's MEAN momentum points along
     +y' and centred on the centroid, so y' is the longitudinal direction and x' the radial one."""
     import pickle
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
     with open(data_pkl, 'rb') as fh:
         data = pickle.load(fh)
     snaps = _run_of(data, which).get('snapshots') or []
@@ -617,7 +596,7 @@ def beam_frames(data_pkl, out=None, which: str = 'final', n_max: int = 20000, co
         raise ValueError(f"{data_pkl} has no snapshots for {which!r}")
     cols = min(4, len(snaps))
     rows = int(np.ceil(len(snaps) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(3.6 * cols, 3.4 * rows), squeeze=False)
+    fig, axes = _subplots(rows, cols, figsize=(3.6 * cols, 3.4 * rows), squeeze=False)
     rng = np.random.default_rng(0)
     lims, frames = [], []
     for s in snaps:
@@ -666,6 +645,5 @@ def beam_frames(data_pkl, out=None, which: str = 'final', n_max: int = 20000, co
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     out = Path(out) if out else Path(data_pkl).with_name(Path(data_pkl).stem + "_rz_frames.png")
     fig.savefig(out, dpi=160)
-    plt.close(fig)
     print(f"[frames] {len([f for f in frames if f])} snapshots -> {out}")
     return out

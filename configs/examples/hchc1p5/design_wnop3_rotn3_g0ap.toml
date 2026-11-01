@@ -29,11 +29,9 @@ rotation_deg = 4.726034523988023       # the electrode builder's "corner" rotati
 phases_deg = [-15.0]                   # the phase the 4k scan picked
 probes_deg = [25.0, 45.0, 160.0]
 
-# The electrodes as the design deck built them (cr_geom_build.py with CR_SI_ROT=corner, CR_GROUND=star,
-# CR_DEE_INNER=hug, CR_DEE0_NOSE_MM=3, CR_JUNCTION_R=2:124.6,3:208.5, CR_APERTURE_MM=26,32, CR_APERTURE_R_MM=100,140,
-# --dee0-clearance 5 --lc 8 --lc-outer 16 --gap-apertures for the gap-0 hole). The emitting plane is the export's own
-# hand-off beside the housing outline (geometry.emitting_plane_file empty), the exit plane spec the export's
-# exit_plane_spec.json.
+# The electrodes as the design deck built them on 2026-10-31 (`pcr build` reproduces that model bit for bit;
+# docs/porting.md maps the deck's build variables to these keys). The emitting plane is the export's own hand-off beside
+# the housing outline (geometry.emitting_plane_file empty), the exit plane spec the export's exit_plane_spec.json.
 [geometry]
 si_rotation = "corner"                 # gap-0 ray 28.726 deg - the export's 24.0 = inflector.rotation_deg above
 gap0_on_plate = true

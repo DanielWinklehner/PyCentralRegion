@@ -1,43 +1,71 @@
 """Multi-objective Bayesian optimisation of central-region designs, with the full 3D model in the loop.
 
     pcr optimize        <mobo.toml> [--max-evals N] [--max-hours H] [--dry-run] [--set key=value ...]
-    pcr optimize-verify <mobo.toml> (--ids ID ... | --pareto) [--fidelity NAME]
-    pcr optimize-status <mobo.toml>
+    pcr optimize-verify <mobo.toml> (--ids ID ... | --pareto) [--fidelity NAME] [--set key=value ...]
+    pcr optimize-status <mobo.toml> [--set key=value ...]
 
 One evaluation of a design is the whole chain build -> 3D BEM -> bunch tracking with space charge -> scores, run as
 a subprocess of the physics environment (``evaluate``). It costs minutes and one GPU, so the driver runs one
 evaluation at a time and chooses each with a sample-efficient multi-objective sampler (optuna's TPE or Gaussian
 process, both constrained) on the unit cube of the design variables (``space``).
 
-Cost structure: a new electrode geometry needs a build and a 3D BEM (about 10 min); the RF phase, dee voltage, a
-magnetic trim or a slit reuse the fields and only re-track (1-2 min). After every new geometry the driver therefore
-runs ``cheap_per_geometry`` evaluations with the geometry coordinates held at that geometry's values and only the
-cheap ones proposed (TPE through optuna's PartialFixedSampler; the GP through a subclass that maximises its
-acquisition over the free coordinates while its Gaussian processes keep seeing every coordinate). Evaluations of one
-geometry share one model and one field map under ``<campaign_dir>/geometries/<key>/``.
+Cost structure: a new electrode geometry needs a build and its 3D BEM fields (on the worked example the build takes
+~20 s, the fields ~8 min, that evaluation ~10 min in all); the RF phase, dee voltage, a magnetic trim or a slit reuse
+the fields and only re-track (1.5-2 min, most of it the tracking kernel's compile in every new process). After every
+new geometry the driver therefore runs ``cheap_per_geometry`` evaluations with the geometry coordinates held at that
+geometry's values and only the cheap ones proposed (TPE through optuna's PartialFixedSampler; the GP through a
+subclass that maximises its acquisition over the free coordinates while its Gaussian processes keep seeing every
+coordinate). Evaluations of one geometry share one model and one field map under ``<campaign_dir>/geometries/<key>/``.
 
-Fidelities: the sampler learns from the search fidelity (e.g. 10k particles, SC 64^3 every 5 steps, 7 turns);
+Fidelities: the sampler learns from the search fidelity (e.g. 10k particles, SC 64^3 every 5 steps);
 ``optimize-verify`` re-evaluates chosen designs (e.g. the Pareto set) at the verify fidelity (every particle, 128^3
 every step) and stores them next to the originals, so the search-to-verify shift of every score can be read off.
+That shift measures the resolution only when the fidelities differ in nothing else (the same turns, the same
+stopping energy).
 
 State: the store (``store``) is the only state. Before every proposal the optuna study is rebuilt in memory from it
 (``optuna.trial.create_trial`` with the constraint values set on the trial), with a sampler seeded from the
-campaign seed and the evaluation's index: a campaign stopped and continued proposes exactly what an uninterrupted
-one would. Failed evaluations go to the sampler as pending (RUNNING) trials, which keeps TPE (constant liar) and
-the GP (q-batch acquisition) from proposing the same design again without inventing objective values for it; with
-``failed_as_infeasible`` they enter as complete trials with the worst values seen and an extra violated constraint.
-A run the scorer skipped (too few survivors to score) is not a failure but a design known to lose its beam: it
-enters as a complete trial with the metrics its scores carry and the worst values seen for the others, so the
-sampler learns to leave that region (a slit closed too far, an inflector turned too far).
-An evaluation stopped from outside (Ctrl+C, the time budget, a driver that died) says nothing about its design: it
-is recorded failed ('interrupted'), left out of the study and of the budget, and not run again. The model and the
-field cache of a geometry are written whole, so a stop never leaves them cut short: once made they serve the
-geometry's later evaluations. A build stopped before its model leaves outputs that the next build of that geometry
-would refuse to overwrite: those are moved to ``geometries/<key>/stopped-<id>/``.
+campaign seed and the evaluation's index: every proposal follows from the store alone, so a campaign stopped and
+continued proposes what one uninterrupted run would have proposed from the same evaluations - an uninterrupted run's
+designs up to the stop, and after it the proposals of a study without the evaluation that was running at the stop
+(it is lost, see below). A proposal not yet started when the driver stopped is run first, and then nothing is lost.
+The study places every design at its stored unit coordinates, so the variables are the campaign's for good: a
+variable added, removed, renamed, re-ranged or re-targeted once evaluations exist would move every stored design
+under the sampler, and the driver refuses to continue (``check_store``; a new search space is a new campaign_dir,
+whose warm_start can repeat earlier designs). Objectives and constraints are read from the stored scores at every
+proposal, so those may change: a constraint added later judges the earlier evaluations too.
+
+What enters the study:
+* a scored evaluation: a complete trial with its objective and constraint values;
+* an evaluation that finished but whose scores cannot be used - the scorer skipped the run (too few tracks or
+  survivors), or an objective or constraint metric is missing (no probe has enough complete passes for valley_all),
+  null or not finite: the design lost its beam too early to be measured. That is a bad design, not an unknown one,
+  and the sampler must learn to leave its region (a slit closed too far, an inflector turned too far): a complete
+  trial with the worst values seen of every objective and constraint, made infeasible by one extra constraint
+  'scored' (1 for it, 0 for the scored ones; present only while such a trial exists). The store records why
+  (``unusable``) and optimize-status shows it;
+* a failed evaluation (the build, the BEM or the tracking failed, or a timeout): a pending (RUNNING) trial, which
+  keeps TPE (constant liar) and the GP (q-batch acquisition) from proposing that design again without inventing
+  values for it; with ``failed_as_infeasible`` the same infeasible stand-in as an unusable one. Stand-ins need
+  values seen: until every objective and constraint has one, they are pending too;
+* an evaluation stopped from outside (Ctrl+C, the time budget, a driver that died) says nothing about its design:
+  it is recorded failed ('interrupted'), left out of the study and of the budget, and not run again - unless it is
+  a warm-start point, which was asked for by name: that is evaluated again until it has an outcome.
+
+The model and the field cache of a geometry are written whole, so a stop never leaves them cut short: once made they
+serve the geometry's later evaluations. A build stopped before its model leaves outputs that the next build of that
+geometry would refuse to overwrite: those are moved to ``geometries/<key>/stopped-<id>/``.
+
+A metric no scored evaluation has (no run the scorer skipped counts) is a misnamed one and stops the campaign; a
+metric that ``pcr evaluate``'s scorer documents (``analysis.objectives.METRICS``) is never taken for misnamed, since a
+lossy run lacks some of those legitimately.
 
 The driver never schedules or restarts itself: it runs until its budget is spent or it is stopped, and running it
-again continues the campaign. When it stops - Ctrl+C, SIGTERM / Ctrl+Break, the end of max_hours, or killed - the
-running evaluation stops with it, with every process it started (``evaluate.run``).
+again continues the campaign. Before the first evaluation it checks that the physics interpreter finds the evaluator
+(``preflight``), and a run stops after ``max_failed_in_a_row`` failed evaluations in a row: a physics environment
+that cannot run an evaluation would otherwise spend the whole budget on failures. When it stops - Ctrl+C, SIGTERM /
+Ctrl+Break, the end of max_hours, or killed - the running evaluation stops with it, with every process it started
+(``evaluate.run``).
 
 The driver needs only the standard library, numpy and optuna >= 5 (torch and scipy for the GP sampler); it never
 imports the physics modules (the [section] dataclasses it checks the overrides against are plain dataclasses).
@@ -46,6 +74,7 @@ import argparse
 import copy
 import functools
 import importlib.util
+import itertools
 import json
 import math
 import signal
@@ -85,6 +114,32 @@ def pareto_mask(Y):
     """Non-dominated rows of Y, every column to be minimised."""
     Y = np.asarray(Y, dtype=float)
     return np.array([not np.any(np.all(Y <= y, axis=1) & np.any(Y < y, axis=1)) for y in Y], dtype=bool)
+
+
+def value(scores, path):
+    """A score as a float, nan when it is missing, null or not a finite number."""
+    try:
+        return space.metric(scores, path)
+    except KeyError:
+        return math.nan
+
+
+def runs_pcr_evaluate(evaluator):
+    """Whether the evaluator is `pcr evaluate`: its run config is read through the [section]s of config.SECTIONS."""
+    return evaluator.split()[:1] == ['PyCentralRegion.cli']
+
+
+@functools.lru_cache(maxsize=None)
+def scorer_metrics(evaluator):
+    """The metrics `pcr evaluate`'s scorer documents (analysis.objectives.METRICS; importing it needs numpy only), when
+    the evaluator is `pcr evaluate`; None for another evaluator or when the table does not import here."""
+    if not runs_pcr_evaluate(evaluator):
+        return None
+    try:
+        from ..analysis.objectives import METRICS
+    except ImportError:
+        return None
+    return frozenset(METRICS)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -200,20 +255,31 @@ class Campaign:
 
     def check_overrides(self):
         """Every override must name a key that its [section] knows, with a value it accepts: a misspelt target would
-        leave every evaluation of the campaign the same design. Each fidelity's base is checked, and each variable at
-        both ends of its range. Sections without a registered dataclass (the toy's) are not checked."""
+        leave every evaluation of the campaign the same design. Each fidelity's base is checked, and the variables of
+        each [section] at every corner of their box (the campaign's other variables at the base's values): a
+        section's own checks can relate its keys (a channel taper must start at r > 0), and a corner they refuse
+        would fail every evaluation proposed near it. With `pcr evaluate` as the evaluator an override must also name
+        one of the sections it reads (config.SECTIONS): one of another section would change nothing. Another
+        evaluator's own sections (the toy's) are its business and are not checked."""
         cfg = self.cfg
-        items = list(cfg.fixed) + [s for f in cfg.fidelities.values() for s in f.overrides] + [v.target + '='
-                                                                                              for v in cfg.variables]
-        names = sorted({s.split('.')[0] for s in items} & set(config.SECTIONS))
-        cases = [(name, []) for name in cfg.fidelities]
-        cases += [(cfg.search_fidelity, [v.override(v.physical(u))]) for v in cfg.variables for u in (0.0, 1.0)]
-        for fidelity, sets in cases:
-            run = copy.deepcopy(self.base(fidelity))
+        items = list(cfg.fixed) + [s for f in cfg.fidelities.values() for s in f.overrides]
+        roots = {config.parse_override(s)[0][0] for s in items} | {v.target.split('.')[0] for v in cfg.variables}
+        other = sorted(roots - set(config.SECTIONS))
+        if other and runs_pcr_evaluate(cfg.evaluator):
+            raise config.ConfigError(f"[mobo] override(s) of [{'], ['.join(other)}]: pcr evaluate reads only the "
+                                     f"sections [{'], ['.join(config.SECTIONS)}]")
+        names = sorted(roots & set(config.SECTIONS))
+        boxes = {name: [v for v in cfg.variables if v.target.split('.')[0] == name] for name in names}
+        cases = [(fidelity, [], names) for fidelity in cfg.fidelities]
+        cases += [(cfg.search_fidelity, [v.override(v.physical(u)) for v, u in zip(box, corner)], [name])
+                  for name, box in boxes.items() if box for corner in itertools.product((0.0, 1.0), repeat=len(box))]
+        for fidelity, sets, check in cases:
+            base = self.base(fidelity)
+            run = copy.deepcopy({name: base.get(name, {}) for name in check})     # a section reads only its table
             try:
                 for item in sets:
                     config.set_dotted(run, *config.parse_override(item))
-                for name in names:
+                for name in check:
                     config.section(run, name)
             except ImportError as ex:
                 warnings.warn(f"[mobo] overrides not checked: {ex}", stacklevel=2)
@@ -253,85 +319,131 @@ class Campaign:
         """The search-fidelity evaluations (not the re-evaluations of `verify`), in order."""
         return [ev for ev in evals.values() if 'parent' not in ev]
 
+    def check_store(self, evals):
+        """The study places every stored design at its stored unit coordinates: the variables must still map them
+        onto the values the design was evaluated with, set on the same targets. A variable added, removed, renamed,
+        re-ranged, re-targeted or mapped otherwise once evaluations exist would move every stored design under the
+        sampler (or leave it without a coordinate): that is another search space, so another campaign. (A pinned
+        follower carries its head's exact geometry values, which the unit cube gives back to within rounding.)"""
+        cfg = self.cfg
+        names = sorted(v.name for v in cfg.variables)
+
+        def moved(ev):
+            if sorted(ev.get('unit', {})) != names:
+                return f"it has the variables {sorted(ev.get('unit', {}))}, the campaign {names}"
+            for v in cfg.variables:
+                x, y = ev.get('params', {}).get(v.name), v.physical(ev['unit'][v.name])
+                if v.integer or isinstance(x, bool) or not isinstance(x, (int, float)):
+                    same = x == y and type(x) is type(y)
+                else:
+                    same = math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-12 * (v.high - v.low))
+                if not same:
+                    return f"its {v.name} was {x!r}, which the variable now maps to {y!r}"
+                if v.override(x) not in ev.get('overrides', ()):
+                    return f"its {v.name} was not set as {v.override(x)}"
+            return ''
+
+        for ev in self.search(evals):
+            if why := moved(ev):
+                raise config.ConfigError(
+                    f"[mobo] the variables changed since evaluation {ev['id']} ({self.store.log}): {why}. A campaign "
+                    f"keeps its search space: run the changed one in another campaign_dir (its warm_start can repeat "
+                    f"designs of this one)")
+
+    @property
+    def metrics(self):
+        """The metric of every objective, then of every constraint."""
+        return [o.metric for o in self.cfg.objectives] + [c.metric for c in self.cfg.constraints]
+
+    def unusable(self, scores):
+        """Why the scores of an evaluation that finished cannot be used as they are ('' = they can): the scorer
+        skipped the run, or a metric of an objective or a constraint is missing, null or not finite."""
+        if 'skip' in scores:
+            return f"not scored: {scores['skip']}"
+        bad = []
+        for m in dict.fromkeys(self.metrics):
+            x = config.get_dotted(scores, m, space.MISSING)
+            if x is space.MISSING:
+                bad.append(f"no {m}")
+            elif not math.isfinite(value(scores, m)):
+                bad.append(f"{m} = {'null' if x is None else x}")
+        return ', '.join(bad)
+
     def values(self, ev):
-        """(objectives, constraints) of a done evaluation, None when it has none or a value is not finite."""
-        if ev.get('state') != 'done':
+        """(objectives, constraints) of a done evaluation whose scores are usable, else None."""
+        scores = ev.get('scores') or {}
+        if ev.get('state') != 'done' or self.unusable(scores):
             return None
-        try:
-            obj = space.objective_values(self.cfg, ev.get('scores', {}))
-            con = space.constraint_values(self.cfg, ev.get('scores', {}))
-        except KeyError:
-            return None
-        return (obj, con) if all(math.isfinite(v) for v in obj + con) else None
+        return space.objective_values(self.cfg, scores), space.constraint_values(self.cfg, scores)
 
     def check_metrics(self, evals):
-        """A metric that no scored evaluation has is a misnamed one: stop instead of feeding the sampler nothing.
-        (Runs the scorer skipped - too few survivors - carry no metrics and do not count.)"""
-        done = [ev.get('scores', {}) for ev in evals.values() if ev.get('state') == 'done']
+        """A metric that no scored evaluation has (no run the scorer skipped counts) is a misnamed one: stop instead
+        of feeding the sampler nothing. A metric the scorer of `pcr evaluate` documents is never misnamed: a run that
+        lost its beam early lacks some of them (valley_all needs probes with complete passes)."""
+        done = [ev.get('scores') or {} for ev in evals.values() if ev.get('state') == 'done']
         done = [s for s in done if 'skip' not in s]
         if not done:
             return
-        for m in [o.metric for o in self.cfg.objectives] + [c.metric for c in self.cfg.constraints]:
-            if all(config.get_dotted(s, m, space.MISSING) is space.MISSING for s in done):
+        known = scorer_metrics(self.cfg.evaluator) or ()
+        for m in dict.fromkeys(self.metrics):
+            if m not in known and all(config.get_dotted(s, m, space.MISSING) is space.MISSING for s in done):
                 raise config.ConfigError(f"[mobo] metric {m!r} is in no evaluation's scores; they have: "
                                          f"{', '.join(sorted(done[-1])) or 'nothing'}")
 
+    def worst(self, evals):
+        """The worst value seen of every objective and every constraint, over the finite values in the scores of the
+        search evaluations (an unusable run's own metrics count too); None while one of them has none."""
+        cfg = self.cfg
+        scores = [ev.get('scores') or {} for ev in self.search(evals) if ev.get('state') == 'done']
+        obj, con = [], []
+        for o in cfg.objectives:
+            xs = [o.scale * x for s in scores if math.isfinite(x := value(s, o.metric))]
+            obj.append((max if o.direction == 'minimize' else min)(xs, default=math.nan))
+        for c in cfg.constraints:
+            con.append(max((c.violation(x) for s in scores if math.isfinite(x := value(s, c.metric))),
+                           default=math.nan))
+        return None if any(math.isnan(x) for x in obj + con) else (obj, con)
+
     # ---- the optuna study, rebuilt from the store
     def study(self, evals, sampler):
-        """The study of the search evaluations so far. A done evaluation enters with its objective and constraint
-        values. A run the scorer skipped (too few survivors to score: a design that lost its beam) is known to be
-        bad: it enters with the values its scores have and the worst ones seen for the rest. A failed evaluation is
-        a pending trial, or with failed_as_infeasible a complete one with the worst values seen and the extra
-        constraint 'evaluated' violated. Stand-in values need values seen: until then those are pending too."""
+        """The study of the search evaluations so far (see the module docstring for what enters it how): a scored
+        evaluation with its values; an unusable one, and with failed_as_infeasible a failed one, as a stand-in with
+        the worst values seen and the extra constraint 'scored' violated; a failed one otherwise, and a stand-in
+        while no values have been seen, as a pending trial; an interrupted one not at all."""
         optuna = import_optuna()
         cfg = self.cfg
         dists = {v.param: optuna.distributions.FloatDistribution(0.0, 1.0) for v in cfg.variables}
         study = optuna.create_study(directions=[o.direction for o in cfg.objectives], sampler=sampler)
-        rows = [ev for ev in self.search(evals) if ev['state'] in ('done', 'failed') and not ev.get('interrupted')]
-        vals = [self.values(ev) for ev in rows]
-        good = [v for v in vals if v is not None]
-        worst_obj = [(max if o.direction == 'minimize' else min)(v[0][i] for v in good) if good else math.nan
-                     for i, o in enumerate(cfg.objectives)]
-        worst_con = [max(v[1][i] for v in good) if good else math.nan for i in range(len(cfg.constraints))]
-        labels = [c.label() for c in cfg.constraints] + ['evaluated'] * cfg.failed_as_infeasible
-        for ev, v in zip(rows, vals):
+        worst = self.worst(evals)
+        trials = []                                    # (params, values or None = pending, constraints, stand-in)
+        for ev in self.search(evals):
+            if ev['state'] not in ('done', 'failed') or ev.get('interrupted'):
+                continue
             params = {var.param: ev['unit'][var.name] for var in cfg.variables}
-            skipped = v is None and ev['state'] == 'done' and 'skip' in (ev.get('scores') or {})
-            if v is None and not (good and (skipped or cfg.failed_as_infeasible)):
+            v = self.values(ev)
+            if v is not None:
+                trials.append((params, *v, 0.0))
+            elif worst is not None and (ev['state'] == 'done' or cfg.failed_as_infeasible):
+                trials.append((params, *worst, 1.0))
+            else:
+                trials.append((params, None, None, None))
+        extra = any(t[3] for t in trials)              # the constraint 'scored' while a stand-in is in the study
+        labels = [c.label() for c in cfg.constraints] + ['scored'] * extra
+        for params, obj, con, bad in trials:
+            if obj is None:
                 study.add_trial(optuna.trial.create_trial(state=optuna.trial.TrialState.RUNNING, params=params,
                                                           distributions=dists))
-                continue
-            if v is not None:
-                obj, con = v
-            elif skipped:
-                obj, con = self.stand_in(ev.get('scores') or {}, worst_obj, worst_con)
             else:
-                obj, con = worst_obj, worst_con
-            con = con + [0.0 if v is not None or skipped else 1.0] * cfg.failed_as_infeasible
-            study.add_trial(optuna.trial.create_trial(params=params, distributions=dists, values=obj,
-                                                      constraints=dict(zip(labels, con)) or None))
+                study.add_trial(optuna.trial.create_trial(params=params, distributions=dists, values=obj,
+                                                          constraints=dict(zip(labels, con + [bad] * extra)) or None))
         return study, dists
-
-    def stand_in(self, scores, worst_obj, worst_con):
-        """(objectives, constraints) of a run the scorer skipped: the metrics its scores have, the worst seen for
-        the others."""
-        def value(path, fallback, f):
-            try:
-                x = space.metric(scores, path)
-            except KeyError:
-                return fallback
-            return f(x) if math.isfinite(x) else fallback
-
-        cfg = self.cfg
-        obj = [value(o.metric, w, lambda x, o=o: o.scale * x) for o, w in zip(cfg.objectives, worst_obj)]
-        con = [value(c.metric, w, c.violation) for c, w in zip(cfg.constraints, worst_con)]
-        return obj, con
 
     # ---- what to evaluate next
     def plan(self, evals):
         """('pinned', head evaluation) while the newest geometry has fewer than cheap_per_geometry cheap followers
-        (interrupted ones do not count) and its fields were made, else ('warm', index) for the next warm-start point,
-        else ('free', None)."""
+        (interrupted ones do not count) and its fields were made, else ('warm', index) for the first warm-start point
+        without an outcome (an interrupted one is evaluated again: unlike a proposal, it was asked for), else
+        ('free', None)."""
         cfg = self.cfg
         search = self.search(evals)
         if cfg.geometry_variables and cfg.cheap_variables and cfg.cheap_per_geometry > 0:
@@ -345,10 +457,9 @@ class Campaign:
                 built = (self.store.geometry_dir(search[head]['geometry']) / FIELDS_FILE).exists()
                 if n_pinned < cfg.cheap_per_geometry and built:
                     return 'pinned', search[head]
-        n_warm = sum(ev['kind'] == 'warm' for ev in search)
-        if n_warm < len(cfg.warm_start):
-            return 'warm', n_warm
-        return 'free', None
+        done = {ev.get('warm') for ev in search if ev['kind'] == 'warm' and not ev.get('interrupted')}
+        todo = [i for i in range(len(cfg.warm_start)) if i not in done]
+        return ('warm', todo[0]) if todo else ('free', None)
 
     def warm_point(self, i):
         """Physical values of warm-start point i; a variable it omits takes the base config's value."""
@@ -379,8 +490,13 @@ class Campaign:
         trial = study.ask(dists)
         unit = {v.name: v.snap(trial.params[v.param]) for v in cfg.variables}
         unit.update(pinned)
+        # a pinned proposal evaluates its head's geometry with the head's own physical values: a warm start's need not
+        # survive the round trip through the unit cube (4.726034523988023 deg comes back ...024), and one ulp would be
+        # another geometry key, so another build and BEM
+        params = {**space.physical(cfg, unit), **{k: arg['params'][k] for k in pinned}}
         extra = {'pinned_to': arg['id']} if pinned else {}
-        return self.proposal(cfg.search_fidelity, kind, unit, step=step, sampler=cfg.sampler, seed=seed, **extra)
+        return self.proposal(cfg.search_fidelity, kind, unit, params, step=step, sampler=cfg.sampler, seed=seed,
+                             **extra)
 
     # ---- running evaluations
     def add(self, eval_id, proposal):
@@ -453,7 +569,8 @@ class Campaign:
         'interrupted' when it was stopped from outside (stop = the reason). builds: it was to make its geometry's
         model and fields; when it failed, what an unfinished build left is moved aside (``set_aside``)."""
         cfg, r = self.cfg, outcome.result
-        common = dict(wall_s=round(float(outcome.wall_s), 2), returncode=outcome.returncode, **({'how': how} if how else {}))
+        common = dict(wall_s=round(float(outcome.wall_s), 2), returncode=outcome.returncode,
+                      **({'how': how} if how else {}))
         error = ''
         if stop:
             error = f'interrupted: {stop}'
@@ -472,24 +589,26 @@ class Campaign:
             return
         scores = r.get('scores') or {}
         done = {'state': 'done', 'scores': scores}
-        v = self.values(done)
+        v, why = self.values(done), self.unusable(scores)
         self.store.append(ev['id'], 'done', scores=scores, objectives=v[0] if v else None,
-                          constraints=v[1] if v else None, **common)
-        log(f"{ev['id']} done in {outcome.wall_s:.0f} s: " + self.describe(done))
+                          constraints=v[1] if v else None, **({'unusable': why} if why else {}), **common)
+        log(f"{ev['id']} done in {outcome.wall_s:.0f} s: " + self.describe(done)
+            + (f" -> unusable ({why}): a bad design to the sampler" if why else ''))
         self.check_metrics(self.store.evaluations())
 
     def design(self, ev):
         return ' '.join(f"{v.name}={_fmt(ev['params'][v.name])}" for v in self.cfg.variables)
 
     def describe(self, ev):
-        """One line of an evaluation's objectives and constraints."""
-        scores = ev.get('scores', {})
+        """One line of an evaluation's objectives and constraints ('-' = missing or null)."""
+        scores = ev.get('scores') or {}
         if 'skip' in scores:
             return f"not scored ({scores['skip']})"
         text = ' '.join(f"{o.metric}={_fmt(config.get_dotted(scores, o.metric))}" for o in self.cfg.objectives)
         for c in self.cfg.constraints:
-            x = config.get_dotted(scores, c.metric)
-            text += f" | {c.label()}: {_fmt(x)}" + (' (violated)' if x is not None and not c.violation(x) <= 0 else '')
+            x = value(scores, c.metric)
+            text += (f" | {c.label()}: {_fmt(config.get_dotted(scores, c.metric))}"
+                     + (' (violated)' if math.isfinite(x) and c.violation(x) > 0 else ''))
         return text
 
     def recover(self):
@@ -526,17 +645,20 @@ class Campaign:
     # ---- commands
     def optimize(self, max_evals=None, max_hours=None):
         """Run evaluations until max_evals search evaluations are spent (interrupted ones do not count) or
-        max_hours have passed (the evaluation still running then is stopped); 130 when stopped by the user."""
+        max_hours have passed (the evaluation still running then is stopped); 130 when stopped by the user, 1 after
+        max_failed_in_a_row failed evaluations in a row (a broken environment would otherwise spend the budget)."""
         cfg = self.cfg
         max_evals = cfg.max_evals if max_evals is None else max_evals
         max_hours = cfg.max_hours if max_hours is None else max_hours
         deadline = time.monotonic() + 3600.0 * max_hours if max_hours else None
         with CampaignLock(self.store.lock_path) as lock:
             self.recover()
+            self.check_store(self.store.evaluations())
             self.preflight()
             self.check_metrics(self.store.evaluations())
             log(f"campaign {cfg.campaign_dir}: {self.spent(self.store.evaluations())} search evaluations so far, "
                 f"budget {max_evals}" + (f" or {max_hours:g} h" if max_hours else ''))
+            failed = 0                                  # failed evaluations in a row, in this run
             while True:
                 evals = self.store.evaluations()
                 search = self.search(evals)
@@ -558,6 +680,14 @@ class Campaign:
                 if stop:
                     log(f"budget spent: {max_hours:g} h ({ev['id']} was stopped)")
                     break
+                rec = self.store.evaluations()[ev['id']]
+                failed = failed + 1 if rec['state'] == 'failed' else 0
+                if cfg.max_failed_in_a_row and failed >= cfg.max_failed_in_a_row:
+                    log(f"stopped: {failed} evaluations in a row failed (max_failed_in_a_row), the last ({ev['id']}) "
+                        f"with: {rec.get('error')}. That points at the environment or the campaign, not at the "
+                        f"designs: see {self.store.eval_dir(ev['id']) / 'stderr.log'}. `pcr optimize` again "
+                        f"continues the campaign")
+                    return 1
         return 0
 
     def spent(self, evals):
@@ -568,15 +698,20 @@ class Campaign:
         """Print the campaign and the next evaluation's command; run and write nothing."""
         cfg = self.cfg
         evals = self.store.evaluations()
+        self.check_store(evals)
         log(f"campaign {cfg.campaign_dir}: {self.spent(evals)} of {cfg.max_evals} search evaluations in the store")
         log(f"base {cfg.base_config_file}; sampler {cfg.sampler}, seed {cfg.seed}, n_startup {cfg.n_startup}")
         for v in cfg.variables:
             log(f"  variable {v.name:12s} {v.kind:8s} {v.target} in [{v.low:g}, {v.high:g}]"
                 + ' log' * v.log + ' integer' * v.integer + ' list' * v.as_list + f" (base: {_fmt(self.current(v))})")
+        known = scorer_metrics(cfg.evaluator)
+        note = " (not in the scorer's table analysis.objectives.METRICS: checked against the first scored evaluation)"
+        unlisted = {m: '' if known is None or m in known else note for m in self.metrics}
         for o in cfg.objectives:
-            log(f"  objective {o.direction} {o.metric}" + (f" x {o.scale:g}" if o.scale != 1 else ''))
+            log(f"  objective {o.direction} {o.metric}" + (f" x {o.scale:g}" if o.scale != 1 else '')
+                + unlisted[o.metric])
         for c in cfg.constraints:
-            log(f"  constraint {c.label()}")
+            log(f"  constraint {c.label()}" + unlisted[c.metric])
         for name, f in cfg.fidelities.items():
             log(f"  fidelity {name}: {' '.join(f.overrides) or '(base config)'}"
                 + (f", timeout {f.timeout_min:g} min" if f.timeout_min else ''))
@@ -597,6 +732,7 @@ class Campaign:
         with CampaignLock(self.store.lock_path) as lock:
             self.recover()
             evals = self.store.evaluations()
+            self.check_store(evals)
             targets = [f"{int(i):04d}" if str(i).isdigit() else str(i) for i in ids]
             targets = list(dict.fromkeys(targets + (self.summary(evals)['pareto'] if pareto else [])))
             for pid in targets:
@@ -643,21 +779,28 @@ class Campaign:
                 + [c.label() for c in cfg.constraints] + ['P'] + (['geometry'] if cfg.geometry_variables else []))
         rows, notes = [], []
         for ev in sorted(evals.values(), key=lambda e: e['id']):           # <id>.verify right after <id>
-            scores = ev.get('scores', {})
-            row = [ev['id'], ev.get('kind', '?'), ev['state'], _fmt(ev.get('wall_s'))]
+            scores = ev.get('scores') or {}
+            why = self.unusable(scores) if ev['state'] == 'done' else ''
+            row = [ev['id'], ev.get('kind', '?'), ev['state'] + '!' * bool(why), _fmt(ev.get('wall_s'))]
             row += [_fmt(ev.get('params', {}).get(v.name)) for v in cfg.variables]
             row += [_fmt(config.get_dotted(scores, o.metric)) for o in cfg.objectives]
             row += [_fmt(config.get_dotted(scores, c.metric)) for c in cfg.constraints]
-            row += ['*' if ev['id'] in summ['pareto'] else ''] + ([ev.get('geometry') or ''] if cfg.geometry_variables else [])
+            row += ['*' if ev['id'] in summ['pareto'] else '']
+            row += [ev.get('geometry') or ''] if cfg.geometry_variables else []
             rows.append(row)
-            if ev['state'] == 'failed' or 'skip' in scores:
-                notes.append(f"  {ev['id']}: {ev.get('error') or 'not scored: ' + str(scores.get('skip'))}")
+            if ev['state'] == 'failed':
+                notes.append(f"  {ev['id']}: {ev.get('error')}")
+            elif why:
+                notes.append(f"  {ev['id']}: unusable scores ({why}): a bad design to the sampler")
         widths = [max(len(str(r[k])) for r in [head] + rows) for k in range(len(head))]
         print(f"campaign {cfg.campaign_dir}: {len(self.search(evals))} search evaluations ({self.spent(evals)} count "
               f"against max_evals = {cfg.max_evals}), {summ['n_usable']} usable")
         for r in [head] + rows:
             print('  '.join(str(x).rjust(w) for x, w in zip(r, widths)))
-        print('\n'.join(notes))
+        if notes:
+            print("failed and unusable (done!: finished, but the scores lack a metric; such a design enters the study "
+                  "as infeasible, with the worst values seen):")
+            print('\n'.join(notes))
         which = 'feasible' if summ['feasible'] else 'usable (none is feasible yet)'
         print(f"Pareto set at fidelity '{cfg.search_fidelity}', {which}: {', '.join(summ['pareto']) or '-'}")
         if summ['best']:
@@ -689,8 +832,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     # SIGTERM (and Ctrl+Break on Windows, SIGHUP on POSIX) stop the driver like Ctrl+C: the evaluation is stopped and
     # recorded before the driver exits
-    stops = [s for s in (getattr(signal, n, None) for n in ('SIGTERM', 'SIGBREAK', 'SIGHUP')) if s is not None]
-    previous = {s: signal.signal(s, _stop_signal) for s in stops}
+    previous = {s: signal.signal(s, _stop_signal) for s in evaluate.STOP_SIGNALS if s != signal.SIGINT}
     try:
         campaign = Campaign(load(args.config, args.set))
         if args.cmd == 'optimize':

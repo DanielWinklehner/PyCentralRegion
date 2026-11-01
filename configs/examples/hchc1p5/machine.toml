@@ -25,6 +25,11 @@ dee_opening_deg = 42.0
 dee_voltage_kv = 65.0
 design_voltage_kv = 60.0
 r_max_cavity_m = 0.37
+# the design deck's 6.5 * 1e-3 in floating point, 1 ulp above 0.0065: with it `pcr build` reproduces the deck's
+# electrode models bit for bit. 0.0065 gives the same metal, but OCC approximates two housing/channel intersection
+# curves differently and 8 ground faces mesh differently (+8 of 24,674 ground triangles). The 3D tracking does not
+# read it (no thin-gap kicks with the BEM fields).
+gap_width_min_m = 0.006500000000000001
 r_max_m = 0.38
 z_max_m = 0.030
 target_energy_mev = 3.0
@@ -33,3 +38,6 @@ target_energy_mev = 3.0
 sign = 1.0
 scale = 1.0
 crop_r_m = 0.40
+
+[score]
+beam = "sp1Lo_c1"           # the hand-off's label in the 2026-11-01 run tables

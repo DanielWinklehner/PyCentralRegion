@@ -1,7 +1,10 @@
 """One-page summary figure of a scored run, drawn from the score dict alone (``metrics.score_run`` output or a saved
 score json): acceptance in release phase, the bunch shape per turn, the turn structure at the virtual probes and the
-collimation trade-off. matplotlib is imported only when a figure is drawn.
+collimation trade-off. The keys that carry a [score] setting (acc<L>, halo<s>) are found in the score, so a score
+made with other settings draws the same. matplotlib is imported only when a figure is drawn.
 """
+import re
+
 import numpy as np
 
 
@@ -13,6 +16,9 @@ def summary_figure(score, path=None, dpi=120):
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(2, 2, figsize=(11.0, 8.0))
     g = (lambda k: np.nan if score.get(k) is None else score[k])
+    accs = sorted((m.group(1) for m in map(re.compile(r'(acc\d+)_lo').fullmatch, score) if m),
+                  key=lambda key: -int(key[3:]))
+    halo = next((key for key in score if re.fullmatch(r'halo\d+(?:\.\d+)?', key)), 'halo')
 
     a = ax[0, 0]
     sc = score.get('survival_curve') or {}
@@ -20,9 +26,10 @@ def summary_figure(score, path=None, dpi=120):
         x = np.array([float(k) for k in sc])
         o = np.argsort(x)
         a.plot(x[o], 100 * np.array(list(sc.values()))[o], 'o-', ms=3)
-        for key, c in (('acc90', 'C2'), ('acc80', 'C1')):
+        for i, key in enumerate(accs):
             if score.get(f'{key}_lo') is not None:
-                a.axvspan(score[f'{key}_lo'], score[f'{key}_hi'], color=c, alpha=0.12, lw=0, label=key)
+                a.axvspan(score[f'{key}_lo'], score[f'{key}_hi'], color=f'C{(2, 1, 4, 5, 6)[i % 5]}', alpha=0.12,
+                          lw=0, label=key)
         a.legend(frameon=False, fontsize=8)
     a.set(xlabel='release phase [RF deg]', ylabel='survival [%]', title=f"(a) acceptance: W_eff {g('W_eff'):.0f} deg")
 
@@ -38,7 +45,7 @@ def summary_figure(score, path=None, dpi=120):
         b.set_ylabel('core sigma [mm]')
         (h1, l1), (h2, l2) = a.get_legend_handles_labels(), b.get_legend_handles_labels()
         b.legend(h1 + h2, l1 + l2, frameon=False, fontsize=8, loc='upper left')
-    a.set(xlabel='turn', title=f"(b) bunch shape: last-turn ratio {g('ratio'):.2f}, halo {100 * g('halo3'):.1f} %")
+    a.set(xlabel='turn', title=f"(b) bunch shape: last-turn ratio {g('ratio'):.2f}, {halo} {100 * g(halo):.1f} %")
 
     a = ax[1, 0]
     pr = score.get('probes') or {}

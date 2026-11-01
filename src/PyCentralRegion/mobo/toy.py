@@ -29,6 +29,12 @@ amplitude to every score (a low-fidelity search); sleep_s makes an evaluation ta
 then has made its geometry's files, as a real one stopped during its tracking has: interruption tests);
 child_sleep_s > 0 starts a child process that sleeps that long and is never waited for, its pid in
 <eval_dir>/child.pid (the driver must stop it with the evaluation: process-tree tests).
+
+A late RF phase loses the beam (I_final -> 0 at 0 deg), like a real design: above short_above_deg the run is too
+short of survivors for the probes' turn structure, so its scores have no valley_all (as the scorer leaves out
+valley_all and turn_* without probes with enough complete passes); above skip_above_deg the scorer skips the run
+({'tag', 'skip': reason}, no metrics, as with too few survivors). Both finish ok: they are bad designs, not
+failures (the driver's unusable scores).
 """
 import hashlib
 import json
@@ -43,7 +49,8 @@ from .. import config
 from .evaluate import evaluator_parser, write_result
 
 DEFAULTS = {'phases_deg': [-20.0], 'volt_scale': 1.0, 'trim_t': 1e-3, 'gap_width_mm': 3.0, 'n_posts': 2,
-            'fail_above_mm': 1e9, 'noise': 0.0, 'sleep_s': 0.0, 'child_sleep_s': 0.0}
+            'fail_above_mm': 1e9, 'short_above_deg': 1e9, 'skip_above_deg': 1e9, 'noise': 0.0, 'sleep_s': 0.0,
+            'child_sleep_s': 0.0}
 GEOMETRY = ('gap_width_mm', 'n_posts')
 I_MAX = math.sqrt(2.0 / 3.0)         # the constraint's end of the front
 
@@ -58,7 +65,10 @@ def distance(t):
 
 
 def scores(t):
-    p = min(max((float(t['phases_deg'][0]) + 40.0) / 40.0, 0.0), 1.0)
+    phase = float(t['phases_deg'][0])
+    if phase > t['skip_above_deg']:
+        return {'tag': 'toy', 'skip': f"12 tracked survivors (RF phase {phase:g} deg > skip_above_deg)"}
+    p = min(max((phase + 40.0) / 40.0, 0.0), 1.0)
     g = 1.0 + distance(t)
     current = 1.0 - p
     out = {'I_final': current, 'valley_all': g * (1.0 - math.sqrt(p / g)), 'ratio': g * (1.5 + 0.5 * p * p),
@@ -68,6 +78,8 @@ def scores(t):
         seed = hashlib.sha256(json.dumps(design).encode()).digest()
         for i, key in enumerate(('I_final', 'valley_all', 'ratio', 'E_med')):
             out[key] += t['noise'] * (seed[i] / 127.5 - 1.0)
+    if phase > t['short_above_deg']:
+        del out['valley_all']
     return out
 
 

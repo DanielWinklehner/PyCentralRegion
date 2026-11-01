@@ -41,12 +41,17 @@ A stage reuses an output that exists and never overwrites one. `python -m PyCent
 ## Documentation
 
 - [docs/pipeline.md](docs/pipeline.md): run files, the stages and their outputs, tracking fidelity, the obstacles
-  that cost no BEM (posts, boxes, the slit), and the validation of the 3D tracking.
+  that cost no BEM (posts, boxes, the slit), and the validation of the build, the tracking and the scoring.
 - [docs/mobo.md](docs/mobo.md): the optimisation campaign: variables, objectives, constraints, fidelities, resuming.
 - [docs/HOWTO_mobo_campaign.md](docs/HOWTO_mobo_campaign.md): running a real campaign step by step.
 - [docs/porting.md](docs/porting.md): where the design deck's scripts and environment variables went.
 - `configs/defaults/*.toml`: every configuration key with its default and meaning.
-- `examples/`: the 2D design workflow, one script per step.
+- `examples/`: the design workflow, one script per step, on a small four-dee cyclotron: static orbits, 2D
+  acceleration and bunch tracking, the per-gap cavity optimisation, solved 2D gap fields, a cavity centre's field from
+  its CAD, and 3D electrodes ([examples/README.md](examples/README.md)).
+- `python -m PyCentralRegion.geometry.build --help`: the electrode builder's own tools besides `build`: `bounds` (the
+  channel-height bounds for a campaign's ranges), `hole` (a gap-0 hole from the hand-off bunch), `shift`, `cut` and
+  `sections`.
 
 ## Tests
 
@@ -54,4 +59,6 @@ A stage reuses an output that exists and never overwrites one. `python -m PyCent
 pytest
 ```
 
-The fast tests need no data files. Those that need optional packages (PyPATools, optuna, torch) skip without them.
+The tests need no data files: the few that use the worked example's inputs (the reference layout in
+`tests/test_geometry.py`, the pilot and campaign dry runs in `tests/test_mobo.py`) skip without them, and so do those
+that need optional packages (scipy, matplotlib, PyPATools, gmsh, optuna, torch).

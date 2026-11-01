@@ -26,8 +26,7 @@ off, and a vortex has b > 0, c < 0 and a negative rotation.
 """
 import numpy as np
 
-from .metrics import (alive_mask, core_covariance, core_variance_factor, ghost_first_step, map_rotation,
-                      rotation_sense, run_constants, survivors)
+from .metrics import core_covariance, core_variance_factor, map_rotation, run_state
 from .objectives import ScoreConfig
 
 
@@ -153,41 +152,36 @@ def gauss_reference(score, t0, t1):
             float(cov), {str(k): round(v, 4) for k, v in w.items() if v > 0})
 
 
-def _prepare(run, cfg):
-    k = run_constants(run, cfg)
-    steps = np.asarray(run.steps)
-    gstep = ghost_first_step(run.ids, run.ghost_ids, run.ghost_step)
-    alive = alive_mask(steps, run.xyz, run.birth_step, run.stop_step, gstep)
-    surv = survivors(run.xyz[-1], run.stop_step, run.n_steps, gstep, k['r_max'], k['z_max'])
-    return k, steps, alive, surv, rotation_sense(run.xyz, alive)
-
-
 def vortex_twin(run_on, run_off, score_on=None, cfg=None):
     """The space-charge vortex of run_on measured against its SC-off twin run_off (``runs.RunData`` tracking the same
-    particles), in guiding-centre coordinates (module docstring); score_on, the SC-on run's score, adds the
-    time-matched Gaussian reference. Returns tag_on, tag_off, J, psi0_deg, n_both, sense, boot, window_centres_rev,
-    turns (per window n: t_rev; on / off: R_mean, sig_r, sig_l, ratio, corr of the core and, but for the last window,
-    the map M, rot, b, c; the paired map A, det_A, cum_eig, cum_sum with errors; sc (b, c, rot: on - off) with sc_err
-    and pred, pred_coverage, pred_weights) and the totals rot_sc_total (cum_sum after the last map), its error and
-    rot_pred_total (the kernel-averaged Gaussian rotations summed over the maps)."""
+    particles: the same track ids and, when both are known, the same hand-off particles), in guiding-centre
+    coordinates (module docstring); score_on, the SC-on run's score, adds the time-matched Gaussian reference. Returns
+    tag_on, tag_off, J, psi0_deg, n_both, sense, boot, window_centres_rev, turns (per window n: t_rev; on / off:
+    R_mean, sig_r, sig_l, ratio, corr of the core and, but for the last window, the map M, rot, b, c; the paired map
+    A, det_A, cum_eig, cum_sum with errors; sc (b, c, rot: on - off) with sc_err and pred, pred_coverage,
+    pred_weights) and the totals rot_sc_total (cum_sum after the last map), its error and rot_pred_total (the
+    kernel-averaged Gaussian rotations summed over the maps)."""
     cfg = cfg or ScoreConfig()
     if not np.array_equal(run_on.ids, run_off.ids):
         raise ValueError(f"{run_on.tag} and {run_off.tag} track different particles: not twins")
+    if run_on.handoff_ids is not None and run_off.handoff_ids is not None and \
+            not np.array_equal(run_on.handoff_ids, run_off.handoff_ids):
+        raise ValueError(f"{run_on.tag} and {run_off.tag} track different hand-off particles (another bunch sample): "
+                         f"not twins")
     q, sig, J, psi0 = cfg.core_q, cfg.map_core_sigma, int(cfg.twin_azimuths), float(cfg.twin_psi0_deg)
-    k_on, st_on, al_on, sv_on, s_on = _prepare(run_on, cfg)
-    k_off, st_off, al_off, sv_off, s_off = _prepare(run_off, cfg)
-    both = np.flatnonzero(sv_on & sv_off)
-    R_on, T_on = guiding_centres(run_on.xyz, both, st_on, al_on, s_on, k_on['f_rev'], run_on.steps_per_turn,
+    on, off = run_state(run_on, cfg), run_state(run_off, cfg)
+    both = np.flatnonzero(on.surv & off.surv)
+    R_on, T_on = guiding_centres(run_on.xyz, both, on.steps, on.alive, on.sense, on.k['f_rev'], run_on.steps_per_turn,
                                  run_on.n_steps, J, psi0)
-    R_off, T_off = guiding_centres(run_off.xyz, both, st_off, al_off, s_off, k_off['f_rev'], run_off.steps_per_turn,
-                                   run_off.n_steps, J, psi0)
+    R_off, T_off = guiding_centres(run_off.xyz, both, off.steps, off.alive, off.sense, off.k['f_rev'],
+                                   run_off.steps_per_turn, run_off.n_steps, J, psi0)
     full = [np.flatnonzero(np.isfinite(R).mean(axis=0) > cfg.twin_min_share) for R in (R_on, R_off)]
     if not all(len(f) >= 2 for f in full):
         raise ValueError(f"fewer than two complete turn windows in {run_on.tag} / {run_off.tag}")
     nT = min(f.max() for f in full) + 1
-    g_on, g_off = gc_frame(R_on[:, :nT], T_on[:, :nT], k_on['f_rev']), gc_frame(R_off[:, :nT], T_off[:, :nT],
-                                                                                 k_off['f_rev'])
-    t_win = np.nanmedian(T_on[:, :nT], axis=0) * k_on['f_rev']
+    g_on = gc_frame(R_on[:, :nT], T_on[:, :nT], on.k['f_rev'])
+    g_off = gc_frame(R_off[:, :nT], T_off[:, :nT], off.k['f_rev'])
+    t_win = np.nanmedian(T_on[:, :nT], axis=0) * on.k['f_rev']
     nom = sc_terms(g_on, g_off, q, sig)
     err = {}
     if cfg.twin_boot:
@@ -196,7 +190,7 @@ def vortex_twin(run_on, run_off, score_on=None, cfg=None):
               for i in (rng.integers(0, len(g_on), len(g_on)) for _ in range(int(cfg.twin_boot)))]
         err = {key: np.nanstd([b[key] for b in bs], axis=0) for key in nom}
     res = {'tag_on': run_on.tag, 'tag_off': run_off.tag, 'J': J, 'psi0_deg': psi0, 'n_both': int(len(both)),
-           'sense': [float(s_on), float(s_off)], 'boot': int(cfg.twin_boot),
+           'sense': [float(on.sense), float(off.sense)], 'boot': int(cfg.twin_boot),
            'window_centres_rev': t_win.tolist(), 'turns': []}
     for n in range(nT):
         row = {'n': n, 't_rev': float(t_win[n])}

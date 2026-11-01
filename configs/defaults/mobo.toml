@@ -7,32 +7,60 @@
 #   pcr optimize        campaign.toml [--max-evals N] [--max-hours H] [--dry-run]   run or continue the campaign
 #   pcr optimize-verify campaign.toml (--ids 3 7 | --pareto) [--fidelity NAME]     re-evaluate at the verify fidelity
 #   pcr optimize-status campaign.toml                                               table, Pareto set, best values
+# Each takes --set key=value (repeatable): an override of the campaign file, e.g. --set mobo.seed=3.
 #
 # The campaign folder is the whole state (evals.jsonl, one folder per evaluation, one per geometry): running
 # pcr optimize again continues where it stopped. Stopping the driver (Ctrl+C, closing its window, killing it, the end
 # of max_hours) stops the running evaluation with every process it started; that evaluation is recorded failed
 # ("interrupted"), does not count against max_evals and is not run again (to evaluate that design anyway, give it as
-# a warm_start point). A geometry's model and fields are written whole and serve its later evaluations; what a build
-# stopped before its model left is moved to geometries/<key>/stopped-<id>/, so that geometry can be built again.
+# a warm_start point: an interrupted warm_start point is evaluated again). A geometry's model and fields are written
+# whole and serve its later evaluations; what a build stopped before its model left is moved to
+# geometries/<key>/stopped-<id>/, so that geometry can be built again. The geometry key hashes the base config's
+# [geometry], [machine], [inflector] and [fields] tables as written (fixed and fidelity overrides applied) and the
+# paths of the seed, hand-off and housing files, not the code's defaults or the files' contents: after a change of
+# those a cached geometry keeps its key, and its model and fields made before the change, so start another
+# campaign_dir.
+#
+# A campaign keeps its variables: the sampler sees every stored design at its stored unit coordinates, so a variable
+# added, removed, renamed, re-ranged or re-targeted once evaluations exist would move them all, and pcr optimize /
+# optimize-verify / --dry-run refuse to continue (run a changed search space in another campaign_dir; its warm_start
+# can repeat designs of this one). Objectives and constraints are read from the stored scores at every proposal and
+# may change: a constraint added later judges the earlier evaluations too.
 
 [mobo]
 campaign_dir = ""              # campaign folder: evals.jsonl (the store), evals/<id>/, geometries/<key>/, driver.lock
 base_config_file = ""          # run TOML every evaluation starts from
 physics_python = ""            # absolute path of the evaluations' interpreter (the physics env); "" = the driver's own
 evaluator = "PyCentralRegion.cli evaluate"   # module (and arguments) run with -m: --config --set ... --out <eval_dir>
-fixed = []                     # overrides of every evaluation, applied before the fidelity's, e.g. ["btrim.r_min_m=0.05"]
-sampler = "tpe"                # tpe (optuna TPESampler, multivariate) | gp (optuna GPSampler; needs torch); both constrained
+fixed = []                     # overrides of every evaluation, applied before the fidelity's,
+                               # e.g. ["btrim.r_min_m=0.05"]
+sampler = "tpe"                # tpe (optuna TPESampler, multivariate) | gp (optuna GPSampler; needs torch);
+                               # both constrained
 seed = 0                       # with the evaluation's index it seeds the sampler of every proposal (reproducible)
-n_startup = 10                 # evaluations (warm start included) before the sampler's model replaces random sampling
+n_startup = 10                 # evaluations with values (warm start and stand-ins included; failed ones, pending to
+                               # the sampler, are not) before the sampler's model replaces random sampling
 max_evals = 20                 # budget: search-fidelity evaluations of the whole campaign (a rerun continues to it);
                                # interrupted evaluations do not count
 max_hours = 0.0                # budget of one `pcr optimize` run: no evaluation starts after it, and the one running
                                # then is stopped (interrupted); 0 = no limit
-cheap_per_geometry = 3         # after every new geometry: this many evaluations with the geometry held, cheap variables free
-failed_as_infeasible = false   # false: a failed evaluation is a pending trial (not proposed again, no values invented);
-                               # true: a complete trial with the worst values seen and an extra violated constraint.
-                               # (A run the scorer skips - too few survivors - is not a failure: it always enters with
-                               # the metrics it has and the worst values seen for the rest.)
+cheap_per_geometry = 3         # after every new geometry (once its fields exist): this many evaluations with the
+                               # geometry held and only the cheap variables free
+failed_as_infeasible = false   # a failed evaluation (build, BEM or tracking failed, timeout): false = a pending trial
+                               # (not proposed again, no values invented); true = an infeasible stand-in (below)
+# An evaluation that finishes but whose scores are unusable is a bad design, not a failure, and always enters the study
+# as an infeasible stand-in: the scorer skipped the run (fewer than score.min_tracks tracks or score.min_survivors
+# survivors), or a metric of an objective or a constraint is missing (valley_all and turn_* need probes with
+# score.probe_passes complete passes), null (pcr score writes NaN and inf as null) or not finite. A stand-in is a
+# complete trial with the worst value seen of every objective and constraint plus one extra constraint, "scored",
+# violated (1; 0 for the scored trials), so the sampler learns to leave that region. Until every objective and
+# constraint has a value seen, stand-ins are pending trials. The store records why ("unusable"), the log and
+# pcr optimize-status show it (state "done!"); such evaluations count against max_evals and are never in the Pareto
+# set. A metric that no scored evaluation has (runs the scorer skipped do not count) is a misnamed one and stops the
+# campaign, unless the scorer of pcr evaluate documents it (PyCentralRegion.analysis.objectives.METRICS).
+max_failed_in_a_row = 5        # a `pcr optimize` run stops after this many failed search evaluations in a row: that is
+                               # a broken environment or campaign (a physics stack that does not import fails every
+                               # evaluation; the preflight only checks that physics_python finds the evaluator), not
+                               # bad designs; 0 = never. Running pcr optimize again continues.
 search_fidelity = "search"     # the fidelity the sampler learns from
 verify_fidelity = "verify"     # the fidelity of pcr optimize-verify
 
@@ -40,14 +68,18 @@ verify_fidelity = "verify"     # the fidelity of pcr optimize-verify
 #   [[mobo.variables]]
 #   name = "phase"             # short name
 #   target = "track.phases_deg"   # dotted run-config key the value overrides (not paths.model3d / paths.fields /
-#                                 # run.out_dir); an integer part indexes an array of tables: geometry.windows.1.z_hi_mm
+#                                 # run.out_dir); an integer part indexes an array of tables:
+#                                 # geometry.windows.1.half_height_mm
 #   low = -40.0
 #   high = 0.0
 #   log = false                # logarithmic mapping (low > 0)
-#   integer = false            # integer values (every integer gets the same share of [0, 1])
+#   integer = false            # integer values, integer low and high (every integer gets the same share of [0, 1])
 #   as_list = true             # the target is a list: it is set to [value]
-#   kind = "cheap"             # "geometry": needs a new build + BEM (shared per geometry key); "cheap": only re-tracking
-# Every target is checked against its [section] (at both ends of its range) before anything runs.
+#   kind = "cheap"             # "geometry": needs a new build + BEM (shared per geometry key);
+#                              # "cheap": only re-tracking
+# Every override is checked against its [section] before anything runs, the variables of each section at every
+# corner of their box (a section's checks can relate its keys: a channel taper must start at r > 0); with
+# pcr evaluate as the evaluator, an override must name one of its sections (a key elsewhere would change nothing).
 variables = []
 
 # Objectives, one table each, read from result.json's scores by dotted path:
@@ -71,6 +103,8 @@ warm_start = []
 
 # Fidelities: named override lists. An evaluation runs with the base config, then `fixed`, then its fidelity's
 # overrides, then the variables. timeout_min stops an evaluation that runs longer (recorded failed); 0 = no limit.
+# Let them differ in resolution only (particles, space-charge grid and interval), not in what is simulated (turns,
+# energies), so that the search-to-verify shift of a score that optimize-verify shows is its resolution error.
 [mobo.fidelities.search]
 overrides = []
 timeout_min = 0.0

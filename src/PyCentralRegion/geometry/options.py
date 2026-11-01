@@ -12,14 +12,16 @@ Lengths are millimetres (the units of the housing outline and of gmsh), angles d
 
 The beam channel: every dee is hollowed by a channel of full height ``aperture_inner_mm`` inside the radial taper and
 ``aperture_outer_mm`` beyond it, linear in between, from r0 = aperture_taper_center_mm - aperture_taper_length_mm / 2
-to r1 = aperture_taper_center_mm + aperture_taper_length_mm / 2. The dummy dees (and the star ground) share the taper
-radii and take their own heights when ``dummy_aperture_inner_mm`` / ``dummy_aperture_outer_mm`` are non-zero. The four
-are independent (an optimiser needs no ordering constraint: inner > outer is an inverted taper). ``check_bounds``
-holds them to what can be built, at build time:
+to r1 = aperture_taper_center_mm + aperture_taper_length_mm / 2 (``channel_height_mm``). The dummy dees (and the star
+ground) share the taper radii and take their own heights when ``dummy_aperture_inner_mm`` / ``dummy_aperture_outer_mm``
+are non-zero. The four are independent (an optimiser needs no ordering constraint: inner > outer is an inverted
+taper). ``check_bounds`` holds them to what can be built, at build time:
 
 * every height <= 2 x (plate_half_gap_mm - dee_wall_mm): the dee plates must fit inside the plate / pole gap;
-* the inner heights >= 2 x the spiral-inflector housing exit's half height (the largest |z| of the exit aperture the
-  housing outline carries, after aperture_inset_mm): the channel must clear the exit the beam leaves the housing by.
+* the channel clears the spiral-inflector housing's exit, the opening the beam leaves the housing by: the inner
+  heights, and the heights at the exit's outermost radius, >= 2 x the exit's half height (the largest |z| of the exit
+  aperture the housing outline carries, after aperture_inset_mm). The second binds only for an inverted taper that
+  starts inside the exit.
 
 Hardware on a gap edge is placed by ARCLENGTH along that edge [mm] from the edge's inner end. Every gap has one dee
 side (gap 2j is dee j's low-azimuth edge, gap 2j+1 its high-azimuth edge) and one dummy side facing it across the
@@ -27,15 +29,14 @@ gap. A rule that moves an edge's inner end (dee0's tip cut, a pinched dee, ``dee
 written against one build are re-derived for another, not translated (``build.edge_shift`` turns a radius change
 into an arclength; a round dee0 nose keeps the origin at the old vertex).
 
-Older run scripts gave these options as environment variables (CR_*), command-line strings and JSON files;
-``from_deck``, ``aperture_from_spec``, ``posts_from_spec`` and their siblings, ``from_posts_json`` and ``to_toml``
-convert those into this section.
+Older run scripts gave the channel and the hardware as command-line strings and JSON files: ``aperture_from_spec``,
+``posts_from_spec`` and their siblings and ``from_posts_json`` convert those into this section's fields, and
+``to_toml`` writes a section as a run file's [geometry] table.
 
 This module needs only the standard library, so a run file can be checked without the physics stack.
 """
 import dataclasses
 import json
-import shlex
 from pathlib import Path
 
 from PyCentralRegion.config import ConfigError
@@ -145,6 +146,8 @@ class DeeRmin:
 # ---------------------------------------------------------------------------------------------------------------------
 @dataclasses.dataclass
 class GeometryConfig:
+    """The [geometry] section: every option of the electrode builder (configs/defaults/geometry.toml documents them
+    with their defaults)."""
     # --- gap lines -----------------------------------------------------------------------------------------------
     snap_nodes: bool = True              # zero inert variable segments, then put the node radii midway between turns
     junctions: tuple[JunctionMove, ...] = ()   # after the snap: junctions moved to radii between the 3D beam's passes
@@ -171,7 +174,7 @@ class GeometryConfig:
     plate_half_gap_mm: float = 20.0      # half the vertical gap of the plates / poles the dees sit between: every
                                          # channel height <= 2 x (plate_half_gap_mm - dee_wall_mm)
     # --- dees ----------------------------------------------------------------------------------------------------
-    r_max_mm: float = 0.0                # dees and model end here; 0 = [machine] r_max_cavity_m
+    r_max_mm: float = 0.0                # dees and model end here (<= [machine] r_max_cavity_m); 0 = r_max_cavity_m
     housing_clearance_mm: float = 10.0   # the dee metal of gaps 1 .. n stays this far off the housing
     dee_wall_mm: float = 5.0             # thickness of a dee's walls: its solid inner end wall (radially) and its
                                          # plates (the plate bound above)
@@ -198,7 +201,7 @@ class GeometryConfig:
     boxes: tuple[BoxSpec, ...] = ()
     post_size_mm: float = 10.0           # post width and depth; window / hole plate depth
     post_offset_mm: float = 5.0          # post centre from its edge (half the size: face flush)
-    post_overhang_mm: float = 5.0        # posts and plates reach this far past the channel
+    post_overhang_mm: float = 5.0        # posts and plates reach this far past the channel (its highest over them)
     post_shape: str = 'square'           # 'square' | 'cylinder' (a post_facets-gon, no 90 deg edges in the gap)
     post_facets: int = 16
     post_wall_join_mm: float = 2.0       # carry a post end this close to a hug dee's end wall into it; 0 = never
@@ -213,8 +216,7 @@ class GeometryConfig:
     mesh_size_min_mm: float = 0.0        # gmsh Mesh.MeshSizeMin; 0 = lc_mm / 2
     mesh_flip_min_deg: float = 5.0       # repair triangles with an angle below this by edge flips; 0 = off
     occ_fuzzy_mm: float = 0.05           # OCC fuzzy boolean tolerance; 0 = exact booleans
-    # --- model ---------------------------------------------------------------------------------------------------
-    bem_only: bool = True                # the BEM field is the whole machine (no RF-cavity map to blend onto)
+    # --- output --------------------------------------------------------------------------------------------------
     plot_dees: bool = True               # write <model>_dees.png (the 2D layout) next to the model
 
     def __post_init__(self):
@@ -246,6 +248,14 @@ class GeometryConfig:
         if self.lc_outer_mm > self.lc_mm and not self.r_coarse_mm > self.r_fine_mm:
             raise ConfigError(f"geometry: a graded mesh needs r_coarse_mm > r_fine_mm, got {self.r_fine_mm} / "
                               f"{self.r_coarse_mm}")
+        # options that would otherwise be ignored without a word
+        if self.gap0_face_mm > 0.0 and self.ground != 'star':
+            raise ConfigError(f"geometry.gap0_face_mm = {self.gap0_face_mm:g} fills gap 0's dummy side of the star "
+                              f"ground; ground = {self.ground!r} builds no such face (set ground = 'star', or "
+                              f"gap0_face_mm = 0)")
+        if self.dee0_clearance_mm > 0.0 and self.dee0_trim_mm > 0.0:
+            raise ConfigError("geometry.dee0_clearance_mm and dee0_trim_mm both cut dee0's tip back: set one of them "
+                              "(with both, the clearance rule applies and the trim is unused)")
 
     # the channel, as the builder reads it
     def aperture_heights(self) -> tuple:
@@ -263,6 +273,18 @@ class GeometryConfig:
         return c - h, c + h
 
 
+def channel_height_mm(r_mm, radii, heights) -> float:
+    """The channel's full height [mm] at radius r_mm [mm]: heights[0] inside radii[0], heights[1] beyond radii[1],
+    linear between. The one profile of the build (the aperture tool the electrodes are hollowed with, the hardware
+    heights) and of the bounds; the arithmetic is numpy.interp's, bit for bit, so models built before it are unchanged."""
+    r, (r0, r1), (h0, h1) = float(r_mm), map(float, radii), map(float, heights)
+    if r <= r0:
+        return h0
+    if r >= r1:
+        return h1
+    return (h1 - h0) / (r1 - r0) * (r - r0) + h0
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # bounds of the channel heights (checked at build time)
 def channel_height_max_mm(geometry: GeometryConfig) -> float:
@@ -270,14 +292,17 @@ def channel_height_max_mm(geometry: GeometryConfig) -> float:
     return 2.0 * (float(geometry.plate_half_gap_mm) - float(geometry.dee_wall_mm))
 
 
-def check_bounds(geometry: GeometryConfig, exit_half_height_mm: float = None) -> dict:
+def check_bounds(geometry: GeometryConfig, exit_half_height_mm: float = None, exit_r_mm: float = None) -> dict:
     """Hold the channel heights to what can be built; a ConfigError names the first bound violated.
 
     * every height (dees and, when set, dummy dees) <= 2 x (plate_half_gap_mm - dee_wall_mm);
-    * the inner heights >= 2 x ``exit_half_height_mm``, the spiral-inflector housing exit's half height (the largest
-      |z| of its exit aperture; ``builder.exit_half_height_mm`` reads it off the housing outline). Not checked when
-      None (no outline at hand).
-    Returns the bounds {'height_max_mm', 'inner_min_mm'} for a campaign to set its variable ranges from."""
+    * the channel clears the spiral-inflector housing's exit, whose half height ``exit_half_height_mm`` is the largest
+      |z| of its exit aperture (``builder.exit_half_height_mm`` reads it off the housing outline): the inner heights
+      >= 2 x exit_half_height_mm, and so are the heights of the dees' and of the dummy dees' channel at the exit's
+      outermost radius ``exit_r_mm`` (``builder.exit_radius_mm``). A height profile is monotonic in r, so the two
+      together hold the channel over the opening's whole radial span; the second binds only for an inverted taper
+      that starts inside the exit. Neither is checked without the exit's half height (no outline at hand).
+    Returns the bounds {'height_max_mm', 'inner_min_mm', 'exit_r_mm'} for a campaign to set its variable ranges from."""
     g = geometry
     top = channel_height_max_mm(g)
     heights = [('aperture_inner_mm', g.aperture_inner_mm, True), ('aperture_outer_mm', g.aperture_outer_mm, False)]
@@ -301,11 +326,23 @@ def check_bounds(geometry: GeometryConfig, exit_half_height_mm: float = None) ->
                 raise ConfigError(f"geometry.{name} = {float(v):g} mm is below its bound 2 x the spiral-inflector "
                                   f"housing exit's half height = 2 x {float(exit_half_height_mm):.3f} = {lo:.3f} mm: "
                                   f"the channel must clear the exit the beam leaves the housing by")
-    return {'height_max_mm': top, 'inner_min_mm': lo}
+        if exit_r_mm is not None:
+            profiles = [('aperture_inner_mm / aperture_outer_mm', g.aperture_heights())]
+            if g.dummy_aperture_heights() != g.aperture_heights():
+                profiles.append(('dummy_aperture_inner_mm / dummy_aperture_outer_mm', g.dummy_aperture_heights()))
+            for names, hh in profiles:
+                h = channel_height_mm(exit_r_mm, g.aperture_radii(), hh)
+                if h < lo - 1e-9:
+                    raise ConfigError(f"geometry.{names}: the channel is {h:.3f} mm high at the spiral-inflector housing "
+                                      f"exit's outermost radius r = {float(exit_r_mm):.2f} mm, below its bound 2 x the "
+                                      f"exit's half height = {lo:.3f} mm: the channel must clear the exit over its "
+                                      f"whole radial span (start the taper, aperture_taper_center_mm - "
+                                      f"aperture_taper_length_mm / 2, outside that radius, or keep the height there)")
+    return {'height_max_mm': top, 'inner_min_mm': lo, 'exit_r_mm': None if exit_r_mm is None else float(exit_r_mm)}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# converters from the older command-line strings, environment variables and JSON files
+# converters from the older command-line strings and JSON files
 def _items(spec, sep=','):
     return [s.strip() for s in str(spec or '').split(sep) if s.strip()]
 
@@ -325,8 +362,8 @@ def _pair(spec, what):
 
 
 def aperture_from_spec(heights, radii=None, dummy=None) -> dict:
-    """The old "inner,outer" heights / "r0,r1" taper radii (CR_APERTURE_MM / CR_APERTURE_R_MM, --aperture /
-    --dummy-aperture) -> the GeometryConfig channel fields. ``radii`` None keeps the default taper."""
+    """The old "inner,outer" channel heights, "r0,r1" taper radii and "inner,outer" dummy heights -> the
+    GeometryConfig channel fields. ``radii`` None keeps the default taper."""
     inner, outer = _pair(heights, 'the channel heights')
     out = {'aperture_inner_mm': inner, 'aperture_outer_mm': outer}
     if radii:
@@ -414,98 +451,6 @@ def from_posts_json(path):
 def junctions_from_json(path):
     """A junction-state JSON file ({"spec": "gap:r_mm,..."}) -> JunctionMove tuple."""
     return junctions_from_spec(json.loads(Path(path).read_text()).get('spec', ''))
-
-
-# the deck's CR_* / MINIDAR_* environment variables of the builder -> GeometryConfig field and converter
-_DECK_ENV = {'CR_GROUND': ('ground', str.lower), 'CR_STAR_TIP_GAP_MM': ('star_tip_gap_mm', float),
-             'CR_GAP0_FACE_MM': ('gap0_face_mm', float), 'CR_DEE_INNER': ('dee_inner', str.lower),
-             'CR_HUG_DS_MM': ('hug_ds_mm', float), 'CR_HUG_RING_N': ('hug_ring_n', int),
-             'CR_DEE_RMIN': ('dee_rmin', dee_rmin_from_spec), 'CR_DEE0_NOSE_MM': ('dee0_nose_mm', float),
-             'CR_NOSE_LC_MM': ('nose_lc_mm', float), 'CR_JUNCTION_R': ('junctions', junctions_from_spec),
-             'CR_EXTRA_BOXES': ('boxes', boxes_from_spec), 'CR_POST_WALL_JOIN_MM': ('post_wall_join_mm', float),
-             'CR_OCC_FUZZY_MM': ('occ_fuzzy_mm', float), 'CR_MESH_FLIP_MIN_DEG': ('mesh_flip_min_deg', float),
-             'MINIDAR_MESH_ALGO': ('mesh_algorithm', int), 'MINIDAR_MESH_MIN': ('mesh_size_min_mm', float)}
-# the deck's command-line flags of the builder -> GeometryConfig field and converter
-_DECK_ARGS = {'--r-max': ('r_max_mm', float), '--lc': ('lc_mm', float), '--lc-outer': ('lc_outer_mm', float),
-              '--r-fine': ('r_fine_mm', float), '--r-coarse': ('r_coarse_mm', float),
-              '--lc-posts': ('lc_posts_mm', float), '--dee-wall': ('dee_wall_mm', float),
-              '--dummy-overlap': ('dummy_overlap_mm', float),
-              '--cavity-clearance-inner': ('housing_clearance_mm', float),
-              '--junction-tol': ('junction_tol_deg', float), '--cluster-tol': ('cluster_tol_mm', float),
-              '--keep-every': ('keep_every', int), '--half-height': ('half_height_mm', float),
-              '--brick-extend': ('channel_extend_mm', float), '--channel-back': ('channel_back_mm', float),
-              '--post-size': ('post_size_mm', float), '--post-offset': ('post_offset_mm', float),
-              '--post-overhang': ('post_overhang_mm', float), '--post-shape': ('post_shape', str),
-              '--dee0-clearance': ('dee0_clearance_mm', float), '--dee0-trim': ('dee0_trim_mm', float),
-              '--aperture-inset': ('aperture_inset_mm', lambda s: tuple(_pair(s, '--aperture-inset'))),
-              '--gap0-posts': ('gap0_posts_mm', lambda s: tuple(_pair(s, '--gap0-posts'))),
-              '--gap-posts': ('posts', posts_from_spec), '--gap-windows': ('windows', windows_from_spec),
-              '--gap-apertures': ('holes', holes_from_spec)}
-_DECK_PATHS = {'--pkl': 'seed', '--outline': 'housing_outline', '--pickle': 'model3d'}
-_DECK_APERTURE_MM, _DECK_APERTURE_R_MM = '40,40', '148,247'      # the deck's defaults without CR_APERTURE_*
-
-
-def from_deck(env=None, argv=()) -> dict:
-    """A deck build (``cr_geom_build.py`` with its CR_* environment and command line) -> the run-file tables that
-    rebuild it: {'geometry': {...}, 'paths': {...}, 'inflector': {...}} of the keys the deck set (always the four
-    channel fields, whose deck defaults differ from these). ``env``: the variables the runner set (a dict);
-    ``argv``: the command line (a list or one string). Machine settings (HCHC60_R_MAX_CAV, MINIDAR_BEM_DEE_KV, the
-    gap law) are [machine]'s and are not converted."""
-    env = {k: str(v) for k, v in (env or {}).items()}
-    args = shlex.split(argv, posix=False) if isinstance(argv, str) else [str(a) for a in argv]
-    flags = {}
-    i = 0
-    while i < len(args):
-        a = args[i]
-        key, _, val = a.partition('=')
-        if not key.startswith('--'):
-            raise ConfigError(f"from_deck: unexpected argument {a!r}")
-        if not val and i + 1 < len(args) and not args[i + 1].startswith('--'):
-            val, i = args[i + 1], i + 1
-        flags[key] = val.strip('"')
-        i += 1
-    geo, paths, infl = {}, {}, {}
-    for var, (name, conv) in _DECK_ENV.items():
-        if env.get(var, '').strip():
-            geo[name] = conv(env[var].strip())
-    for flag, value in flags.items():
-        if flag in _DECK_ARGS:
-            name, conv = _DECK_ARGS[flag]
-            geo[name] = conv(value)
-        elif flag in _DECK_PATHS:
-            if value:
-                paths[_DECK_PATHS[flag]] = value
-        elif flag == '--handoff':
-            if value:
-                geo['emitting_plane_file'] = value
-        elif flag == '--no-snap':
-            geo['snap_nodes'] = False
-        elif flag == '--junction-r':
-            geo['junctions'] = junctions_from_spec(value)
-        elif flag == '--dees':
-            geo['plot_dees'] = True
-        elif flag not in ('--build', '--aperture', '--dummy-aperture'):
-            raise ConfigError(f"from_deck: {flag} is not a geometry option of the deck builder")
-    if '--pickle' not in flags and flags.get('--build'):
-        paths['model3d'] = flags['--build'] + '_model3d.pkl'
-    geo.update(aperture_from_spec(flags.get('--aperture') or env.get('CR_APERTURE_MM') or _DECK_APERTURE_MM,
-                                  env.get('CR_APERTURE_R_MM') or _DECK_APERTURE_R_MM, flags.get('--dummy-aperture')))
-    rot = env.get('CR_SI_ROT', '').strip()
-    if not rot:
-        infl['rotation_deg'] = 0.0
-    else:
-        geo['gap0_on_plate'] = True
-        if env.get('HCHC60_EXPORT'):
-            geo['exit_plane_spec_file'] = str(Path(env['HCHC60_EXPORT']) / 'exit_plane_spec.json')
-        if rot.lower() == 'corner':
-            geo['si_rotation'] = 'corner'
-            if env.get('MINIDAR_SI_ROT_DEG'):            # the angle the deck's tracker turned the inflector by
-                infl['rotation_deg'] = float(env['MINIDAR_SI_ROT_DEG'])
-        else:
-            geo['si_rotation'] = 'fixed'
-            infl['rotation_deg'] = float(rot)
-    GeometryConfig(**geo)                                # validate
-    return {'geometry': geo, 'paths': paths, 'inflector': infl}
 
 
 # ---------------------------------------------------------------------------------------------------------------------

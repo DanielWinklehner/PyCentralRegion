@@ -21,10 +21,11 @@ wrapped to +-180 deg; its phase lag is h x its azimuth behind the survivors' mea
 """
 import time
 import warnings
+from collections import namedtuple
 
 import numpy as np
 
-from ..config import get_dotted
+from ..config import MachineConfig, get_dotted
 from .objectives import METRICS, ScoreConfig
 
 EPS0 = 8.8541878128e-12          # vacuum permittivity [F/m]
@@ -253,22 +254,25 @@ def compression_slope(ph, lag, clip_sigma=2.5):
     return float(np.polyfit(ph[core], lag[core], 1)[0])
 
 
-def release_budget(ph, surv, sel, E, lag, lost_turn, cfg):
-    """What becomes of each release phase. release_bins: per bin with >= min_bin_count tracked particles, its share of
-    them, the mean and rms final energy and phase lag of its survivors in sel, and the share of the bin lost in each
-    loss-turn class (loss_turn_edges). E_peak_phase, E_peak: the maximum of a quadratic E(release) fitted to the core
-    survivors (phase conserved through the gaps makes E(release) a cosine; NaN when the fit has no maximum)."""
+def release_budget(ph, sel, E, lag, lost_turn, cfg):
+    """What becomes of each release phase ph (N,) of the tracked particles. release_bins: per bin with >=
+    min_bin_count of them (phases beyond +-phase_range_deg are left out, not put in the end bins), its share of them,
+    the share of the bin lost in each loss-turn class (loss_turn_edges; lost_turn NaN for the survivors, so the bin's
+    survival is 1 - sum(lost)) and, when at least min_bin_survivors of its survivors are in sel, their mean and rms
+    final energy and phase lag. E_peak_phase, E_peak: the maximum of a quadratic E(release) fitted to the core
+    survivors in sel (phase conserved through the gaps makes E(release) a cosine; NaN when the fit has no maximum)."""
     edges, b = phase_bins(ph, cfg.phase_bin_deg, cfg.phase_range_deg)
+    inside = (ph >= edges[0]) & (ph < edges[-1])
     tb = np.r_[0.0, np.asarray(cfg.loss_turn_edges, dtype=float), np.inf]
     rows = {}
     for i in range(len(edges) - 1):
-        m = b == i
+        m = (b == i) & inside
         if m.sum() < cfg.min_bin_count:
             continue
         ms = m & sel
         row = {'n': int(m.sum()), 'share': float(m.mean()),
                'lost': [float(np.mean((lost_turn[m] >= lo) & (lost_turn[m] < hi))) for lo, hi in zip(tb[:-1], tb[1:])]}
-        if ms.any():
+        if ms.sum() >= cfg.min_bin_survivors:
             row.update(E_mean=float(E[ms].mean()), E_std=float(E[ms].std()), lag_mean=float(lag[ms].mean()),
                        lag_std=float(lag[ms].std()))
         rows[f"{0.5 * (edges[i] + edges[i + 1]):g}"] = row
@@ -455,15 +459,17 @@ def turn_centres(xy, alive, sense, fill=0.8):
 
 
 def centre_fan(cen, ph=None, degree=3, fill=0.8):
-    """Per turn (from 1) of the per-particle orbit centres cen (n, K, 2) [mm]: coh, the coherent offset |mean centre|,
-    and coh_xy, the mean centre (x, y); spread, the rms spread about it; c_med, the median |centre|; proj and
-    proj_max, the rms of the spread projected on the radial direction, averaged over the azimuths (spread / sqrt 2) and
-    at the worst azimuth (the major axis of the fan ellipse): an orbit-centre offset c moves a particle's radius at
-    azimuth theta by c . e_r(theta), so this is what the fan adds to the turn width at a probe. With the release
-    phases ph (n,): expl_share, the share of the spread a polynomial of the given degree in release phase explains
-    (the 'fan' that phase-dependent energy gains in the first gaps make), and early_late, the distance between the
-    mean centres of the earliest and the latest third. Turns where fewer than fill x n particles have a centre are
-    left out."""
+    """Per revolution n = 1, 2, ... of the per-particle orbit centres cen (n, K, 2) [mm] of ``turn_centres``, which
+    counts the revolutions from each particle's own start: revolution n of a bunch released around step 0 is about
+    the time-turn n - 1 of score_run's 'turns' (so fan key _t3 is a turn earlier than ratio_t3). Per revolution: coh,
+    the coherent offset |mean centre|, and coh_xy, the mean centre (x, y); spread, the rms spread about it; c_med, the
+    median |centre|; proj and proj_max, the rms of the spread projected on the radial direction, averaged over the
+    azimuths (spread / sqrt 2) and at the worst azimuth (the major axis of the fan ellipse): an orbit-centre offset c
+    moves a particle's radius at azimuth theta by c . e_r(theta), so this is what the fan adds to the turn width at a
+    probe. With the release phases ph (n,): expl_share, the share of the spread a polynomial of the given degree in
+    release phase explains (the 'fan' that phase-dependent energy gains in the first gaps make), and early_late, the
+    distance between the mean centres of the earliest and the latest third. Turns where fewer than fill x n particles
+    have a centre are left out."""
     fan = {}
     for t in range(cen.shape[1]):
         c = cen[:, t]
@@ -723,20 +729,49 @@ def campaign_summary(scores, paths):
 
 # ---------------------------------------------------------------------------------------------------------------------
 # one run
+def machine_value(run, key):
+    """A [machine] setting of the run: its recorded table (``runs.RunData.machine``: the config it was tracked with),
+    else the ``config.MachineConfig`` default."""
+    return run.machine[key] if key in run.machine else getattr(MachineConfig(), key)
+
+
+def tracked_species(run):
+    """(mass [MeV / c^2], charge state Z) of the tracked ions. The tracker pushes, and records E_mev with, the
+    PyPATools preset of its [machine] species (``machine.make_design``; a hand-off file's species_mass_mev only turns
+    its momenta into velocities), so: that preset when the run records its [machine] table, else the hand-off file's
+    species_mass_mev and species_charge_state, else the preset of its pypatools_species_name or of the default
+    [machine] species; NaN mass when none is known."""
+    meta = run.handoff_meta or {}
+    if 'species' not in run.machine and meta.get('species_mass_mev') is not None:
+        return float(meta['species_mass_mev']), float(meta.get('species_charge_state', 1.0))
+    try:
+        from PyPATools.species import PRESETS, IonSpecies
+    except ImportError:
+        return float('nan'), 1.0
+    name = str(run.machine.get('species') or meta.get('pypatools_species_name') or MachineConfig().species)
+    if name not in PRESETS:                          # IonSpecies exits the interpreter on a name it does not know
+        return float('nan'), 1.0
+    sp = IonSpecies(name)
+    return float(sp.mass_mev), float(sp.q)
+
+
 def run_constants(run, cfg):
-    """What scoring needs from the run besides its tracks, with the ScoreConfig fallbacks: the loss limits (the run's
-    json['limits'], else r_max_m / z_max_m), the harmonic (json['harmonic'], else rf / f_rev, else harmonic), the RF
-    frequency (json rf_mhz, else h x f_rev_mhz, else the hand-off file's RF: the bunch was formed for it) and the
-    revolution frequency, |B| at the bunch (mean |B_z| of the run's field check, else b0_t, else the isochronous field
-    of the hand-off species), the injected current (the run's space-charge current, else the hand-off file's
-    transmitted current: an SC-off run has none of its own), the bunch charge and whether space charge was on."""
+    """What scoring needs from the run besides its tracks: from its json, else from its [machine] table
+    (``machine_value``). The loss limits (json['limits'], else machine r_max_m / z_max_m), the harmonic
+    (json['harmonic'], else rf / f_rev, else machine harmonic), the RF frequency (json rf_mhz, else h x f_rev_mhz, else
+    the hand-off file's RF: the bunch was formed for it) and the revolution frequency, the tracked species
+    (``tracked_species``), |B| at the bunch (mean |B_z| of the run's field check, else cfg.b0_t, else the isochronous
+    field of the species), the injected current (the run's space-charge current, else the hand-off file's transmitted
+    current: an SC-off run has none of its own), the bunch charge and whether space charge was on."""
     js = run.info
     fj, scj, lim = js.get('final') or {}, js.get('space_charge') or {}, js.get('limits') or {}
     rf, frev = js.get('rf_mhz'), js.get('f_rev_mhz')
-    h = int(js['harmonic']) if js.get('harmonic') else (int(round(rf / frev)) if rf and frev else int(cfg.harmonic))
+    h = int(js['harmonic']) if js.get('harmonic') else (int(round(rf / frev)) if rf and frev else
+                                                        int(machine_value(run, 'harmonic')))
     f_rf = 1e6 * float(rf) if rf else (1e6 * float(frev) * h if frev else
                                        float(run.handoff_meta.get('rf_frequency_hz', np.nan)))
     f_rev = f_rf / h
+    mass, zq = tracked_species(run)
     i0_from = 'run' if scj.get('current_ma') else 'handoff'
     i0 = float(scj['current_ma']) if i0_from == 'run' else float(run.handoff_meta.get('transmitted_current_ma', np.nan))
     bchk = (js.get('fields') or {}).get('bfield_check') or {}
@@ -745,12 +780,27 @@ def run_constants(run, cfg):
     elif cfg.b0_t > 0:
         b0 = float(cfg.b0_t)
     else:
-        b0 = isochronous_field(f_rev, run.handoff_meta.get('species_mass_mev'),
-                               run.handoff_meta.get('species_charge_state', 1.0))
+        b0 = isochronous_field(f_rev, mass, zq)
     q = (fj.get('space_charge') or {}).get('bunch_charge_c') or (i0 * 1e-3 / f_rf if np.isfinite(i0) else np.nan)
-    return {'r_max': float(lim.get('r_max_m', cfg.r_max_m)), 'z_max': float(lim.get('z_max_m', cfg.z_max_m)),
-            'harmonic': h, 'f_rf': f_rf, 'f_rev': f_rev, 'B0': b0, 'I0': i0, 'I0_from': i0_from, 'Q': float(q),
-            'sc_on': bool(fj.get('sc', scj.get('on', False))) and bool(run.sc_recorded)}
+    return {'r_max': float(lim.get('r_max_m', machine_value(run, 'r_max_m'))),
+            'z_max': float(lim.get('z_max_m', machine_value(run, 'z_max_m'))), 'harmonic': h, 'f_rf': f_rf,
+            'f_rev': f_rev, 'mass_mev': mass, 'charge_state': zq, 'B0': b0, 'I0': i0, 'I0_from': i0_from,
+            'Q': float(q), 'sc_on': bool(fj.get('sc', scj.get('on', False))) and bool(run.sc_recorded)}
+
+
+RunState = namedtuple('RunState', 'k steps gstep alive surv sense')
+
+
+def run_state(run, cfg):
+    """A run's constants and who is alive when, the common start of ``score_run``, ``runs.virtual_probe`` and
+    ``twins.vortex_twin``: k (``run_constants``), the recorded steps (S,), every track's first ghost step (N,), alive
+    (S, N) (``alive_mask``), the survivors (N,) (``survivors``) and the rotation sense."""
+    k = run_constants(run, cfg)
+    steps = np.asarray(run.steps)
+    gstep = ghost_first_step(run.ids, run.ghost_ids, run.ghost_step)
+    alive = alive_mask(steps, run.xyz, run.birth_step, run.stop_step, gstep)
+    surv = survivors(run.xyz[-1], run.stop_step, run.n_steps, gstep, k['r_max'], k['z_max'])
+    return RunState(k, steps, gstep, alive, surv, rotation_sense(run.xyz, alive))
 
 
 def turn_instants(steps, alive_surv, n_steps, spt, n_snap):
@@ -785,8 +835,9 @@ def score_run(run, cfg=None):
       release   (with the hand-off phases) acc<L>_width/_lo/_hi/_ceiling, W_eff, survival_curve, S30, S30_40
                 (acceptance); slope, lag_rms, release_rms_surv (compression from the final lag); release_bins,
                 E_peak_phase, E_peak (release_budget); band<q>_*, surv_vs_z, surv_vs_zp (handoff_survival)
-      shape     turns: per turn k (n_snapshots instants of revolution k, all survivors alive) and 'last' (the last
-                revolution): shape_stats, sig_z (robust), alive_frac, with space charge b_pred, c_pred, rot_pred
+      shape     turns: per time-turn k (n_snapshots instants of steps [k spt, (k + 1) spt), all survivors alive;
+                step 0 is the first release) and 'last' (the last spt steps): shape_stats, sig_z (robust), alive_frac,
+                with space charge b_pred, c_pred, rot_pred
                 (vortex_prediction), M, b_meas, c_meas, rot_meas towards turn k + 1 (one_turn_map, core within
                 map_core_sigma), and with the hand-off phases compress and lag_rms (the turn-mean lag, turn_lag);
                 turn0_part: the shape and prediction over time-turn 0 once the last survivor is born (t_from [turns]);
@@ -794,9 +845,10 @@ def score_run(run, cfg=None):
                 sig_l_t1, s_round_t1, tilt_t1 (first full turn), ratio / sig_r / sig_l / s_round / compress _t<t> for
                 the proxy turns, rot_meas_sum, rot_pred_sum, b/c_meas_mean, b/c_pred_mean, n_trans, halo_born_t<t>;
                 ratio_no_fan, r_release_share (ratio_without_fan)
-      fan       fan: per turn coh, spread, c_med, proj, proj_max, expl_share, early_late (centre_fan); fan_spread /
-                fan_share / fan_proj / coh _t<t> (proxy turns) and fan_spread / fan_share / fan_proj / fan_proj_max /
-                coh _last, fan_last_turn
+      fan       fan: per revolution n from each particle's own start (about time-turn n - 1) coh, coh_xy, spread,
+                c_med, proj, proj_max, expl_share, early_late (centre_fan); fan_spread / fan_share / fan_proj / coh
+                _t<t> (revolution t of the proxy turns) and fan_spread / fan_share / fan_proj / fan_proj_max / coh
+                _last, fan_last_turn (the last revolution most survivors complete)
       turns     probes: per azimuth passes, R, sigma, dR, sep, valley, vp, halo (turn_structure); turn_sep,
                 turn_valley, turn_vp, turn_halo (means over the probes), turn_valley_max / _min / _min_az, turn_dR,
                 turn_sigR (last pass) / _min / _max; valley_all (all probes' crossings pooled), valley_from_halo
@@ -811,17 +863,13 @@ def score_run(run, cfg=None):
     N = run.n_tracks
     if N < cfg.min_tracks:
         return {'tag': run.tag, 'skip': f"{N} tracks (min_tracks {cfg.min_tracks})"}
-    k = run_constants(run, cfg)
-    steps, xyz, n_steps, spt = np.asarray(run.steps), run.xyz, int(run.n_steps), int(run.steps_per_turn)
-    gstep = ghost_first_step(run.ids, run.ghost_ids, run.ghost_step)
-    alive = alive_mask(steps, xyz, run.birth_step, run.stop_step, gstep)
+    k, steps, gstep, alive, surv, sense = run_state(run, cfg)
+    xyz, n_steps, spt = run.xyz, int(run.n_steps), int(run.steps_per_turn)
     last = xyz[-1]
-    surv = survivors(last, run.stop_step, n_steps, gstep, k['r_max'], k['z_max'])
     nS = int(surv.sum())
     if nS < cfg.min_survivors:
         return {'tag': run.tag, 'skip': f"{nS} tracked survivors inside r {k['r_max']} m (T json "
                                         f"{run.pkl_final.get('transmission')}, {n_steps / spt:.1f} turns)"}
-    sense = rotation_sense(xyz, alive)
     fj = run.info.get('final') or {}
     T = nS / N if run.ghost_run or 'transmission' not in fj else float(fj['transmission'])
     I0, h = k['I0'], k['harmonic']
@@ -847,7 +895,7 @@ def score_run(run, cfg=None):
         ps, ls = ph[s], lag[s]
         res.update(slope=compression_slope(ps, ls, cfg.compression_clip_sigma), lag_rms=float(ls.std()),
                    release_rms_surv=float(ps.std()))
-        res.update(release_budget(ph, surv, s, E, lag, lost_turn, cfg))
+        res.update(release_budget(ph, s, E, lag, lost_turn, cfg))
         z0, zp0 = run.of_tracks(run.handoff_z_m), run.of_tracks(run.handoff_zp_rad)
         if z0 is not None and zp0 is not None:
             res.update(handoff_survival(ph, 1e3 * z0, 1e3 * zp0, surv, cfg))
@@ -967,8 +1015,14 @@ def score_run(run, cfg=None):
             seed = slit_settings(sl['radial'], refx.get(sl['radial'].get('az'), {}).get(sl['radial'].get('pass')))
             if seed is not None:
                 res['best_slit'][tb] = seed | {'valley': sl['radial']['valley'], 'I_final': res[f'I_rad{tb}']}
-    notes = list(run.notes) + (["I0 is the hand-off file's transmitted current (the run records no space-charge "
-                                "current of its own)"] if k['I0_from'] == 'handoff' else [])
+    notes = list(run.notes)
+    if k['I0_from'] == 'handoff':
+        notes.append("I0 is the hand-off file's transmitted current (the run records no space-charge current of its "
+                     "own)" if np.isfinite(I0) else "the injected current is unknown (no space-charge current in the "
+                     "run, no transmitted_current_ma in the hand-off file): I_final and the I_* currents are NaN")
+    if k['sc_on'] and not vortex:
+        notes.append(f"space charge on, but no vortex prediction: bunch charge {k['Q']} C, |B| {k['B0']} T, f_rev "
+                     f"{k['f_rev']} Hz")
     if notes:
         res['notes'] = notes
 

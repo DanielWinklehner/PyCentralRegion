@@ -1,7 +1,7 @@
 # Toy MOBO campaign: the shape of a real campaign (cheap and geometry variables, a log and an integer variable, a
 # list-valued target, three objectives, a constraint, a warm start, two fidelities) answered by the analytic toy
-# evaluator, so the whole loop runs in seconds without the physics stack or a GPU. It is the dry run of the driver:
-#   pcr optimize        configs/examples/toy/campaign.toml          (30 evaluations, a few seconds)
+# evaluator, so the whole loop runs in seconds without the physics stack or a GPU. It tests the driver end to end:
+#   pcr optimize        configs/examples/toy/campaign.toml          (30 evaluations, about 8 s; 17 s with the GP)
 #   pcr optimize-status configs/examples/toy/campaign.toml
 #   pcr optimize-verify configs/examples/toy/campaign.toml --pareto
 # The toy's Pareto front is valley_all = 1 - sqrt(1 - I_final) for I_final <= sqrt(2/3) (see PyCentralRegion.mobo.toy).

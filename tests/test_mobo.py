@@ -1,10 +1,12 @@
-"""MOBO driver: unit cube, store and resume, the campaign lock, constraints and failures, geometry batches and cache,
-the samplers' pinning, process trees (time limit, Ctrl+C, time budget, a killed driver), verify / status / dry run,
-and a toy campaign through real subprocesses that ends near the toy's front.
+"""MOBO driver: unit cube, config checks, store and resume (the search space fixed by the store, interrupted warm
+starts run again), the campaign lock, constraints and failures, geometry batches and cache, the samplers' pinning,
+process trees (time limit, Ctrl+C - also while an evaluation starts -, time budget, a killed driver), verify / status /
+dry run, and a toy campaign through real subprocesses that ends near the toy's front.
 
 Tests that need optuna skip without it (the physics environment has none); the GP tests also need torch and a
 working bounded L-BFGS-B."""
 import dataclasses
+import functools
 import importlib.util
 import json
 import math
@@ -73,13 +75,21 @@ def subprocess_env(monkeypatch):
     monkeypatch.setenv('PYTHONPATH', os.pathsep.join([str(SRC), os.environ.get('PYTHONPATH', '')]))
 
 
-def _require_gp():
+@functools.lru_cache(maxsize=None)
+def _gp_missing():
+    """Why the GP tests cannot run here ('' = they can); the L-BFGS-B probe runs in a process of its own, once."""
     if importlib.util.find_spec('optuna') is None or importlib.util.find_spec('torch') is None:
-        pytest.skip('GP sampler needs optuna and torch')
-    probe = ('import numpy as np, scipy.optimize as so; '
-             'so.fmin_l_bfgs_b(lambda x: (((x - .3) ** 2).sum(), 2 * (x - .3)), np.array([.9, .1]), bounds=[(0, 1)] * 2)')
+        return 'GP sampler needs optuna and torch'
+    probe = ('import numpy as np, scipy.optimize as so; so.fmin_l_bfgs_b(lambda x: (((x - .3) ** 2).sum(), '
+             '2 * (x - .3)), np.array([.9, .1]), bounds=[(0, 1)] * 2)')
     if subprocess.run([sys.executable, '-c', probe], capture_output=True, timeout=300).returncode != 0:
-        pytest.skip("scipy's bounded L-BFGS-B does not work in this environment")
+        return "scipy's bounded L-BFGS-B does not work in this environment"
+    return ''
+
+
+def _require_gp():
+    if _gp_missing():
+        pytest.skip(_gp_missing())
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -114,6 +124,7 @@ def test_campaign_config_and_validation(tmp_path):
            'mobo.variables=[{name="a", target="run.out_dir"}]': 'target',
            'mobo.variables=[{name="a", target="x.y", low=1.0, high=1.0}]': 'low < high',
            'mobo.variables=[{name="a", target="x.y", low=0.0, high=1.0, log=true}]': 'log',
+           'mobo.variables=[{name="a", target="x.y", low=0.5, high=3.5, integer=true}]': 'integer low and high',
            'mobo.variables=[{name="a", target="x.y"}, {name="a", target="x.z"}]': 'unique',
            'mobo.objectives=[{metric="I_final", direction="up"}]': 'direction',
            'mobo.constraints=[{metric="E_med", op=">"}]': 'op',
@@ -125,10 +136,17 @@ def test_campaign_config_and_validation(tmp_path):
             campaign(tmp_path, item).validate()
     with pytest.raises(C.ConfigError, match='nope'):
         campaign(tmp_path, 'mobo.fidelities.search.nope=1')
-    # overrides are checked against their [section] before anything runs: a misspelt target, an absent array item
+    # overrides are checked against their [section] before anything runs: a misspelt target, an absent array item, a
+    # box with a corner the section refuses (each variable alone passes at both ends: the base's centre is 120 mm, its
+    # length 40 mm), and - when pcr evaluate runs the evaluations - a section it does not read (the toy's)
+    taper = ('mobo.variables=[{name="c", target="geometry.aperture_taper_center_mm", low=50.0, high=220.0, '
+             'kind="geometry"}, {name="l", target="geometry.aperture_taper_length_mm", low=10.0, high=160.0, '
+             'kind="geometry"}]')
     for item, match in {'mobo.variables=[{name="v", target="track.volt_scal"}]': 'volt_scal',
                         'mobo.variables=[{name="w", target="geometry.windows.0.z_hi_mm", kind="geometry"}]': 'no array',
-                        'mobo.fidelities.verify.overrides=["track.n_finale=0"]': 'n_finale'}.items():
+                        'mobo.fidelities.verify.overrides=["track.n_finale=0"]': 'n_finale',
+                        taper: 'center_mm=50.0 geometry.aperture_taper_length_mm=160.0: .* taper must lie inside',
+                        'mobo.evaluator="PyCentralRegion.cli evaluate"': r'override\(s\) of \[toy\]'}.items():
         with pytest.raises(C.ConfigError, match=match):
             driver.Campaign(campaign(tmp_path, item, *(['mobo.warm_start=[]'] * item.startswith('mobo.var'))))
 
@@ -148,9 +166,22 @@ def test_objectives_constraints_and_usable_values(tmp_path):
     assert camp.values({'state': 'done', 'scores': {**s, 'ratio': float('nan')}}) is None
     assert camp.values({'state': 'done', 'scores': {k: v for k, v in s.items() if k != 'ratio'}}) is None
     assert camp.values({'state': 'failed'}) is None
+    # why scores are unusable: skipped by the scorer, a metric missing, null (pcr score's NaN) or not finite
+    no_valley = {k: v for k, v in s.items() if k != 'valley_all'}
+    assert camp.unusable(s) == '' and camp.unusable({'tag': 'x', 'skip': '12 tracks'}) == 'not scored: 12 tracks'
+    assert camp.unusable(no_valley) == 'no valley_all'
+    assert camp.unusable({**s, 'ratio': None, 'E_med': float('inf')}) == 'ratio = null, E_med = inf'
     with pytest.raises(C.ConfigError, match='ratio'):                     # a metric no evaluation has is misnamed
         camp.check_metrics({'0000': {'state': 'done', 'scores': {k: v for k, v in s.items() if k != 'ratio'}}})
     camp.check_metrics({'0000': {'state': 'done', 'scores': {'skip': '12 tracks'}}})   # a skipped run: no metrics
+    # `pcr evaluate`'s scorer documents valley_all: a first run without it (it lost its beam) does not stop the
+    # campaign; a name that the scorer does not document and that no scored evaluation has does (the evaluator is
+    # set after the start: `pcr evaluate` would refuse the toy's [toy] overrides)
+    camp.cfg.evaluator = 'PyCentralRegion.cli evaluate'
+    camp.check_metrics({'0': {'state': 'done', 'scores': no_valley}})
+    camp.cfg.objectives = (space.Objective('valley_al', 'minimize'),)
+    with pytest.raises(C.ConfigError, match='valley_al'):
+        camp.check_metrics({'0': {'state': 'done', 'scores': s}})
 
 
 def test_store_round_trip(tmp_path):
@@ -214,6 +245,16 @@ def test_resume_continues_with_the_same_proposals(tmp_path):
     st.append('0016', 'proposed', **b.propose(evals))
     b.optimize(max_evals=16)
     assert st.evaluations()['0016']['state'] == 'done' and len(st.evaluations()) == 17
+    # the variables are the campaign's: a re-ranged, re-targeted or renamed one would move every stored design under
+    # the sampler (a variable added or removed alike), so neither a run nor a dry run nor a verify continues
+    for item, match in {'mobo.variables.1.high=1.30': 'evaluation 0000 .*its volt was 1.0, which the variable now',
+                        'mobo.variables.1.target="toy.volt"': 'its volt was not set as toy.volt=1.0',
+                        'mobo.variables.1.name="v"': "it has the variables .*'volt'.*, the campaign .*'v'"}.items():
+        changed = driver.Campaign(campaign(tmp_path / 'b', item, 'mobo.warm_start=[]'), runner=inprocess)
+        for run in (changed.optimize, changed.dry_run, lambda: changed.verify(ids=['3'])):
+            with pytest.raises(C.ConfigError, match=match):
+                run()
+    assert len(st.evaluations()) == 17 and st.lock_path.read_text() == ''
 
 
 def json_key(unit):
@@ -222,7 +263,8 @@ def json_key(unit):
 
 def test_failed_evaluations(tmp_path):
     optuna = pytest.importorskip('optuna')
-    sets = ['mobo.fixed=["toy.fail_above_mm=4.0"]', 'mobo.max_evals=12']
+    # about 2/3 of the toy's geometries fail here: the run must not stop on a streak of them
+    sets = ['mobo.fixed=["toy.fail_above_mm=4.0"]', 'mobo.max_evals=12', 'mobo.max_failed_in_a_row=0']
     camp = driver.Campaign(campaign(tmp_path, *sets), runner=inprocess)
     camp.optimize()
     evals = camp.store.evaluations()
@@ -235,42 +277,81 @@ def test_failed_evaluations(tmp_path):
     assert not {ev.get('pinned_to') for ev in search} & {ev['id'] for ev in failed}
     # the sampler sees a failed evaluation as a pending trial ...
     study, _ = camp.study(evals, optuna.samplers.RandomSampler(seed=0))
-    assert [t.state == optuna.trial.TrialState.RUNNING for t in study.trials] == [ev['state'] == 'failed' for ev in search]
+    pending = [t.state == optuna.trial.TrialState.RUNNING for t in study.trials]
+    assert pending == [ev['state'] == 'failed' for ev in search]
     assert all(list(t.constraints) == ['E_med>=2.9'] for t in study.trials if t.state.is_finished())
     # ... or, with failed_as_infeasible, as a complete trial with the worst values and an extra violated constraint
     camp2 = driver.Campaign(campaign(tmp_path, *sets, 'mobo.failed_as_infeasible=true'), runner=inprocess)
     study2, _ = camp2.study(evals, optuna.samplers.RandomSampler(seed=0))
     assert all(t.state == optuna.trial.TrialState.COMPLETE for t in study2.trials)
-    assert [t.constraints['evaluated'] for t in study2.trials] == [float(ev['state'] == 'failed') for ev in search]
+    assert [t.constraints['scored'] for t in study2.trials] == [float(ev['state'] == 'failed') for ev in search]
     ok = [t.values for t, ev in zip(study2.trials, search) if ev['state'] == 'done']
     worst = [t.values for t, ev in zip(study2.trials, search) if ev['state'] == 'failed'][0]
     assert worst == [min(v[0] for v in ok), max(v[1] for v in ok), max(v[2] for v in ok)]
 
 
-def test_skipped_runs_enter_the_study_as_bad_designs(tmp_path):
-    """A run the scorer skipped (too few survivors) is a design that lost its beam: a complete trial with the metrics
-    its scores carry and the worst values seen for the rest; never in the Pareto set. With nothing seen yet it is
-    pending."""
-    optuna = pytest.importorskip('optuna')
-    camp = driver.Campaign(campaign(tmp_path, 'mobo.max_evals=6'), runner=inprocess)
-    skip = {'tag': 'camp', 'skip': '12 tracked survivors (min_survivors 200)'}
-    first = camp.add('0000', camp.propose({}))
-    camp.store.append(first['id'], 'done', scores=skip)
-    study, _ = camp.study(camp.store.evaluations(), optuna.samplers.RandomSampler(seed=0))
-    assert [t.state for t in study.trials] == [optuna.trial.TrialState.RUNNING]
-    camp.optimize()
+def test_failures_in_a_row_stop_the_run(tmp_path, capsys):
+    """An environment that cannot run an evaluation fails every one: the run stops after max_failed_in_a_row of them
+    in a row (exit code 1) instead of spending the budget on failures; a rerun continues (and stops again)."""
+    pytest.importorskip('optuna')
+    sets = ['mobo.fixed=["toy.fail_above_mm=0.0"]', 'mobo.max_evals=10', 'mobo.max_failed_in_a_row=3']
+    camp = driver.Campaign(campaign(tmp_path, *sets), runner=inprocess)
+    capsys.readouterr()
+    assert camp.optimize() == 1
     evals = camp.store.evaluations()
-    for eval_id, scores in (('0006', skip), ('0007', {**skip, 'I_final': 0.01})):
-        ev = camp.add(eval_id, camp.propose(evals))
-        camp.store.append(eval_id, 'done', scores=scores)
-        evals = camp.store.evaluations()
+    assert [ev['state'] for ev in evals.values()] == ['failed'] * 3 and camp.spent(evals) == 3
+    assert 'stopped: 3 evaluations in a row failed' in capsys.readouterr().out
+    assert camp.optimize() == 1 and camp.spent(camp.store.evaluations()) == 6
+    with pytest.raises(C.ConfigError, match='max_failed_in_a_row'):
+        campaign(tmp_path, 'mobo.max_failed_in_a_row=-1').validate()
+
+
+def test_unusable_scores_enter_the_study_as_bad_designs(tmp_path, capsys):
+    """An evaluation that finished but whose scores lack an objective or constraint value - the scorer skipped the run
+    (toy: RF phase > -10 deg), a metric is missing (toy: no valley_all above -20 deg), null or not finite - is a
+    design that lost its beam: a complete infeasible trial with the worst values seen (its own finite metrics count),
+    with the reason in the store and in optimize-status, never in the Pareto set, counted in the budget; pending
+    while no values have been seen. The sampler proposes on such a study (it ran 4 TPE proposals here)."""
+    optuna = pytest.importorskip('optuna')
+    sets = ['mobo.fixed=["toy.short_above_deg=-20.0", "toy.skip_above_deg=-10.0"]', 'mobo.max_evals=14']
+    camp = driver.Campaign(campaign(tmp_path, *sets), runner=inprocess)
+    assert camp.optimize() == 0
+    evals = camp.store.evaluations()
+    search = camp.search(evals)
+    why = {ev['id']: ev.get('unusable', '') for ev in search}
+    phase = {ev['id']: ev['params']['phase'] for ev in search}
+    assert all(ev['state'] == 'done' for ev in search) and camp.spent(evals) == 14
+    assert all(why[i].startswith('not scored: ') == (phase[i] > -10.0) for i in why)
+    assert all((why[i] == 'no valley_all') == (-20.0 < phase[i] <= -10.0) for i in why)
+    bad = [i for i in why if why[i]]
+    assert 2 <= len(bad) <= 12 and why['0000'] == ''               # the warm start (-20 deg) is scored
+    # the study: every finished evaluation complete; the unusable ones at the worst values seen, infeasible
     study, _ = camp.study(evals, optuna.samplers.RandomSampler(seed=0))
-    ok = [v for ev in camp.search(evals) if (v := camp.values(ev)) is not None]
-    worst = [min(v[0][0] for v in ok), max(v[0][1] for v in ok), max(v[0][2] for v in ok)]
-    assert study.trials[0].state == optuna.trial.TrialState.COMPLETE and study.trials[0].values == worst
-    assert study.trials[-1].values == [0.01] + worst[1:]
-    assert study.trials[-1].constraints == {'E_med>=2.9': max(v[1][0] for v in ok)}
-    assert not {'0000', '0006', '0007'} & set(camp.summary(evals)['pareto']) and camp.spent(evals) == 8
+    scores = [ev['scores'] for ev in search]
+    seen = {m: [s[m] for s in scores if m in s] for m in ('I_final', 'valley_all', 'ratio', 'E_med')}
+    worst = [min(seen['I_final']), max(seen['valley_all']), max(seen['ratio'])]
+    assert all(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
+    for t, ev in zip(study.trials, search):
+        assert t.constraints['scored'] == float(bool(why[ev['id']]))
+        if why[ev['id']]:
+            assert t.values == worst and t.constraints['E_med>=2.9'] == pytest.approx(2.9 - min(seen['E_med']))
+    assert not set(bad) & set(camp.summary(evals)['pareto'])
+    capsys.readouterr()
+    camp.status()
+    out = capsys.readouterr().out
+    assert 'done!' in out and f"{bad[0]}: unusable scores ({why[bad[0]]})" in out
+    # null and non-finite metrics, recorded with their reason
+    ev = camp.add('0014', camp.propose(evals))
+    result = {'status': 'ok', 'scores': {**scores[0], 'valley_all': None, 'ratio': float('inf')}}
+    camp.finish(ev, evaluate.Outcome(returncode=0, wall_s=1.0, result=result))
+    assert camp.store.evaluations()['0014']['unusable'] == 'valley_all = null, ratio = inf'
+    # before any value has been seen a stand-in is pending
+    first = driver.Campaign(campaign(tmp_path / 'b', *sets), runner=inprocess)
+    ev = first.add('0000', first.proposal('search', 'free', {v.name: 1.0 for v in first.cfg.variables}))
+    first.finish(ev, evaluate.Outcome(returncode=0, wall_s=1.0, result={'status': 'ok', 'scores': toy.scores(
+        {**toy.DEFAULTS, 'phases_deg': [0.0], 'skip_above_deg': -10.0})}))
+    study, _ = first.study(first.store.evaluations(), optuna.samplers.RandomSampler(seed=0))
+    assert [t.state for t in study.trials] == [optuna.trial.TrialState.RUNNING]
 
 
 def test_time_limit_stops_the_whole_tree(tmp_path, subprocess_env):
@@ -288,28 +369,61 @@ def test_time_limit_stops_the_whole_tree(tmp_path, subprocess_env):
 
 
 def test_ctrl_c_stops_the_whole_tree(tmp_path, subprocess_env):
-    """Ctrl+C in the driver (here a SIGINT 2 s in) stops the evaluation and its child at once."""
+    """Ctrl+C in the driver (a SIGINT 2 s in, raised from another thread as the console's handler thread raises it)
+    stops the evaluation and its child at once, on a busy machine too. A thread that holds the interpreter in long C
+    calls wakes the driver late from every wait, as a loaded machine does; with Popen.wait(timeout) the stop then
+    waited for the whole 60 s evaluation (evaluate's module docstring)."""
     cmd = evaluate.command('', 'PyCentralRegion.mobo.toy', BASE, ['toy.sleep_s=60', 'toy.child_sleep_s=60'],
                            tmp_path / 'e')
-    pids = []
+    pids, done = [], threading.Event()
+
+    def busy():
+        while not done.is_set():
+            sum(range(2_000_000))
+
+    threading.Thread(target=busy, daemon=True).start()
     timer = threading.Timer(2.0, signal.raise_signal, (signal.SIGINT,))
     timer.start()
     try:
         out = evaluate.run(cmd, tmp_path / 'e', env=evaluate.child_env(''), on_start=pids.append)
     finally:
         timer.cancel()
-    assert out.interrupted and not out.timed_out and out.wall_s < 30
+        done.set()
+    assert out.interrupted and not out.timed_out and out.wall_s < 15
     assert not store.pid_alive(pids[0]) and not store.pid_alive(child_pid(tmp_path / 'e'))
+
+
+def test_ctrl_c_while_the_evaluation_starts_stops_it_too(tmp_path, subprocess_env, monkeypatch):
+    """Ctrl+C after the process exists but before Popen returns it is held until the process is in its tree, then
+    stops it like any other: raised inside Popen, it would lose the process (Windows: suspended outside its job)."""
+    created = []
+
+    class Late(subprocess.Popen):
+        def _execute_child(self, *args, **kwargs):
+            super()._execute_child(*args, **kwargs)
+            created.append(self.pid)
+            signal.raise_signal(signal.SIGINT)
+
+    monkeypatch.setattr(subprocess, 'Popen', Late)
+    cmd = evaluate.command('', 'PyCentralRegion.mobo.toy', BASE, ['toy.sleep_s=60'], tmp_path / 'e')
+    try:
+        out = evaluate.run(cmd, tmp_path / 'e', env=evaluate.child_env(''))
+        assert out.interrupted and out.wall_s < 15 and created and not store.pid_alive(created[0])
+    finally:
+        for pid in created:                                     # only when it failed: what it left behind
+            if store.pid_alive(pid):
+                os.kill(pid, getattr(signal, 'SIGKILL', signal.SIGTERM))
 
 
 def test_time_budget_stops_the_running_evaluation(tmp_path, subprocess_env):
     """At the end of max_hours the running evaluation is stopped with its tree and recorded interrupted; it does not
-    count against max_evals and is not run again. The geometry files it had made (the toy writes them before it
-    sleeps) are complete: they stay, and the geometry's cheap evaluations use them."""
+    count against max_evals. The geometry files it had made (the toy writes them before it sleeps) are complete: they
+    stay, and the geometry's cheap evaluations use them. It was the warm start, which is evaluated again after them
+    (a proposal would not be)."""
     pytest.importorskip('optuna')
     camp = driver.Campaign(campaign(tmp_path, SLOW, 'mobo.max_evals=3'))
     t0 = time.monotonic()
-    assert camp.optimize(max_hours=6.0 / 3600.0) == 0
+    assert camp.optimize(max_hours=3.0 / 3600.0) == 0          # the toy writes its geometry files at once, then sleeps
     assert time.monotonic() - t0 < 30
     evals = camp.store.evaluations()
     ev = evals['0000']
@@ -323,6 +437,8 @@ def test_time_budget_stops_the_running_evaluation(tmp_path, subprocess_env):
     evals = again.store.evaluations()
     assert list(evals) == ['0000', '0001', '0002', '0003'] and again.spent(evals) == 3
     assert evals['0000']['state'] == 'failed' and evals['0001']['pinned_to'] == '0000'
+    assert (evals['0003']['kind'], evals['0003']['warm'], evals['0003']['state']) == ('warm', 0, 'done')
+    assert evals['0003']['params'] == ev['params'] and evals['0003']['geometry'] == ev['geometry']
 
 
 def test_a_stopped_build_leaves_its_geometry_buildable(tmp_path):
@@ -373,6 +489,25 @@ def test_interrupted_followers_leave_the_geometry_its_cheap_evaluations(tmp_path
     assert (camp.store.geometry_dir(ev['geometry']) / driver.FIELDS_FILE).exists()
     kind, head = camp.plan(evals)
     assert kind == 'pinned' and head['id'] == '0000'
+
+
+def test_pinned_followers_evaluate_their_heads_geometry_exactly(tmp_path):
+    """A cheap follower takes its head's physical geometry values, not their round trip through the unit cube: the
+    cube gives a warm start's 4.726034523988023 back as ...024, which would be another geometry key (another build)."""
+    pytest.importorskip('optuna')
+    width = 4.726034523988023
+    odd = ['mobo.variables=[{name="phase", target="toy.phases_deg", low=-40.0, high=0.0, as_list=true}, '
+           '{name="width", target="toy.gap_width_mm", low=-3.274, high=12.726, kind="geometry"}]',
+           f'mobo.warm_start=[{{phase=-20.0, width={width!r}}}]', 'mobo.max_evals=3']
+    camp = driver.Campaign(campaign(tmp_path, *odd), runner=inprocess)
+    v = camp.cfg.variables[1]
+    assert v.physical(v.unit(width)) != width                  # the case: the cube does not give it back
+    assert camp.optimize() == 0
+    evals = list(camp.store.evaluations().values())
+    assert [ev['kind'] for ev in evals] == ['warm', 'pinned', 'pinned']
+    assert all(ev['params']['width'] == width and ev['geometry'] == evals[0]['geometry'] for ev in evals)
+    assert [p.name for p in (Path(camp.cfg.campaign_dir) / 'geometries').iterdir()] == [evals[0]['geometry']]
+    camp.check_store(camp.store.evaluations())                  # the one-ulp round trip is no changed search space
 
 
 def test_evaluations_run_the_drivers_code(tmp_path):
@@ -499,8 +634,12 @@ def test_gp_campaign_pins_the_geometry(tmp_path):
         if ev['kind'] == 'pinned':
             head = evals[ev['pinned_to']]
             assert (ev['unit']['width'], ev['unit']['posts']) == (head['unit']['width'], head['unit']['posts'])
+    # a design that lost its beam joins the study as an infeasible stand-in: the GP fits the constraint 'scored' too
+    ev = camp.add('0008', camp.propose(evals))
+    camp.finish(ev, evaluate.Outcome(returncode=0, wall_s=1.0, result={'status': 'ok', 'scores': {'skip': 'lost'}}))
     sampler = driver.make_sampler(cfg, 0, {'u_width': 0.25, 'u_posts': 0.7})
-    study, dists = camp.study(evals, sampler)
+    study, dists = camp.study(camp.store.evaluations(), sampler)
+    assert study.trials[-1].constraints['scored'] == 1.0
     trial = study.ask(dists)                                    # past the startup: the pinned acquisition
     assert trial.params['u_width'] == 0.25 and trial.params['u_posts'] == 0.7
     assert all(0.0 <= trial.params[k] <= 1.0 for k in dists)
@@ -509,7 +648,7 @@ def test_gp_campaign_pins_the_geometry(tmp_path):
 def test_verify_status_and_dry_run(tmp_path, subprocess_env, capsys):
     pytest.importorskip('optuna')
     camp_dir = tmp_path / 'camp'
-    sets = ['--set', f'mobo.campaign_dir={camp_dir.as_posix()}', '--set', 'mobo.max_evals=8']
+    sets = ['--set', f'mobo.campaign_dir={camp_dir.as_posix()}', '--set', 'mobo.max_evals=6']
     assert driver.main(['optimize', str(TOY), *sets, '--dry-run']) == 0
     assert 'next: 0000 warm' in capsys.readouterr().out and not camp_dir.exists()   # the dry run writes nothing
     assert driver.main(['optimize', str(TOY), *sets]) == 0

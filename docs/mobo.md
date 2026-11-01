@@ -23,10 +23,18 @@ The driver never imports the physics modules. Each evaluation is a subprocess:
 It writes `result.json`: `{"status": "ok" | "failed", "scores", "error", "wall_s", "config"}`.
 
 Running evaluations as subprocesses means a crash, a hang or a GPU out-of-memory costs one evaluation, never the
-campaign. The subprocess inherits the driver's environment, `PYTHONPATH` included, so a source checkout runs as it
-is. The driver sets `MPLBACKEND=Agg` and, for a conda interpreter, `CONDA_PREFIX` and that environment's DLL folders
-(the CUDA libraries do not load without them on Windows). On Windows the evaluation runs in a job object: stopping the
-driver in any way, a hard kill included, stops the evaluation and every process it started.
+campaign. The subprocess inherits the driver's environment. When the driver's own PyCentralRegion is a source tree (a
+checkout or an editable install), that `src` folder goes first on the evaluation's `PYTHONPATH`, so the evaluation
+runs the code the driver runs; a copy installed in site-packages is never put on another interpreter's path. The
+driver sets `MPLBACKEND=Agg` and, for a conda interpreter, `CONDA_PREFIX` and that environment's DLL folders (the CUDA
+libraries do not load without them on Windows).
+
+On Windows the evaluation runs in a job object, so stopping the driver in any way, a hard kill included, stops the
+evaluation and every process it started. It also gets a hidden console of its own: Ctrl+C and Ctrl+Break reach the
+driver alone, which stops the tree and records the evaluation interrupted, never failed. On POSIX the evaluation leads
+a session of its own, which the driver ends (SIGTERM, then SIGKILL) when it stops. A SIGKILL of the driver itself
+leaves that session running; the campaign lock, which the evaluation inherits, keeps a new driver off the campaign
+until it ends.
 
 ## The campaign file
 
@@ -39,7 +47,7 @@ campaign_dir = "E:/results/mobo/my_campaign"   # the whole state of the campaign
 base_config_file = "my_design.toml"             # the run file every evaluation starts from
 physics_python = "C:/.../envs/physics/python.exe"
 sampler = "gp"
-n_startup = 10            # evaluations (warm start included) before the model replaces random sampling
+n_startup = 10            # evaluations with values (warm start included, failed ones not) before the model takes over
 max_evals = 60            # search evaluations of the whole campaign; a rerun continues to it
 cheap_per_geometry = 3    # after every new geometry: this many evaluations on it with only the cheap variables free
 fixed = ["btrim.r_min_m=0.05"]                  # overrides of every evaluation
@@ -67,20 +75,34 @@ timeout_min = 30.0
 ```
 
 Worked examples:
-- `configs/examples/toy/campaign.toml`: the analytic toy, which runs in seconds;
-- `configs/examples/hchc1p5/mobo_pilot.toml`: cheap variables only, on the worked example's existing fields.
+- `configs/examples/toy/campaign.toml`: the analytic toy, 30 evaluations in about 8 s (17 s with the GP);
+- `configs/examples/hchc1p5/mobo_pilot.toml`: cheap variables only (RF phase, dee voltage, first-harmonic trim), on
+  the worked example's existing fields, 20 evaluations;
+- `configs/examples/hchc1p5/mobo_campaign.toml`: the full campaign: the beam channel's aperture and the
+  spiral-inflector rotation (geometry) with the RF phase, the dee voltage, the trim and a radial slit (cheap); 13
+  variables, 120 evaluations, about 8 h. Its header lists what the loop does not see.
 
 ## Variables
 
 The sampler works on `u_<name>` in [0, 1], mapped linearly onto [`low`, `high`] (`log = true`: logarithmically).
-With `integer = true` every integer gets the same share of the cube.
+With `integer = true` (integer `low` and `high`) every integer gets the same share of the cube.
 
 The `target` is a dotted run-file key, the same as a `--set` override. An integer part indexes an array of tables:
 `geometry.windows.1.half_height_mm`. The driver owns `paths.model3d`, `paths.fields` and `run.out_dir`; a variable
 cannot set them.
 
-Before anything runs, every target is applied at both ends of its range and checked against its section. A misspelt
-key fails then, instead of leaving every evaluation the same design.
+Before anything runs, every override is checked against its section: the variables of each section together at every
+corner of their box (a section's checks can relate its keys: a channel taper must start at r > 0), the campaign's
+other variables at the base's values. With `pcr evaluate` as the evaluator an override must name one of the sections
+it reads.
+A misspelt key or an invalid corner fails then, instead of leaving every evaluation the same design or failing those
+proposed near it. Bounds that need the electrode layout (the channel heights against the housing exit) are checked
+at the build; `python -m PyCentralRegion.geometry.build bounds <base run toml>` prints them.
+
+A started campaign keeps its variables. One added, removed, renamed, re-ranged or re-targeted once evaluations exist
+would move every stored design under the sampler, so `pcr optimize`, `--dry-run` and `optimize-verify` refuse it:
+run a changed search space in another `campaign_dir`. Objectives and constraints may change; they are re-read from the
+stored scores, so a constraint added later judges the earlier evaluations too.
 
 A variable has one of two kinds:
 
@@ -89,14 +111,18 @@ A variable has one of two kinds:
 | `cheap` | RF phase, dee voltage, magnetic trim, slit, extra posts | re-tracking only, on the same fields |
 | `geometry` | the electrodes or anything the build or the BEM reads | a new build and 3D BEM |
 
-The geometry key is a hash of everything the build and the BEM read: the sections `[geometry]`, `[machine]`,
-`[inflector]` and `[fields]` and the files `paths.seed`, `paths.handoff`, `paths.housing_outline` and
-`paths.housing_step`, after all overrides. Evaluations with the same key share one model and one field map in
-`<campaign_dir>/geometries/<key>/`. A `cheap` variable that targets one of these sections gets a warning, because its
-evaluations would share fields that do not belong to them.
+The geometry key is a hash of what the build and the BEM read: the sections `[geometry]`, `[machine]`, `[inflector]`
+and `[fields]` as the base run file writes them (with `fixed` and the fidelity's overrides), the paths `paths.seed`,
+`paths.handoff`, `paths.housing_outline` and `paths.housing_step`, and the geometry variables' values. It holds
+neither the code's defaults nor the files' contents: after a change of either, start another `campaign_dir`.
+Evaluations with the same key share one model and one field map in `<campaign_dir>/geometries/<key>/`. A `cheap`
+variable that targets one of these sections gets a warning, because its evaluations would share fields that do not
+belong to them.
 
-After every new geometry the driver runs `cheap_per_geometry` evaluations on it, with the geometry coordinates held
-and only the cheap ones proposed. Its fields are then used several times before the next build.
+After every new geometry whose fields were made, the driver runs `cheap_per_geometry` evaluations on it. They take
+that evaluation's geometry values exactly (a warm start's included), so they share its key and its fields, and only
+the cheap variables are proposed; an interrupted one does not count. A geometry whose build or BEM failed gets no
+cheap evaluations: the next evaluation is a new geometry.
 
 A campaign without geometry variables uses the base run file's own `paths.model3d` and `paths.fields`.
 
@@ -107,26 +133,43 @@ Useful targets:
 | RF phase | `track.phases_deg` (`as_list = true`) | cheap |
 | dee voltage | `track.volt_scale` | cheap |
 | first-harmonic trim | `btrim.amplitude_t`, `btrim.phase_deg` | cheap |
-| collimating slit | `slit.half_width_mm`, `slit.offset_mm`, `slit.pass_index` (`integer = true`) | cheap |
+| collimating slit | `slit.half_width_mm`, `slit.azimuth_deg`, `slit.offset_mm`, `slit.pass_index` (`integer = true`) | cheap |
 | spiral-inflector rotation | `inflector.rotation_deg` (with `geometry.si_rotation = "fixed"`) | geometry |
 | dee vertical aperture | `geometry.aperture_inner_mm`, `aperture_outer_mm`, `aperture_taper_center_mm`, `aperture_taper_length_mm` | geometry |
 | a gap window | `geometry.windows.<i>.half_height_mm` | geometry |
+
+Two of these are awkward for any sampler: `slit.half_width_mm = 0` means no slit, next to small widths that pass
+almost no beam, so the scores jump at that end; `btrim.phase_deg` is periodic and does nothing at zero amplitude.
 
 ## Objectives and constraints
 
 Both are read from the scores in `result.json` by dotted path. `pcr score` writes every metric; the ones an optimiser
 may use are listed with their meaning in `PyCentralRegion.analysis.objectives.METRICS`.
 
-A metric that no scored evaluation has stops the campaign: a typo must not feed the sampler nothing.
+A metric that no scored evaluation has (runs the scorer skipped do not count) stops the campaign: a typo must not feed
+the sampler nothing. With `pcr evaluate` as the evaluator, a metric listed in `METRICS` is never taken for a typo,
+since a run that lost its beam early lacks some of those legitimately (`valley_all` and the `turn_*` metrics need
+probes with `score.probe_passes` complete passes). The dry run marks every objective or constraint metric that
+`METRICS` does not list.
 
 Constraints follow optuna's convention: a value <= 0 is feasible, so `metric >= value` is stored as `value - metric`.
 
-The scoring of the 108 earlier 3D runs (2026-11-01) suggests:
+An evaluation that finishes with unusable scores is a bad design, not a failure. That is the case when the scorer
+skipped the run (fewer than `score.min_tracks` = 5000 tracks or `score.min_survivors` = 200 survivors), or when a
+metric of an objective or a constraint is missing, null or not finite. It enters the study as an infeasible stand-in:
+a complete trial with the worst value seen of every objective and constraint and one extra constraint, `scored`,
+violated (1 for a stand-in, 0 for the scored trials; present only while a stand-in exists). Until every objective and
+constraint has a value seen, stand-ins are pending trials. The store records why (`unusable`); the log and
+`pcr optimize-status` show it (state `done!`, the reason under the table). Stand-ins count against `max_evals` and are
+never in the Pareto set. The GP learns from their values; TPE ranks infeasible trials by their violation, so for TPE
+the `scored` violation is what steers it away.
+
+The scoring of the 109 earlier 3D runs (2026-11-01) suggests:
 
 | | metric | why |
 |---|---|---|
 | maximise | `I_final` | final current, T × injected current [mA] |
-| minimise | `valley_all` | particles between the turns, mean of 8 probes. Never one probe alone: the 45° probe flatters. |
+| minimise | `valley_all` | share of the probe crossings between the turns, the 8 probes (every 45°) pooled. Never one probe alone: the 45° probe flatters. |
 | minimise | `ratio` | aspect ratio of the bunch core at the last turn |
 | constraint | `E_med >= 2.9` | reach the design energy [MeV] |
 | constraint | `turn_sigR <= 3.0` | clean turns, 8 σ at a 24 mm turn separation [mm] |
@@ -139,18 +182,25 @@ There is no vortex objective: at this bunch density the vortex cannot shape the 
 
 A fidelity is a named list of overrides, applied after `fixed` and before the variables:
 - the sampler learns from `search_fidelity`;
-- `pcr optimize-verify` re-evaluates chosen designs at `verify_fidelity`. It stores each next to its original (id
-  `0007.verify`), so the search-to-verify shift of every score can be read off.
+- `pcr optimize-verify` re-evaluates chosen designs at `verify_fidelity` (or `--fidelity NAME`). It stores each next to
+  its original (id `0007.verify`), so the search-to-verify shift of every score can be read off. A re-evaluation that
+  failed or was interrupted runs again on the next `optimize-verify`; its earlier folder is kept as
+  `0007.verify.attempt<k>`.
 
 `timeout_min` stops an evaluation that runs longer, which is then recorded failed.
+
+Let the fidelities differ in resolution only (particles, space-charge grid and interval), not in what is simulated
+(turns, energies): then the search-to-verify shift of a score is its resolution error. The worked example's
+fidelities both track to the base's turn cap (`track.turns = 8`; a run ends when the reference reaches
+`machine.target_energy_mev`, within 7 turns for the base design).
 
 | fidelity | particles | SC | one evaluation on known fields |
 |---|---|---|---|
 | search | 10 000 | 64³ every 5 steps | about 2 min (see Costs) |
 | verify | all (~98 000) | 128³ every step | about 8 min |
 
-On the worked example (-15°) the search fidelity gave T = 50.45 % = 4.053 mA, the verify fidelity 50.09 % =
-4.024 mA.
+On the worked example (-15°) a 10 000-particle run at the search fidelity gave T = 50.45 % = 4.053 mA, the verify
+fidelity 50.09 % = 4.024 mA.
 
 A cheaper search over the first turns would need early stand-ins for the final objectives. The candidates are:
 - `sig_r_t3` for `valley_all` (Spearman 0.94 over the earlier runs);
@@ -161,56 +211,93 @@ All three were correlated on the final survivors, while a turns-0-3 run knows on
 Re-check the correlations on that set before using them. The compression slope (`slope`), `dE_E_robust` and `W_eff`
 come from the end of the run, so they are not early stand-ins.
 
+## Samplers
+
+Both samplers are constrained and multi-objective, and both read the same store, so a campaign can switch between
+them. Prefer `gp` (it needs torch): on the toy, 40 evaluations reach 95 % of the true front's hypervolume with the GP
+and 70 % with TPE, whose pinned cheap followers model only the free coordinates. `tpe` is the default because it needs
+no torch. Without the `greenlet` package optuna's GP runs its acquisition restarts one after another, which costs
+about 0.5 s per proposal and prints a warning.
+
 ## Running
 
 ```
 pcr optimize        campaign.toml --dry-run          # check everything, print the next evaluation's command
 pcr optimize        campaign.toml                    # run until max_evals
 pcr optimize        campaign.toml --max-hours 10     # ... or for at most 10 h in this run
+pcr optimize        campaign.toml --max-evals 40     # ... or to another campaign budget than max_evals
 pcr optimize-status campaign.toml                    # evaluations, Pareto set, best values
 pcr optimize-verify campaign.toml --pareto           # re-evaluate the Pareto set at the verify fidelity
-pcr optimize-verify campaign.toml --ids 3 7          # ... or chosen evaluations
+pcr optimize-verify campaign.toml --ids 3 7          # ... or chosen evaluations (--fidelity NAME: another fidelity)
 ```
 
-The campaign folder is the whole state. Running `pcr optimize` again continues where the last run stopped, and
-proposes exactly what an uninterrupted run would have: the sampler of every proposal is seeded from `seed` and the
-evaluation's index, and the study is rebuilt from the store each time.
+Every command takes `--set key=value` (repeatable), an override of the campaign file, e.g. `--set mobo.seed=3`. The
+command line that `--dry-run` prints (and `command.txt` records) is quoted for cmd.exe; to paste it into Windows
+PowerShell 5.1, put `--%` after the interpreter: `& <python> --% -m PyCentralRegion.cli evaluate ...`.
 
-The driver never schedules or restarts itself. Stopping it ends the running evaluation with every process it
-started. The stop can be Ctrl+C, closing its window, a kill, or the end of `--max-hours`. That evaluation is
-recorded failed ("interrupted"), does not count against `max_evals` and is not run again; give its design as a
-`warm_start` point to evaluate it anyway. One lock file keeps a second driver off the same campaign.
+The campaign folder is the whole state. Running `pcr optimize` again continues where the last run stopped. Every
+proposal follows from the store alone: the study is rebuilt from the store each time and the sampler seeded from
+`seed` and the evaluation's index. A run stopped between evaluations, or after proposing one and before starting it
+(that one then runs first), continues exactly as an uninterrupted run would have. A run stopped during an evaluation
+loses that evaluation: the evaluations before it are the uninterrupted run's, the ones after it what the study
+proposes without it.
 
-A failed evaluation enters the study as a pending trial: the sampler does not propose it again, and no objective
-values are invented for it. With `failed_as_infeasible = true` it enters instead as a complete trial with the worst
-values seen and a violated constraint.
+The driver never schedules or restarts itself. Before its first evaluation, `pcr optimize` (and `optimize-verify`,
+when it has work) checks that `physics_python` runs and finds the package and the evaluator module: the preflight,
+a few seconds, logs in `<campaign_dir>/preflight/`. A wrong interpreter, or a `PYTHONPATH` without the package, then
+stops the driver at once instead of failing every evaluation. The preflight does not import the physics stack (numba,
+bempp, cupy), so a run also stops, with exit code 1, after `max_failed_in_a_row` (default 5) failed evaluations in a
+row: a broken environment, not bad designs. Running it again continues. One lock file keeps a second driver off the
+same campaign.
+
+Stopping the driver ends the running evaluation with every process it started. The stop can be Ctrl+C, Ctrl+Break or
+SIGTERM, closing its window, a kill, or the end of `--max-hours`. That evaluation is recorded failed ("interrupted"),
+does not count against `max_evals` and is not run again; give its design as a `warm_start` point to evaluate it
+anyway (an interrupted warm-start point is evaluated again).
+
+A failed evaluation (the build, the BEM or the tracking failed, or a timeout) enters the study as a pending trial: the
+sampler does not propose it again, and no objective values are invented for it. With `failed_as_infeasible = true` it
+enters instead as an infeasible stand-in (see Objectives and constraints).
 
 ## The campaign folder
 
 ```
 <campaign_dir>/evals.jsonl          append-only: one line per state change of an evaluation (the store)
 <campaign_dir>/evals/<id>/          command.txt, stdout.log, stderr.log, result.json and the stage outputs
-<campaign_dir>/geometries/<key>/    model3d.pkl, fields.pkl and geometry.json of one geometry
+<campaign_dir>/evals/<id>.<fid>/    a re-evaluation at another fidelity (0007.verify); earlier tries <id>.<fid>.attempt<k>
+<campaign_dir>/geometries/<key>/    geometry.json (what the key hashes), model3d.pkl with the build's side files
+                                    (model3d.msh, model3d.step, model3d_build.json, model3d_dees.png) and fields.pkl
+<campaign_dir>/preflight/           stdout.log, stderr.log of the check of the physics interpreter
 <campaign_dir>/driver.lock          held by the running driver
 ```
 
-An evaluation goes proposed → running → done | failed. Search evaluations are numbered 0000, 0001, ...
+An evaluation goes proposed → running → done | failed; `optimize-status` marks a done one with unusable scores
+`done!`. Search evaluations are numbered 0000, 0001, ...
 
-An evaluation stopped while it made its geometry's model or fields has its partial files renamed
-(`*.stopped-<id>`), so the next evaluation of that geometry makes them afresh.
+A geometry's model and field cache are each written under a temporary name and renamed once complete, so a stop never
+leaves them cut short: once made, they serve every later evaluation of that geometry (a stop during the BEM keeps the
+model, and a later evaluation makes only the fields). A build that failed or was stopped before its model leaves side
+files that the next build of that geometry would refuse to overwrite; the driver moves them into
+`geometries/<key>/stopped-<id>/`, so the next evaluation of that geometry builds afresh.
 
 ## Costs
 
-- **Every evaluation process** compiles the parallel 3D tracking kernel first, about 65 s on 28 threads. numba 0.64
-  reloads a cached parallel build single-threaded, so the cache is off on purpose.
+On the worked example (28 threads, one GPU):
+- **Every evaluation process** compiles the parallel 3D tracking kernel first, about 65 s. numba 0.64 reloads a cached
+  parallel build single-threaded, so the cache is off on purpose.
 - **Search tracking** of 10 000 particles on known fields takes 20-25 s after that. A cheap evaluation therefore takes
   about 1.5-2 min, most of it the compile.
-- **A new geometry** adds the build (about 1 min) and the 3D BEM solve.
-- **Verify tracking** of every particle with SC 128³ every step takes about 7 min (429 s on the worked example).
+- **A new geometry** adds the build, about 20 s (17-18 s in the validation builds), and its fields, about 8 min (the
+  design deck's run of the worked example: the metal raster of the obstacle test 314 s, the 3D BEM 73 s with assembly
+  29 s and GMRES 35 s, the field grid 98 s). A new geometry's evaluation therefore takes about 10 min.
+- **Verify tracking** of every particle with SC 128³ every step takes about 7 min (429 s).
+- **A campaign** of 120 evaluations with `cheap_per_geometry = 3` (30 geometries): 30 × 10 + 90 × 2 min, about 8 h.
 
 ## The toy campaign
 
-`configs/examples/toy/campaign.toml` runs the whole loop in seconds without the physics stack or a GPU: the analytic
-evaluator `python -m PyCentralRegion.mobo.toy` follows the same contract. The toy covers subprocesses, the store, the
-geometry cache, both fidelities and failures. It is ZDT1 dressed up as a central region, so its Pareto front is known
+`configs/examples/toy/campaign.toml` runs the whole loop (30 evaluations) in about 8 s, 17 s with the GP, without the
+physics stack or a GPU: the analytic evaluator `python -m PyCentralRegion.mobo.toy` follows the same contract. The toy
+covers subprocesses, the store, the geometry cache, both fidelities, failures (`toy.fail_above_mm`), unusable scores
+(`toy.short_above_deg`: no `valley_all`; `toy.skip_above_deg`: the run is skipped) and process trees
+(`toy.child_sleep_s`). It is ZDT1 dressed up as a central region, so its Pareto front is known
 (`PyCentralRegion.mobo.toy`). `tests/test_mobo.py` runs it.

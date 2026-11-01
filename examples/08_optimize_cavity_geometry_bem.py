@@ -40,8 +40,8 @@ ex06 = _common.load_example('06_optimize_cavity_geometry.py')
 # The grounded central post is IN the search: sized per candidate from its
 # auto truncation (post radius = truncation - post_tip_gap, floored by
 # post_min_radius), so the optimizer sees the post's field and the
-# max_r_inner buildability guard stays active. Keep these values identical
-# to example 07 so verification sees the same structure.
+# max_r_inner buildability guard stays active. Keep post_tip_gap equal to
+# example 07's so the verification sees the same dee-tip-to-centre gap.
 BEM_BUILD_KWARGS = dict(chain_ds=0.02, arc_ds=0.06, post_tip_gap=0.005, post_min_radius=0.010)
 BEM_SOLVE_KWARGS = dict(tol=1e-4)
 BEM_FIELD_KWARGS = dict(spacing=0.003)

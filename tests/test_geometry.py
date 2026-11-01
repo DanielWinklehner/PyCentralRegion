@@ -1,7 +1,9 @@
 """The electrode builder (PyCentralRegion.geometry): options, the old-spec converters, the channel bounds, the builder's
 machine check and channel profile, and the build's file handling. Fast: nothing here meshes. The last tests lay out the
 worked example's reference design in 2D when its input files are on this machine (else they skip)."""
+import contextlib
 import dataclasses
+import io
 from pathlib import Path
 
 import pytest
@@ -14,14 +16,13 @@ from PyCentralRegion.geometry.options import GeometryConfig
 REPO = Path(__file__).resolve().parents[1]
 DESIGN = REPO / 'configs' / 'examples' / 'hchc1p5' / 'design_wnop3_rotn3_g0ap.toml'
 
-# the design deck's build of the reference design wnop3_rotn3_g0ap: its CR_* environment and command line
-REF_ENV = {'CR_SI_ROT': 'corner', 'HCHC60_EXPORT': r'E:\X\export', 'MINIDAR_SI_ROT_DEG': '4.726034523988023',
-           'CR_GROUND': 'star', 'CR_DEE_INNER': 'hug', 'CR_DEE0_NOSE_MM': '3', 'CR_JUNCTION_R': '2:124.6,3:208.5',
-           'CR_APERTURE_MM': '26,32', 'CR_APERTURE_R_MM': '100,140', 'CR_OCC_FUZZY_MM': '0.05'}
-REF_ARGS = ['--pkl', 'seed.pkl', '--outline', 'housing_outline.txt', '--handoff', 'handoff_sc_all_level.h5',
-            '--build', 'out/cr_model_x', '--pickle', 'out/cr_model_x_model3d.pkl', '--dees', 'out/cr_model_x_dees.png',
-            '--lc', '8', '--lc-outer', '16', '--r-fine', '150', '--r-coarse', '220', '--dee0-clearance', '5',
-            '--gap-apertures', '0:dee:10:46.12:0:28.12:64.12']
+# the electrodes of the reference design wnop3_rotn3_g0ap as the original design deck built them (2026-10-31): what
+# differs from the defaults (the worked example's design file sets exactly this)
+REF_GEOMETRY = dict(si_rotation='corner', gap0_on_plate=True, ground='star', dee_inner='hug', aperture_inner_mm=26.0,
+                    aperture_outer_mm=32.0, aperture_taper_center_mm=120.0, aperture_taper_length_mm=40.0,
+                    plate_half_gap_mm=25.0, dee0_clearance_mm=5.0, dee0_nose_mm=3.0, lc_outer_mm=16.0,
+                    junctions=(O.JunctionMove(2, 124.6), O.JunctionMove(3, 208.5)),
+                    holes=(O.HoleSpec(0, 'dee', 10.0, 46.12, 0.0, 28.12, 64.12),))
 
 
 def _load(tmp_path, text, overrides=()):
@@ -36,9 +37,29 @@ def test_defaults_and_the_channel():
     g = GeometryConfig()
     assert g.aperture_heights() == (26.0, 30.0) and g.aperture_radii() == (100.0, 140.0)
     assert g.dummy_aperture_heights() == g.aperture_heights()          # 0 = the dees' values
-    assert O.check_bounds(g) == {'height_max_mm': 30.0, 'inner_min_mm': None}   # the defaults pass their own bounds
+    assert O.check_bounds(g) == {'height_max_mm': 30.0, 'inner_min_mm': None, 'exit_r_mm': None}   # (their own bounds)
     assert GeometryConfig(dummy_aperture_inner_mm=28.0).dummy_aperture_heights() == (28.0, 30.0)
     assert g.si_rotation == 'fixed'
+
+
+def test_channel_profile_is_numpys():
+    """The one height profile of the build and the bounds keeps numpy.interp's arithmetic bit for bit (the builder
+    used it until 2026-11): a model built before is rebuilt unchanged."""
+    np = pytest.importorskip('numpy')
+    radii, heights = (100.0, 140.0), (26.0, 32.0)
+    for r in (0.0, 50.0, 100.0, 100.3, 113.7, 120.0, 131.1, 139.99, 140.0, 300.0, 1e5, -1.0):
+        ref = float(np.interp(r, [0.0, radii[0], radii[1], 1e4], [heights[0], heights[0], heights[1], heights[1]]))
+        assert O.channel_height_mm(r, radii, heights) == ref
+    inverted = GeometryConfig(aperture_inner_mm=30.0, aperture_outer_mm=20.0, aperture_taper_center_mm=60.0)
+    assert O.channel_height_mm(50.0, inverted.aperture_radii(), inverted.aperture_heights()) == 27.5
+
+
+def test_options_that_would_be_ignored_are_refused():
+    GeometryConfig(ground='star', gap0_face_mm=8.0)
+    with pytest.raises(ConfigError, match="gap0_face_mm = 8 fills gap 0's dummy side of the star ground"):
+        GeometryConfig(gap0_face_mm=8.0)
+    with pytest.raises(ConfigError, match="dee0_clearance_mm and dee0_trim_mm both cut"):
+        GeometryConfig(dee0_clearance_mm=5.0, dee0_trim_mm=2.0)
 
 
 def test_the_four_channel_fields_are_independent():
@@ -77,6 +98,21 @@ def test_bounds_name_the_bound():
         O.check_bounds(GeometryConfig(dummy_aperture_outer_mm=31.0))
     with pytest.raises(ConfigError, match="leaves no room"):
         O.check_bounds(GeometryConfig(plate_half_gap_mm=5.0))
+
+
+def test_an_inverted_taper_must_clear_the_exit():
+    """A taper that narrows the channel inside the exit's radius is held to the exit's height at its outermost radius;
+    the inner-height bound alone would pass it (the 30 mm inside r0 = 40 mm, but 20 mm at r = 84.9 mm)."""
+    g = GeometryConfig(aperture_inner_mm=30.0, aperture_outer_mm=20.0, aperture_taper_center_mm=60.0,
+                       plate_half_gap_mm=25.0)                              # 30 -> 20 mm over r = 40 .. 80 mm
+    assert O.check_bounds(g, exit_half_height_mm=10.741)['inner_min_mm'] == pytest.approx(21.482)
+    with pytest.raises(ConfigError, match=r"aperture_inner_mm / aperture_outer_mm: the channel is 20\.000 mm high at "
+                                          r"the spiral-inflector housing exit's outermost radius r = 84\.87 mm"):
+        O.check_bounds(g, exit_half_height_mm=10.741, exit_r_mm=84.87)
+    assert O.check_bounds(g, 10.741, exit_r_mm=50.0)['exit_r_mm'] == 50.0       # 27.5 mm there
+    assert O.check_bounds(dataclasses.replace(g, aperture_taper_center_mm=120.0), 10.741, 84.87)  # starts outside
+    with pytest.raises(ConfigError, match=r"dummy_aperture_inner_mm / dummy_aperture_outer_mm: the channel is 18\.000"):
+        O.check_bounds(GeometryConfig(dummy_aperture_outer_mm=18.0, aperture_taper_center_mm=60.0), 10.0, 84.87)
 
 
 def test_windows_from_toml_and_the_dotted_override(tmp_path):
@@ -124,47 +160,19 @@ def test_posts_json(tmp_path):
     GeometryConfig(**d)
 
 
-def test_from_deck_reference_build():
-    t = O.from_deck(REF_ENV, REF_ARGS)
-    g = GeometryConfig(**t['geometry'])
-    assert (g.si_rotation, g.gap0_on_plate, g.ground, g.dee_inner, g.plot_dees) == ('corner', True, 'star', 'hug', True)
-    assert (g.aperture_inner_mm, g.aperture_outer_mm, g.aperture_taper_center_mm, g.aperture_taper_length_mm) == \
-        (26.0, 32.0, 120.0, 40.0)
-    assert g.junctions == (O.JunctionMove(2, 124.6), O.JunctionMove(3, 208.5))
-    assert g.holes == (O.HoleSpec(0, 'dee', 10.0, 46.12, 0.0, 28.12, 64.12),)
-    assert (g.dee0_clearance_mm, g.dee0_nose_mm, g.lc_mm, g.lc_outer_mm) == (5.0, 3.0, 8.0, 16.0)
-    assert t['paths'] == {'seed': 'seed.pkl', 'housing_outline': 'housing_outline.txt',
-                          'model3d': 'out/cr_model_x_model3d.pkl'}
-    assert t['inflector'] == {'rotation_deg': 4.726034523988023}
-    assert Path(g.exit_plane_spec_file) == Path(r'E:\X\export') / 'exit_plane_spec.json'
-    assert g.emitting_plane_file == 'handoff_sc_all_level.h5'
-    bare = O.from_deck({}, '--lc 10')               # the deck's own defaults: 40 mm from 148 to 247 mm, no rotation
-    assert (bare['geometry']['aperture_inner_mm'], bare['geometry']['aperture_taper_center_mm'],
-            bare['geometry']['lc_mm']) == (40.0, 197.5, 10.0)
-    assert bare['inflector'] == {'rotation_deg': 0.0}
-    fixed = O.from_deck({'CR_SI_ROT': '-3.5'}, [])
-    assert fixed['geometry']['si_rotation'] == 'fixed' and fixed['inflector'] == {'rotation_deg': -3.5}
-    with pytest.raises(ConfigError, match="--solve"):
-        O.from_deck({}, ['--solve'])
-
-
 def test_to_toml_round_trip(tmp_path):
-    geo = O.from_deck(REF_ENV, REF_ARGS)['geometry']
+    geo = GeometryConfig(**REF_GEOMETRY, emitting_plane_file='handoff_sc_all_level.h5')
     back = C.section(_load(tmp_path, O.to_toml(geo)), 'geometry')
-    paths = {'emitting_plane_file': '', 'exit_plane_spec_file': ''}       # resolved against the file: compared apart
-    assert dataclasses.replace(back, **paths) == dataclasses.replace(GeometryConfig(**geo), **paths)
-    assert Path(back.emitting_plane_file).name == 'handoff_sc_all_level.h5'
+    assert Path(back.emitting_plane_file).name == 'handoff_sc_all_level.h5'      # resolved against the run file
+    assert back == dataclasses.replace(geo, emitting_plane_file=back.emitting_plane_file)
     assert O.to_toml(GeometryConfig()) == '[geometry]\n'
 
 
 def test_design_example_geometry_table():
-    cfg = C.load(DESIGN)
-    g = C.section(cfg, 'geometry')
-    assert (g.si_rotation, g.ground, g.dee_inner, g.plate_half_gap_mm) == ('corner', 'star', 'hug', 25.0)
-    assert O.check_bounds(g, exit_half_height_mm=10.741)['height_max_mm'] == 40.0
-    ref = GeometryConfig(**O.from_deck(REF_ENV, REF_ARGS)['geometry'])
-    ignore = {'emitting_plane_file': '', 'exit_plane_spec_file': '', 'plate_half_gap_mm': 0.0}
-    assert dataclasses.replace(g, **ignore) == dataclasses.replace(ref, **ignore)
+    g = C.section(C.load(DESIGN), 'geometry')
+    assert g == GeometryConfig(**REF_GEOMETRY)
+    assert O.check_bounds(g, exit_half_height_mm=10.741, exit_r_mm=84.87) == {
+        'height_max_mm': 40.0, 'inner_min_mm': pytest.approx(21.482), 'exit_r_mm': 84.87}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -177,6 +185,12 @@ def test_builder_refuses_other_machines():
         B.configure(GeometryConfig(), C.MachineConfig(dee_shape='spiral'))
     with pytest.raises(ConfigError):
         B.configure(GeometryConfig(), C.MachineConfig(dee_center_angles_deg=(45.0, 135.0)))
+    B.configure(GeometryConfig(r_max_mm=370.0), C.MachineConfig())                # dees ending at the cavity radius
+    B.configure(GeometryConfig(r_max_mm=300.0), C.MachineConfig())                # ... or inside it
+    with pytest.raises(ConfigError, match="r_max_mm = 371 mm lies beyond"):       # the gap lines end at 370 mm
+        B.configure(GeometryConfig(r_max_mm=371.0), C.MachineConfig())
+    assert B.r_max_mm() == 300.0                                                  # a refused call changes nothing
+    B.configure()
 
 
 def test_channel_profile_by_owner():
@@ -191,6 +205,26 @@ def test_channel_profile_by_owner():
     B.configure()
 
 
+def test_hardware_runs_past_the_channel_over_its_footprint():
+    """Inside a steep taper the channel changes across a piece of hardware, so its blocks take the highest channel over
+    the whole footprint. The reference's gap-0 hole plate (r 57.7 .. 94.1 mm) under the campaign's 22 -> 40 mm taper
+    over r = 85 .. 95 mm used to reach 11 + 5 = 16 mm, from the channel at its hole, below the channel's 19.2 mm at
+    its outer end: the beam could pass over the plate."""
+    B = pytest.importorskip('PyCentralRegion.geometry.builder')
+    plate = [[57.7, -5.0], [94.1, -5.0], [94.1, 5.0], [57.7, 5.0]]
+    B.configure(GeometryConfig(aperture_inner_mm=22.0, aperture_outer_mm=40.0, aperture_taper_center_mm=90.0,
+                               aperture_taper_length_mm=10.0, plate_half_gap_mm=25.0), C.MachineConfig())
+    top = 0.5 * (22.0 + 18.0 * ((94.1 ** 2 + 5.0 ** 2) ** 0.5 - 85.0) / 10.0)    # at the far corner, r = 94.23 mm
+    assert B._channel_top(plate, 'dee0', None) == pytest.approx(top, rel=1e-12) and top > 11.0 + 5.0
+    B.configure(GeometryConfig(aperture_inner_mm=40.0, aperture_outer_mm=22.0, aperture_taper_center_mm=65.0,
+                               aperture_taper_length_mm=10.0, plate_half_gap_mm=25.0), C.MachineConfig())
+    slab = [[60.0, -30.0], [60.0, 30.0], [70.0, 30.0], [70.0, -30.0]]    # nearest the axis mid-edge, at (60, 0)
+    assert B._channel_top(slab, 'dee0', None) == 20.0                   # an inverted taper: highest at r = 60 mm
+    B.configure(GeometryConfig(), C.MachineConfig())
+    assert B._channel_top(plate, 'dee0', None) == 13.0                  # all inside r0 = 100 mm: the inner height
+    B.configure()
+
+
 def test_exit_half_height_and_bounds_from_the_outline(tmp_path):
     B = pytest.importorskip('PyCentralRegion.geometry.builder')
     from PyCentralRegion.geometry import build as GB
@@ -200,10 +234,11 @@ def test_exit_half_height_and_bounds_from_the_outline(tmp_path):
                        "aperture 4\n30 -5 -9\n30 5 -9\n30 5 11\n30 -5 11\n")
     assert B.exit_half_height_mm(B.read_housing_outline(outline)) == 11.0
     cfg = _load(tmp_path, f'[paths]\nhousing_outline = "{outline.as_posix()}"\n[geometry]\nplate_half_gap_mm = 25.0\n')
-    assert GB.bounds(cfg) == {'height_max_mm': 40.0, 'inner_min_mm': 22.0, 'exit_half_height_mm': 11.0,
-                              'plate_half_gap_mm': 25.0, 'dee_wall_mm': 5.0}
-    cfg = _load(tmp_path, f'[paths]\nhousing_outline = "{outline.as_posix()}"\n[geometry]\naperture_inset_mm = [0.0, 1.0]\n')
-    assert GB.bounds(cfg)['exit_half_height_mm'] == 10.0       # the inset takes 1 mm off each end of the 20 mm side
+    assert GB.bounds(cfg) == {'height_max_mm': 40.0, 'inner_min_mm': 22.0, 'exit_r_mm': pytest.approx(925.0 ** 0.5),
+                              'exit_half_height_mm': 11.0, 'plate_half_gap_mm': 25.0, 'dee_wall_mm': 5.0}
+    # aperture_inset_mm is (long side, short side): the 20 mm z side is the LONGER edge, 1 mm off each of its ends
+    cfg = _load(tmp_path, f'[paths]\nhousing_outline = "{outline.as_posix()}"\n[geometry]\naperture_inset_mm = [1.0, 0.0]\n')
+    assert GB.bounds(cfg)['exit_half_height_mm'] == 10.0
 
 
 def test_build_files_reuse_and_refusal(tmp_path, capsys):
@@ -220,12 +255,31 @@ def test_build_files_reuse_and_refusal(tmp_path, capsys):
     assert GB.build(cfg) == {'model3d': str(model)}                    # reused: nothing else is needed or written
     assert 'reused' in capsys.readouterr().out and model.read_bytes() == b'not rebuilt'
     model.unlink()
-    out['msh'].write_text('left over')
-    with pytest.raises(ConfigError, match="never overwritten"):
-        GB.build(cfg)
-    assert out['msh'].read_text() == 'left over'
+    for k in ('msh', 'step'):                                          # the CAD is refused like the mesh
+        out[k].write_text('left over')
+        with pytest.raises(ConfigError, match="never overwritten"):
+            GB.build(cfg)
+        assert out[k].read_text() == 'left over'
+        out[k].unlink()
     with pytest.raises(ConfigError, match="paths.model3d is not set"):
         GB.build(_load(tmp_path, '[geometry]\n'))
+
+
+def test_a_failed_build_leaves_no_temporary_file(tmp_path, monkeypatch):
+    pytest.importorskip('PyCentralRegion.geometry.builder')
+    from PyCentralRegion.geometry import build as GB
+    model = tmp_path / 'cr_model_b_model3d.pkl'
+    cfg = _load(tmp_path, f'[paths]\nmodel3d = "{model.as_posix()}"\n')
+    monkeypatch.setattr(GB, 'inputs', lambda cfg: {'seed': 'seed.pkl', 'housing_outline': 'housing_outline.txt'})
+
+    def layout(cfg, verbose=True, inp=None, dees_png=None):    # a bound that needs the layout fails after the plot
+        Path(dees_png).write_bytes(b'the 2D layout')
+        raise ConfigError("geometry.windows.0: the opening must lie inside the channel at the window")
+
+    monkeypatch.setattr(GB, 'layout', layout)
+    with pytest.raises(ConfigError, match="geometry.windows.0"):
+        GB.build(cfg)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['run.toml']
 
 
 def test_build_inputs_are_checked(tmp_path):
@@ -268,15 +322,22 @@ def reference_layout():
     pytest.importorskip('PyCentralRegion.geometry.builder')
     from PyCentralRegion.geometry import build as GB
     cfg = _reference_cfg()
-    return cfg, GB.layout(cfg, verbose=False)
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):
+        lay = GB.layout(cfg, verbose=True)
+    return cfg, lay, log.getvalue()
 
 
 def test_reference_layout_matches_the_deck(reference_layout):
     """Numbers of the design deck's build log of _wnop3_rotn3_g0ap (2026-10-31)."""
     import numpy as np
-    _, lay = reference_layout
+    _, lay, log = reference_layout
     assert lay['si_rotation_deg'] == pytest.approx(4.726034523988023, abs=1e-12)
     assert lay['exit_half_height_mm'] == pytest.approx(10.741, abs=1e-3)
+    assert lay['bounds']['exit_r_mm'] == pytest.approx(84.870, abs=1e-3)
+    # dee0's vertex already clears the housing by more than dee0_clearance_mm: nothing is cut (the deck's log called
+    # this a cut to a 0.00 mm face and warned of a moved arclength origin)
+    assert "[dee0] tip not cut" in log and "[dee0] ARCLENGTH ORIGIN MOVED" not in log
     ends = {d['label']: (np.round(d['lo'][0], 3).tolist(), np.round(d['hi'][0], 3).tolist()) for d in lay['foot']}
     assert ends == {'dee0': ([13.698, 34.273], [13.698, 34.273]), 'dee1': ([-19.402, 16.031], [-24.175, 8.664]),
                     'dee2': ([-31.397, -23.821], [-22.268, -33.641]), 'dee3': ([31.809, -51.275], [69.62, -36.864])}
@@ -287,7 +348,7 @@ def test_reference_layout_matches_the_deck(reference_layout):
 
 def test_reference_gap0_hole_and_edge_shift(reference_layout):
     from PyCentralRegion.geometry import build as GB
-    cfg, lay = reference_layout
+    cfg, lay, _ = reference_layout
     res = GB.gap0_hole(cfg, r_mm=10.0, rim_mm=8.0, dr_mm=-2.0, lay=lay, verbose=False)
     assert res['hole'] == C.section(cfg, 'geometry').holes[0]             # the design's hole: 2 mm inside the beam
     assert res['s_beam_mm'] == pytest.approx(48.311, abs=1e-3) and res['n_hit'] == res['n_kept'] == 97958

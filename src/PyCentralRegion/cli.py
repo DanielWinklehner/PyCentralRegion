@@ -7,11 +7,12 @@
     pcr score    run.toml [--set ...]       metrics of run.out_dir -> run.out_dir/score.json (analysis)
     pcr evaluate --config run.toml [--set ...] --out DIR
                                             build -> fields -> track -> score into DIR; DIR/result.json
-    pcr optimize        campaign.toml [--max-evals N] [--max-hours H] [--dry-run]
+    pcr optimize        campaign.toml [--max-evals N] [--max-hours H] [--dry-run] [--set k=v ...]
                                             run or continue a multi-objective Bayesian optimisation (mobo.driver)
-    pcr optimize-verify campaign.toml (--ids ID ... | --pareto) [--fidelity NAME]
+    pcr optimize-verify campaign.toml (--ids ID ... | --pareto) [--fidelity NAME] [--set k=v ...]
                                             re-evaluate evaluations at the verify fidelity
-    pcr optimize-status campaign.toml       table of the evaluations, Pareto set, best values
+    pcr optimize-status campaign.toml [--set k=v ...]
+                                            table of the evaluations, Pareto set, best values
 
 A stage reuses an output that exists and never overwrites one: point the path elsewhere to recompute. ``--set
 section.key=value`` overrides the files; the value is read as TOML (``--set track.phases_deg=[-15.0]``), else as a
@@ -55,7 +56,8 @@ def score_stage(cfg):
     if path.exists():
         print(f"[score] {path} exists: reused", flush=True)
         return json.loads(path.read_text())
-    scores = clean(score_run(load_track_run(out_dir), config.section(cfg, 'score')))   # plain JSON: NaN -> null
+    sc = config.section(cfg, 'score')
+    scores = clean(score_run(load_track_run(out_dir, beam=sc.beam), sc))      # plain JSON: NaN -> null
     save_score(scores, path)
     return scores
 
@@ -82,9 +84,11 @@ def _cmd_evaluate(args):
     try:
         cfg = _load(args.config, list(args.set) + [f'run.out_dir={json.dumps(str(out))}'])
         scores = evaluate(cfg)
-    except Exception as exc:                       # the evaluation failed: say why in result.json, exit 1
+    except (Exception, SystemExit) as exc:         # the evaluation failed (a library's sys.exit too): say why, exit 1
         traceback.print_exc()
-        write_result(out, 'failed', error=f"{type(exc).__name__}: {exc}", wall_s=time.time() - t0, config=cfg)
+        why = (f"{type(exc).__name__}: {exc}" if isinstance(exc, Exception)
+               else f"a library called sys.exit({exc.code}): its message is in stderr.log")
+        write_result(out, 'failed', error=why, wall_s=time.time() - t0, config=cfg)
         return 1
     write_result(out, 'ok', scores=scores, wall_s=time.time() - t0, config=cfg)
     return 0

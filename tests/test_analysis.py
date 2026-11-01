@@ -1,8 +1,9 @@
 """analysis: known answers of the scoring library on synthetic bunches (no machine data): the core-variance factor,
 the bunch shape of a Gaussian of known aspect ratio and tilt, per-particle orbit centres of circles with known
 centres, probe crossings at a known radius, the turn structure, energy windows, the survivor and hand-off-index rules,
-the operating-point rule, a whole synthetic run through score_run, and a synthetic space-charge twin whose
-guiding-centre core rotates by a known angle per turn."""
+the release-phase budget bins, the operating-point rule, a whole synthetic run through score_run, the [machine]
+fallbacks and the tracked species, a synthetic space-charge twin whose guiding-centre core rotates by a known angle
+per turn, and the summary figure of a score made with other settings."""
 import json
 import pickle
 
@@ -13,7 +14,7 @@ from PyCentralRegion.analysis import metrics as M
 from PyCentralRegion.analysis import objectives as O
 from PyCentralRegion.analysis import runs as R
 from PyCentralRegion.analysis import twins as TW
-from PyCentralRegion.config import get_dotted
+from PyCentralRegion.config import MachineConfig, get_dotted
 
 pytest.importorskip('scipy')
 
@@ -199,6 +200,33 @@ def test_handoff_track_ids_rule():
     assert note is None and np.array_equal(hid, ids)
     hid, note = R.handoff_track_ids(ids, np.zeros(len(ids), int), n_b, n_h, t_rel, seed=2)   # no timed release
     assert np.array_equal(hid, idx[ids]) and 'not checked' in note
+    # the recorded mapping is preferred but still checked: a wrong one is set aside, with a note
+    hid, note = R.handoff_track_ids(ids, birth, n_b, n_h, t_rel, seed=2, recorded=ids)
+    assert np.array_equal(hid, idx[ids]) and 'recorded hand-off ids do not match' in note and 'seed 2' in note
+    hid, note = R.handoff_track_ids(ids, birth, n_b, n_h, t_rel, seed=3, recorded=ids)      # nothing else fits
+    assert hid is None and 'recorded' in note and 'skipped' in note
+    hid, note = R.handoff_track_ids(ids, birth, n_b, n_h, t_rel, seed=2, recorded=np.r_[idx[ids][:-1], -1])
+    assert np.array_equal(hid, idx[ids]) and 'do not index' in note
+
+
+def test_release_budget_bins():
+    """release_bins, release_phase_budget.py's table: phases beyond the range are left out (not put in the end
+    bins), and a bin reports its survivors' energy and lag only with min_bin_survivors of them."""
+    rng = np.random.default_rng(8)
+    ph = np.r_[np.repeat([-45.0, -15.0, 15.0, 45.0], 500) + rng.uniform(-14.9, 14.9, 2000), np.full(50, 100.0),
+               np.full(50, -150.0)]
+    surv = np.abs(ph) < 30.0
+    surv[np.flatnonzero((ph >= 30.0) & (ph < 60.0))[:5]] = True               # 5 survivors: too few to report
+    E, lag = 3.0 - 1e-5 * ph ** 2, 0.5 * ph
+    out = M.release_budget(ph, surv, E, lag, np.where(surv, np.nan, 0.7),
+                           O.ScoreConfig(phase_bin_deg=30.0, phase_range_deg=60.0, min_bin_count=40))
+    rb = out['release_bins']
+    assert list(rb) == ['-45', '-15', '15', '45'] and all(rb[k]['n'] == 500 for k in rb)
+    assert rb['-45']['share'] == pytest.approx(500 / 2100) and rb['-45']['lost'] == [0.0, 1.0, 0.0, 0.0]
+    assert 'E_mean' not in rb['-45'] and 'E_mean' not in rb['45'] and rb['45']['lost'][1] == pytest.approx(0.99)
+    m = (ph >= 0.0) & (ph < 30.0)
+    assert rb['15']['E_mean'] == pytest.approx(E[m].mean()) and rb['15']['lag_std'] == pytest.approx(lag[m].std())
+    assert out['E_peak_phase'] == pytest.approx(0.0, abs=0.5)
 
 
 def test_pick_operating_point():
@@ -293,19 +321,24 @@ def test_score_without_handoff_and_saving(tmp_path):
     assert rows[0] == 'tag,I_final,turns.3.ratio,best_slit' and rows[2] == 'empty,,,'
 
 
+def _write_run(run, pkl, js):
+    """The run's tracks and json as the tracker (and the original deck) write them."""
+    tracks = {key: getattr(run, key) for key in ('ids', 'steps', 'xyz', 'stop_step', 'birth_step', 'n_steps',
+                                                 'steps_per_turn', 'E_mev')}
+    final = {'phase': 0.0, 'n': run.n_tracks, 'transmission': run.info['final']['transmission'], 'tracks': tracks}
+    with open(pkl, 'wb') as fh:
+        pickle.dump({'final': final, 'ref': {0.0: {'traj': run.ref_xyz}}}, fh)
+    js.write_text(json.dumps(run.info))
+
+
 def test_track_folder_round_trip(tmp_path):
     """A run folder in the tracker's layout (track.json, track_data.pkl, probe files) loads back into the same run:
     the folder names it, the probe files of this run alone are found, and it scores like the run it was written from."""
     run = _spiral_run(n=300, halo=0.1)
     run.handoff_ids = None
-    tracks = {key: getattr(run, key) for key in ('ids', 'steps', 'xyz', 'stop_step', 'birth_step', 'n_steps',
-                                                 'steps_per_turn', 'E_mev')}
-    final = {'phase': 0.0, 'n': run.n_tracks, 'transmission': run.info['final']['transmission'], 'tracks': tracks}
     d = tmp_path / 'design_a'
     d.mkdir()
-    with open(d / R.TRACK_PKL, 'wb') as fh:
-        pickle.dump({'final': final, 'ref': {0.0: {'traj': run.ref_xyz}}}, fh)
-    (d / R.TRACK_JSON).write_text(json.dumps(run.info))
+    _write_run(run, d / R.TRACK_PKL, d / R.TRACK_JSON)
     for name in ('probe_45deg.npz', 'probe_-90deg.npz', 'probe_45deg_old.npz'):
         (d / name).write_bytes(b'')
     back = R.load_run(d)
@@ -317,10 +350,47 @@ def test_track_folder_round_trip(tmp_path):
     assert same(M.score_run(back, _cfg())) == same(M.score_run(run, _cfg()))
 
 
+def test_machine_fallbacks(tmp_path):
+    """What a run's json does not record (harmonic, loss limits) comes from the [machine] table it was tracked with:
+    a track folder's config.json, the machine argument of a deck run; else the MachineConfig defaults."""
+    run = _spiral_run(n=300)
+    run.info = {key: v for key, v in run.info.items() if key not in ('harmonic', 'rf_mhz', 'limits')}
+    k = M.run_constants(run, _cfg())
+    mc = MachineConfig()
+    assert (k['harmonic'], k['r_max'], k['z_max']) == (mc.harmonic, mc.r_max_m, mc.z_max_m)
+    n0 = int(M.run_state(run, _cfg()).surv.sum())
+    run.machine = {'harmonic': 2, 'r_max_m': 0.41}
+    k = M.run_constants(run, _cfg())
+    assert k['harmonic'] == 2 and k['f_rf'] == pytest.approx(16e6) and k['f_rev'] == pytest.approx(8e6)
+    assert M.run_state(run, _cfg()).surv.sum() == n0 + 1          # the particle at 0.40 m is inside this limit
+    d = tmp_path / 'design_b'
+    d.mkdir()
+    _write_run(run, d / R.TRACK_PKL, d / R.TRACK_JSON)
+    (d / R.TRACK_CONFIG).write_text(json.dumps({'machine': {'r_max_m': 0.41}}))
+    assert M.run_constants(R.load_run(d), _cfg())['r_max'] == 0.41
+    _write_run(run, tmp_path / R.LEGACY_PKL.format('_v1'), tmp_path / R.LEGACY_JSON.format('_v1'))
+    deck = R.load_run(tmp_path, tag='_v1', machine=MachineConfig(r_max_m=0.41, harmonic=2))
+    assert deck.machine['r_max_m'] == 0.41 and M.run_constants(deck, _cfg())['harmonic'] == 2
+
+
+def test_tracked_species():
+    """The tracker's species: the preset of the run's [machine] species, else the hand-off file's mass and charge
+    state, else the preset of the default species; an unknown name gives NaN (PyPATools would exit)."""
+    run = _spiral_run(n=300)
+    run.handoff_meta = {'species_mass_mev': 938.272, 'species_charge_state': 1.0}
+    assert M.tracked_species(run) == (938.272, 1.0)
+    PS = pytest.importorskip('PyPATools.species')
+    run.machine = {'species': 'proton'}
+    assert M.tracked_species(run) == (pytest.approx(PS.PRESETS['proton']['mass_mev']), 1.0)
+    run.machine, run.handoff_meta = {}, {}
+    assert M.tracked_species(run)[0] == pytest.approx(PS.PRESETS[MachineConfig().species]['mass_mev'])
+    run.machine = {'species': 'no_such_ion'}
+    assert np.isnan(M.tracked_species(run)[0])
+
+
 def test_virtual_probe_round_trip(tmp_path):
     """A probe file built from the tracks (tracker layout) reads back into the same turn structure as the score's
     virtual probe, and matches itself crossing by crossing."""
-    pytest.importorskip('PyPATools')                    # virtual_probe takes the kinetic energy from simulate3d
     run = _spiral_run(n=300, halo=0.1)
     run.handoff_meta = {'species_mass_mev': 1876.124}
     sc = M.score_run(run, _cfg())
@@ -357,9 +427,31 @@ def test_vortex_twin_recovers_a_known_rotation():
         assert r['off']['rot'] == pytest.approx(0.0, abs=1.0)
     assert tw['rot_sc_total'] == pytest.approx(-10.0 * len(maps), abs=1.0)
     assert np.isfinite(tw['rot_sc_total_err'])
+    off.handoff_ids = off.handoff_ids[::-1].copy()          # same track ids, another bunch sample: not twins
+    with pytest.raises(ValueError, match='hand-off'):
+        TW.vortex_twin(on, off, cfg=_cfg(twin_boot=0))
 
 
 def test_kernel_weights_sum_to_one():
     w = TW.kernel_weights(0.7, 1.7, range(-1, 4))
     assert sum(w.values()) == pytest.approx(1.0)
     assert max(w, key=w.get) == 1
+
+
+def test_summary_figure_follows_the_score_settings(tmp_path):
+    """The figure takes the keys that carry a [score] setting from the score: halo_sigma 2.5 and other acceptance
+    levels draw halo2.5 and their own acc<L> windows."""
+    mpl = pytest.importorskip('matplotlib')
+    mpl.use('Agg')
+    import matplotlib.pyplot as plt
+    from PyCentralRegion.analysis.plots import summary_figure
+    sc = R.clean(M.score_run(_spiral_run(n=300, halo=0.1), _cfg(halo_sigma=2.5, acceptance_levels=(0.5, 0.95),
+                                                                 min_bin_count=10)))
+    fig = summary_figure(sc, tmp_path / 'summary.png')
+    try:
+        assert 'halo2.5' in fig.axes[1].get_title() and 'nan' not in fig.axes[1].get_title()
+        drawn = fig.axes[0].get_legend_handles_labels()[1]
+        assert 'acc50' in drawn and drawn == [key for key in ('acc95', 'acc50') if sc[f'{key}_lo'] is not None]
+        assert (tmp_path / 'summary.png').stat().st_size > 0
+    finally:
+        plt.close(fig)

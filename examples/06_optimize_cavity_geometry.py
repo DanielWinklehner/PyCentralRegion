@@ -9,11 +9,11 @@ least-squares residual of energy, orbit centring and turn-separation smoothness,
 pulls each gap's segment node to a target radius (pinch_target_r_m). Examples 07-10 and 12 build on
 this system (build_system); 07 and 12 re-track its result pickle.
 Inputs: <resources>/uCyclo_v3_midplane_field.comsol (COMSOL midplane export of a muon cyclotron).
-Runtime: about a minute. The isochronous-frequency scan takes about 45 s (--rf-frequency 42.2234e6
-skips it); a single-particle evaluation runs on the compiled path in tens of ms, so one start of the
-default budget (600 evaluations, 27 parameters) takes about 30 s, and the starts run in parallel (one per
-worker). A --maxfun below the 28 points DFO-LS samples for its first model leaves every start where stage A
-put it (straight gaps).
+Runtime: about 2 minutes with the defaults (12 workers on 28 cores). The isochronous-frequency scan takes
+about 45 s (--rf-frequency 42.2234e6 skips it); a single-particle evaluation runs on the compiled path in
+tens of ms, so one start of the default budget (600 evaluations, 27 parameters) takes 30-45 s, and the starts
+run in parallel (one per worker): --workers 4 --rf-frequency 42.2234e6 takes about 35 s. A --maxfun below the
+28 points DFO-LS samples for its first model leaves every start where stage A put it (straight gaps).
 Outputs: <out>/optimized_cavity_geometry.pkl (read by 07 and 12), cavity_geometry_optimization.png,
 cavity_geometry_summary.txt, cavity_geometry_optimization.csv[.worker-<pid>.csv] (every evaluation).
 
@@ -71,7 +71,7 @@ SEGMENT_RADII_INITIAL = [0.1]
 # midpoint (need not point at the origin), decoupling the crossing azimuth (RF
 # phase) from the kick direction. Authority test: tilts alone floor at ~7 mm
 # orbit-center offset; tilts+rotations reach ~1 mm at full acceleration.
-# Params: 8 gaps x (angle + radius + rotation) + 2 RF = 26.
+# Params: 8 gaps x (angle + radius + rotation) + the shared opening-angle delta + 2 RF = 27.
 ROTATABLE_SEGMENTS = True
 ROTATION_MAX = 20.0                    # per-segment rotation bounds [deg]
 
@@ -147,7 +147,7 @@ def build_worker_optimizer(field_path, rf_frequency):
 
 
 def add_rf_option(ap):
-    """``--rf-frequency``: skip the isochronous-frequency scan of build_system (about 2 minutes)."""
+    """``--rf-frequency``: skip the isochronous-frequency scan of build_system (about 45 s)."""
     ap.add_argument('--rf-frequency', type=float, default=None,
                     help='RF base frequency [Hz] (default: mean SEO frequency over '
                          f'{ISO_RADII_MM} mm; 42.2234e6 for the default field map)')

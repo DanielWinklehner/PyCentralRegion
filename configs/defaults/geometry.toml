@@ -3,6 +3,14 @@
 # spiral inflector's rotation [inflector] rotation_deg, the inputs [paths] seed / housing_outline / handoff and the
 # output [paths] model3d (<prefix>.msh / .step / _dees.png / _build.json are written beside it).
 #
+# A build needs, besides [machine]: paths.seed (the gap-geometry optimization's result pickle: the gap lines),
+# paths.housing_outline (the spiral-inflector export's housing_outline.txt: the housing's plan-view outline and its
+# exit opening, in the machine frame; format in geometry.builder.read_housing_outline), the hand-off file whose
+# particle cloud is the emitting plane (emitting_plane_file below, else the export's own beside the outline, else
+# paths.handoff) and paths.model3d; si_rotation = "corner" and gap0_on_plate also read the export's
+# exit_plane_spec.json. Then `pcr build run.toml` (or `python -m PyCentralRegion.geometry.build build run.toml`);
+# `... geometry.build bounds run.toml` prints the channel bounds below without building.
+#
 # THE BEAM CHANNEL. Every dee is hollowed by a channel of full height aperture_inner_mm inside the radial taper and
 # aperture_outer_mm beyond it, linear in between, from r0 = aperture_taper_center_mm - aperture_taper_length_mm / 2 to
 # r1 = aperture_taper_center_mm + aperture_taper_length_mm / 2. The dummy dees and the star ground share the taper and
@@ -15,11 +23,16 @@
 #   every channel height (dees, and dummy dees when set) <= 2 x (plate_half_gap_mm - dee_wall_mm)
 #       the dee plates, dee_wall_mm thick, must fit inside the vertical gap of the plates / poles they sit between
 #       (40 mm for a 25 mm half gap and 5 mm walls; 30 mm for these defaults);
-#   aperture_inner_mm (and dummy_aperture_inner_mm when set) >= 2 x the spiral-inflector housing exit's half height
-#       the channel must clear the exit the beam leaves the housing by; the half height is the largest |z| of the exit
+#   aperture_inner_mm (and dummy_aperture_inner_mm when set) >= 2 x the spiral-inflector housing exit's half height,
+#   and so is the channel height (dees and dummy dees) at the exit's outermost radius
+#       the channel must clear the exit the beam leaves the housing by over the opening's whole radial span (the second
+#       binds only for an inverted taper that starts inside the exit); the half height is the largest |z| of the exit
 #       aperture in the housing outline (paths.housing_outline), after aperture_inset_mm - no field of its own;
 #   aperture_taper_length_mm > 0 and 0 < r0 < r1; every height < 2 x half_height_mm;
-#   windows: 0 < half_height_mm and |z_center_mm| + half_height_mm <= the owner's channel half height at the window.
+#   windows: 0 < half_height_mm and |z_center_mm| + half_height_mm <= the owner's channel half height at the window's
+#   middle. Posts, window blocks and hole plates run post_overhang_mm past the channel's highest point over them.
+# Refused as well, instead of being ignored: r_max_mm beyond [machine] r_max_cavity_m, gap0_face_mm without the star
+# ground, dee0_trim_mm together with dee0_clearance_mm.
 #
 # HARDWARE on a gap edge is placed by arclength along that edge from its inner end [mm]; gap 2j is dee j's
 # low-azimuth edge, gap 2j+1 its high-azimuth edge, side "dummy" the other side of the same gap. Arrays of tables:
@@ -66,7 +79,7 @@ dummy_aperture_inner_mm = 0.0      # dummy dees' (and star ground's) full height
 dummy_aperture_outer_mm = 0.0
 plate_half_gap_mm = 20.0     # half the vertical gap of the plates / poles the dees sit between
 # dees
-r_max_mm = 0.0               # dees and model end here; 0 = [machine] r_max_cavity_m
+r_max_mm = 0.0               # dees and model end here (<= [machine] r_max_cavity_m); 0 = r_max_cavity_m
 housing_clearance_mm = 10.0  # the dee metal of gaps 1 .. n stays this far off the housing
 dee_wall_mm = 5.0            # thickness of a dee's walls: its solid inner end wall and its plates (the bound above)
 dee_inner = "arc"            # dees 1 .. n-1 close on an "arc" about the axis or "hug" the housing
@@ -77,7 +90,7 @@ dee_tip_width_mm = 4.0       # a pinched dee's tip is cut back to a face this wi
 dummy_tip_width_mm = 4.0     # a dummy tip crossing outside the housing is cut back to this; 0 = vertex
 dummy_overlap_mm = 6.0       # dummy dees reach this far into the housing
 dee0_clearance_mm = 0.0      # cut dee0's tip back until it clears the housing by this; 0 = off
-dee0_trim_mm = 0.0           # or cut it back this far along both edges; 0 = off
+dee0_trim_mm = 0.0           # or (not both) cut it back this far along both edges; 0 = off
 dee0_nose_mm = 0.0           # round dee0's vertex with this radius in plan view; 0 = vertex
 # ground
 ground = "dummies"           # "dummies" (wedges fused onto the housing) | "star" (one 2D layout)
@@ -92,7 +105,7 @@ holes = []
 boxes = []
 post_size_mm = 10.0          # post width and depth; window / hole plate depth
 post_offset_mm = 5.0         # post centre from its edge (half the size: face flush)
-post_overhang_mm = 5.0       # posts and plates reach this far past the channel
+post_overhang_mm = 5.0       # posts and plates reach this far past the channel (its highest over their footprint)
 post_shape = "square"        # "square" | "cylinder" (a post_facets-gon: no 90 deg edges in the gap)
 post_facets = 16
 post_wall_join_mm = 2.0      # carry a post end this close to a hug dee's end wall into it; 0 = never
@@ -107,6 +120,5 @@ mesh_algorithm = 6           # gmsh Mesh.Algorithm (6 = Frontal-Delaunay)
 mesh_size_min_mm = 0.0       # gmsh Mesh.MeshSizeMin; 0 = lc_mm / 2
 mesh_flip_min_deg = 5.0      # repair triangles with an angle below this by edge flips; 0 = off
 occ_fuzzy_mm = 0.05          # OCC fuzzy boolean tolerance; 0 = exact booleans
-# model
-bem_only = true              # the BEM field is the whole machine (no RF-cavity map to blend onto)
+# output
 plot_dees = true             # write <prefix>_dees.png (the 2D layout) next to the model

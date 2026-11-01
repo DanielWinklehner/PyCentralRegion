@@ -6,11 +6,14 @@
 name = "toy"
 
 [toy]
-phases_deg = [-20.0]      # cheap: moves the design along the Pareto front
+phases_deg = [-20.0]      # cheap: moves the design along the Pareto front (I_final = 1 at -40 deg, 0 at 0 deg)
 volt_scale = 1.0          # cheap: best at 1.02
 trim_t = 1e-3             # cheap, log-scaled: best at 10^-3.5
 gap_width_mm = 3.0        # geometry: best at 4.4 mm
 n_posts = 2               # geometry, integer: best at 2
-fail_above_mm = 1e9       # the toy "build" fails for gap_width_mm above this
+fail_above_mm = 1e9       # the toy "build" fails for gap_width_mm above this (a failed evaluation)
+short_above_deg = 1e9     # an RF phase above this loses so much beam that the scores have no valley_all
+skip_above_deg = 1e9      # ... above this the scorer skips the run (too few survivors: no metrics at all)
 noise = 0.0               # amplitude of a deterministic pseudo-random error on every score (a low fidelity)
 sleep_s = 0.0             # seconds every evaluation takes
+child_sleep_s = 0.0       # > 0: every evaluation starts a child process that sleeps this long (process-tree tests)

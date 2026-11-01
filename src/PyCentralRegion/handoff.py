@@ -115,11 +115,15 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
     meta = d['meta']
     mode = str(meta.get('mode', 'plane_crossing'))
     if species is None:
-        species = IonSpecies(str(meta.get('pypatools_species_name', 'H2_1+')))
-    m_ev = meta.get('species_mass_mev')
-    m_ev = float(m_ev) * 1e6 if m_ev is not None else getattr(species, 'mass_mev', None)
-    if m_ev is None:
+        if meta.get('pypatools_species_name') is None:
+            raise ValueError(f"{d.get('path')}: the file names no species (pypatools_species_name): pass species=")
+        species = IonSpecies(str(meta['pypatools_species_name']))
+    m_mev = meta.get('species_mass_mev')
+    if m_mev is None:
+        m_mev = getattr(species, 'mass_mev', None)          # PyPATools gives MeV / c^2 too
+    if m_mev is None:
         raise ValueError("species mass unknown: the file has no species_mass_mev and the species no mass_mev")
+    m_ev = 1e6 * float(m_mev)
 
     r = np.array(d['r'], dtype=float)
     p = np.array(d['p_ev_c'], dtype=float)

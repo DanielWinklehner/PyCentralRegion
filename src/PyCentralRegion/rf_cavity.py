@@ -145,7 +145,7 @@ class RFCavity:
 
         # Optional ANGULAR gap: a constant-angle wedge with a minimum slot width,
         #     width(r) = max(gap_width_min, r * gap_angle)
-        # which is how the HCHC-60 CAD gap is actually drawn (Daniel, 2026-09-20): 2.5 deg
+        # which is how a real cyclotron's CAD gap is drawn (2026-09-20), e.g. 2.5 deg
         # beyond r = 150 mm, flooring at ~6.5 mm inward. The two anchors agree to 0.05 mm,
         # because 2.5 deg * 150 mm = 6.545 mm - the floor bites at r = 149 mm.
         #
@@ -542,8 +542,8 @@ class RFCavity:
             # minus sign. Without it the crossing was found on the chord AFTER
             # the true crossing (s_part = -s_true), i.e. one step late, and a
             # chord ending exactly on the gap line produced a missed or a
-            # doubled kick (seen as 7 or 9 kicks per turn in the HCHC-60
-            # accelerated orbit, 2026-09-03).
+            # doubled kick (seen as 7 or 9 kicks per turn instead of 8 in a
+            # four-dee accelerated orbit, 2026-09-03).
             s_part[valid_mask] = -det_s_part[valid_mask] / det[valid_mask]
 
             # Check bounds

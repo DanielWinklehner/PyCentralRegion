@@ -4,9 +4,13 @@ The optimiser never sees physical units. Every design variable is a parameter ``
 linearly (or logarithmically) onto [low, high]. Two reasons: the GP's length scales and TPE's Parzen windows then
 mean the same on every axis, and a proposal can hold some coordinates fixed (the geometry of an electrode model
 that is already built) by passing their unit values unchanged, because for a [0, 1] float parameter optuna's
-normalised value is the unit value itself. Integer variables map [0, 1] onto [low - 0.5, high + 0.5] and round, so
-every integer gets the same share of the cube; the unit value is then snapped to the unit value of that integer
-(``Variable.snap``), so that two evaluations of the same design carry the same coordinates.
+normalised value is the unit value itself. Integer variables (integer low and high) map [0, 1] onto
+[low - 0.5, high + 0.5] and round, so every integer gets the same share of the cube; the unit value is then snapped
+to the unit value of that integer (``Variable.snap``), so that two evaluations of the same design carry the same
+coordinates.
+
+The stored unit coordinates are what the sampler sees of every evaluation, so the variables are fixed for a campaign:
+the driver refuses to continue a store that they no longer map onto its evaluated values (``Campaign.check_store``).
 
 A variable is one of two kinds. 'geometry' variables change the electrodes, so a new value needs a new build and
 3D BEM (about 10 min); 'cheap' variables (RF phase, dee voltage, a magnetic trim, a slit) reuse the fields and only
@@ -124,10 +128,11 @@ class MoboConfig:
     n_startup: int = 10              # evaluations before the sampler's model takes over from random sampling
     max_evals: int = 20              # budget: search-fidelity evaluations of the whole campaign (interrupted ones
     #                                  do not count)
-    max_hours: float = 0.0           # budget of one `pcr optimize` run: then the running evaluation is stopped; 0 = none
+    max_hours: float = 0.0           # budget of one `pcr optimize` run: then the running evaluation stops; 0 = none
     cheap_per_geometry: int = 3      # cheap evaluations, geometry held fixed, after every new geometry
     warm_start: tuple = ()           # points evaluated first: tables {name = physical value}; {} = the base design
     failed_as_infeasible: bool = False   # give failed evaluations to the sampler as infeasible trials
+    max_failed_in_a_row: int = 5     # a `pcr optimize` run stops after this many failed evaluations in a row; 0 = never
 
     def __post_init__(self):
         self.fidelities = {k: v if isinstance(v, Fidelity) else from_dict(Fidelity, v, f"[mobo.fidelities.{k}]")
@@ -165,6 +170,9 @@ class MoboConfig:
                                   f"{', '.join(RESERVED_TARGETS)} (the driver sets those)")
             if not v.low < v.high:
                 raise ConfigError(f"{where}: needs low < high (got {v.low}, {v.high})")
+            if v.integer and not (float(v.low).is_integer() and float(v.high).is_integer()):
+                raise ConfigError(f"{where}: an integer variable needs integer low and high (got {v.low}, {v.high}): "
+                                  f"else the integers at the ends get other shares of the unit cube than the rest")
             if v.log and (v.low - 0.5 * v.integer) <= 0:
                 raise ConfigError(f"{where}: a log variable needs low > 0 (integer: low >= 1)")
             if v.kind == 'cheap' and v.target.split('.')[0] in GEOMETRY_SECTIONS:
@@ -182,6 +190,9 @@ class MoboConfig:
             raise ConfigError(f"[mobo] constraints repeat: {labels}")
         if self.sampler not in SAMPLERS:
             raise ConfigError(f"[mobo] sampler {self.sampler!r} is not one of {SAMPLERS}")
+        if self.max_failed_in_a_row < 0:
+            raise ConfigError(f"[mobo] max_failed_in_a_row must be >= 0 (0 = never stop), got "
+                              f"{self.max_failed_in_a_row}")
         self.fidelity(self.search_fidelity)
         for i, point in enumerate(self.warm_start):
             unknown = set(point) - set(names)

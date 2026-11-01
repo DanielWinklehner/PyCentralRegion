@@ -5,10 +5,11 @@
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml             (runs until max_evals; rerun continues)
 #   pcr optimize-status configs/examples/hchc1p5/mobo_pilot.toml
 #   pcr optimize-verify configs/examples/hchc1p5/mobo_pilot.toml --pareto    (every particle, SC 128^3 every step)
-# The driver runs in its own small environment (numpy, scipy, optuna, torch CPU); the evaluations run in the physics
-# environment below, which inherits the driver's PYTHONPATH (point it at the source tree to run a checkout). Every
-# evaluation uses the GPU. Stopping the driver (Ctrl+C, closing its window, the end of --max-hours) stops the running
-# evaluation with everything it started; running it again continues the campaign.
+# The driver runs in its own small environment (numpy, scipy, optuna >= 5, torch CPU); the evaluations run in the
+# physics environment below, with the source folder of the driver's own PyCentralRegion first on their PYTHONPATH
+# (they run the code the driver runs). Every evaluation uses the GPU. Stopping the driver (Ctrl+C, closing its window,
+# the end of --max-hours) stops the running evaluation with everything it started; running it again continues the
+# campaign.
 
 [mobo]
 campaign_dir = "E:/HCHC1.5/Results/CR/mobo/pilot_wnop3_rotn3_g0ap"
@@ -51,7 +52,7 @@ metric = "I_final"             # T x injected current [mA]
 direction = "maximize"
 
 [[mobo.objectives]]
-metric = "valley_all"          # share of probe crossings between the turns, mean of the 8 probes
+metric = "valley_all"          # share of probe crossings between the turns, the 8 probes' crossings pooled
 direction = "minimize"
 
 [[mobo.objectives]]
@@ -63,11 +64,13 @@ metric = "E_med"               # median final energy [MeV]
 op = ">="
 value = 2.9
 
-[mobo.fidelities.search]       # what the sampler learns from: 10k particles, SC 64^3 every 5 steps, 7 turns
-overrides = ["track.turns=7", "track.n_final=10000", "track.sc_final_cells=64", "track.sc_final_every=5",
-             "track.n_tracks=10000"]
+# The fidelities differ in resolution only. Both track to the base's turn cap (track.turns = 8; a run ends earlier,
+# when the reference reaches machine.target_energy_mev = 3 MeV: within 7 turns for the base design), so a design too
+# slow to get there is cut at the same turn in both, and the search-to-verify shift of a score is its resolution error.
+[mobo.fidelities.search]       # what the sampler learns from: 10k particles, SC 64^3 every 5 steps
+overrides = ["track.n_final=10000", "track.sc_final_cells=64", "track.sc_final_every=5", "track.n_tracks=10000"]
 timeout_min = 30.0
 
-[mobo.fidelities.verify]       # pcr optimize-verify: every particle, SC 128^3 every step, 8 turns
-overrides = ["track.n_final=0", "track.sc_final_cells=128", "track.sc_final_every=1", "track.turns=8"]
+[mobo.fidelities.verify]       # pcr optimize-verify: every particle, SC 128^3 every step
+overrides = ["track.n_final=0", "track.sc_final_cells=128", "track.sc_final_every=1"]
 timeout_min = 240.0

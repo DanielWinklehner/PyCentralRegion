@@ -1,11 +1,12 @@
 # The full MOBO campaign on the worked example, after the pilot: the beam channel's aperture and the spiral
-# inflector's rotation (geometry: every new value needs an electrode build and a 3D BEM, ~15 min) together with the
-# RF phase, the dee-voltage scale, a first-harmonic magnetic trim and a radial slit (cheap: they re-track on that
-# geometry's fields, 1-2 min each). After every new geometry the driver runs cheap_per_geometry cheap evaluations on
-# it; every geometry gets its own model and fields under <campaign_dir>/geometries/<key>/.
+# inflector's rotation (geometry: every new value needs an electrode build and its 3D BEM fields, so that evaluation
+# takes about 10 min: build ~20 s, fields ~8 min, then the tracking) together with the RF phase, the dee-voltage
+# scale, a first-harmonic magnetic trim and a radial slit (cheap: they re-track on that geometry's fields, 1.5-2 min
+# each). After every new geometry the driver runs cheap_per_geometry cheap evaluations on it; every geometry gets its
+# own model and fields under <campaign_dir>/geometries/<key>/.
 #   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml --dry-run   (prints the first evaluation's command)
-#   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml             (runs until max_evals; a rerun continues;
-#                                                                                --max-hours H for a time slot)
+#   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml             (runs until max_evals; a rerun
+#                                                                                continues; --max-hours H for a slot)
 #   pcr optimize-status configs/examples/hchc1p5/mobo_campaign.toml
 #   pcr optimize-verify configs/examples/hchc1p5/mobo_campaign.toml --pareto    (every particle, SC 128^3 every step)
 # Every evaluation uses the GPU: run the campaign when nothing else does. Stopping the driver (Ctrl+C, closing its
@@ -29,10 +30,10 @@
 campaign_dir = "E:/HCHC1.5/Results/CR/mobo/campaign_wnop3_rotn3_g0ap"
 base_config_file = "design_wnop3_rotn3_g0ap.toml"
 physics_python = "C:/Users/Daniel/anaconda3/envs/accel-dev-env/python.exe"
-sampler = "gp"                 # constrained 3-objective GP (logCEHVI) over 13 coordinates; "tpe" works on the same store
+sampler = "gp"                 # constrained 3-objective GP (logCEHVI) over 13 coordinates; "tpe" uses the same store
 seed = 0
 n_startup = 16                 # the warm start and 15 random designs (4 geometries with their cheap followers)
-max_evals = 120                # ~30 geometries x (1 + cheap_per_geometry): about 11 h of evaluations
+max_evals = 120                # ~30 geometries x (1 + cheap_per_geometry): 30 x 10 min + 90 x 2 min, about 8 h
 cheap_per_geometry = 3
 failed_as_infeasible = false   # a failed build, BEM or tracking blocks only its own design (a design that loses its
                                # beam is learnt either way: the scorer skips it, and it enters with the worst values)
@@ -51,8 +52,9 @@ warm_start = [{ap_inner = 26.0, ap_outer = 32.0, ap_center = 120.0, ap_length = 
 # them): every height <= 2 x (plate_half_gap_mm - dee_wall_mm) = 2 x (25 - 5) = 40 mm (the base's +-25 mm pole-nose
 # faces and 5 mm dee plates: the +-20 mm upper limit of the opening agreed with IBA); the inner height >= 2 x the
 # housing exit's half height = 2 x 10.74 mm = 21.5 mm (the exit circle's largest |z| in the sp1Lo_c1 housing
-# outline). The taper runs linearly over centre -+ length / 2; centre >= length / 2 + 10 mm at every corner of the
-# box keeps the taper's inner end at r >= 10 mm (it must be > 0).
+# outline); the heights at the exit's outermost radius (84.87 mm) are held to the same bound, which never binds in
+# this box (every height >= 22 mm). The taper runs linearly over centre -+ length / 2; centre >= length / 2 + 10 mm at
+# every corner of the box keeps the taper's inner end at r >= 10 mm (it must be > 0).
 [[mobo.variables]]
 name = "ap_inner"
 target = "geometry.aperture_inner_mm"    # inside the taper [mm]
@@ -118,6 +120,10 @@ low = -180.0
 high = 180.0
 
 # --- cheap: a radial slit inside dee 3 (an obstacle in a field-free region: the fields are unchanged) ---------------
+# slit_hw = 0 is no slit at all, a small slit_hw nearly no beam: the scores jump at that end of the range (the
+# samplers see the closed slits as lost beams, the GP fits the step with a short length scale). Likewise trim_phase is
+# an angle whose ends -180 / +180 deg are the same trim, which the samplers do not know, and it does nothing at
+# trim_amp = 0.
 [[mobo.variables]]
 name = "slit_hw"
 target = "slit.half_width_mm"            # half the opening [mm]; 0 = no slit (the warm start)
@@ -150,7 +156,8 @@ metric = "I_final"                       # T x injected current [mA]
 direction = "maximize"
 
 [[mobo.objectives]]
-metric = "valley_all"                    # share of probe crossings between the turns, mean of the 8 probes
+metric = "valley_all"                    # share of probe crossings between the turns, the 8 probes' crossings
+                                         # pooled
 direction = "minimize"
 
 [[mobo.objectives]]
@@ -163,21 +170,24 @@ op = ">="
 value = 2.9
 
 # Clean turns need the energy spread too: turn_sigR <= 3 mm (8 sigma at a 24 mm turn separation) needs
-# dE_E_robust <= ~1.3 % at R = 330 mm (README, "Constraint"). The designs so far sit near 1.9 %, so with it enabled
-# from the start no evaluation is feasible and the sampler has nothing to steer by. Enable it here once the Pareto
-# set comes near it: the store keeps every evaluation's scores, so the earlier ones are judged by it as well.
+# dE_E_robust <= ~1.3 % at R = 330 mm (PyCentralRegion.analysis.objectives.METRICS: turn_sigR, dE_E_robust, sigR_E,
+# fan_proj_last). The designs so far sit near 1.9 %, so with it enabled from the start no evaluation is feasible and
+# the sampler has nothing to steer by. Enable it here once the Pareto set comes near it: the store keeps every
+# evaluation's scores, so the earlier ones are judged by it as well.
 # [[mobo.constraints]]
 # metric = "dE_E_robust"
 # op = "<="
 # value = 0.013
 
 # --- fidelities ----------------------------------------------------------------------------------------------------
+# They differ in resolution only. Both track to the base's turn cap (track.turns = 8; a run ends earlier, when the
+# reference reaches machine.target_energy_mev = 3 MeV: within 7 turns for the base design), so a design too slow to
+# get there is cut at the same turn in both, and the search-to-verify shift of a score is its resolution error.
 [mobo.fidelities.search]       # what the sampler learns from: 10k particles (all of them tracked for the 8 probes'
-                               # valley share), SC 64^3 every 5 steps, 7 turns
-overrides = ["track.turns=7", "track.n_final=10000", "track.sc_final_cells=64", "track.sc_final_every=5",
-             "track.n_tracks=10000"]
+                               # valley share), SC 64^3 every 5 steps
+overrides = ["track.n_final=10000", "track.sc_final_cells=64", "track.sc_final_every=5", "track.n_tracks=10000"]
 timeout_min = 60.0             # a new geometry: build + 3D BEM + tracking
 
-[mobo.fidelities.verify]       # pcr optimize-verify: every particle, SC 128^3 every step, 8 turns
-overrides = ["track.n_final=0", "track.sc_final_cells=128", "track.sc_final_every=1", "track.turns=8"]
+[mobo.fidelities.verify]       # pcr optimize-verify: every particle, SC 128^3 every step
+overrides = ["track.n_final=0", "track.sc_final_cells=128", "track.sc_final_every=1"]
 timeout_min = 240.0

@@ -400,7 +400,7 @@ class BunchTracker:
         from .accelerated_orbit_finder import ProbeRecorder
         tc, finder = self.tc, self.finder
         t1 = time.time()
-        bunch = self.inflector.beam(n_particles=(int(n) or None), seed=seed_rng)
+        bunch = self.inflector.beam(n_particles=(int(n) or None), seed=seed_rng, species=self.design.species)
         r0 = np.column_stack([np.asarray(bunch.x, dtype=float), np.asarray(bunch.y, dtype=float),
                               np.asarray(bunch.z, dtype=float)])
         slit, slit_rec = self.slit_for(ph)
@@ -455,7 +455,8 @@ class BunchTracker:
                'hits': hits, 'hits_z': hits_z, 'time_s': time.time() - t1,
                'final_energy_mev': float(res.final_energy_mev),
                'transmission': alive[-1] / bunch.numpart if alive else 0.0,
-               'space_charge': res.metadata.get('space_charge')}
+               'space_charge': res.metadata.get('space_charge'),
+               'fast_path': res.metadata.get('fast_path')}          # whether the compiled kernel ran, else why not
         if out['space_charge'] is not None:
             out['space_charge'] = {k: v for k, v in out['space_charge'].items() if k != 'log'}
         if slit_rec is not None:

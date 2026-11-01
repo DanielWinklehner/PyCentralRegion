@@ -33,7 +33,7 @@ import numpy as np
 from PyCentralRegion.config import ConfigError, InflectorConfig, MachineConfig
 from PyCentralRegion.machine import apply_seed_geometry, check_supported
 from PyCentralRegion.rf_cavity import DeeSystem, create_dee_system
-from .options import GeometryConfig
+from .options import GeometryConfig, channel_height_mm
 
 MM = 1000.0                 # metres -> millimetres
 
@@ -55,11 +55,17 @@ def configure(geometry: GeometryConfig = None, machine: MachineConfig = None, in
     """Set the options every function of this module reads: [geometry], [machine] and [inflector] of the run config.
 
     ``exit_plane_spec_file`` overrides geometry.exit_plane_spec_file (``build`` resolves its default from the housing
-    outline's folder)."""
+    outline's folder). Refused, changing nothing: a machine the builder does not model (``machine.check_supported``)
+    and a geometry.r_max_mm beyond the cavity radius the gap lines end at (the dees would stop short of the model's
+    edge)."""
     global OPT, MACHINE, INFLECTOR, EXIT_SPEC_FILE
-    machine = machine or MachineConfig()
+    geometry, machine = geometry or GeometryConfig(), machine or MachineConfig()
     check_supported(machine)
-    OPT, MACHINE, INFLECTOR = geometry or GeometryConfig(), machine, inflector or InflectorConfig()
+    if geometry.r_max_mm > float(machine.r_max_cavity_m) * MM + 1e-9:
+        raise ConfigError(f"geometry.r_max_mm = {geometry.r_max_mm:g} mm lies beyond [machine] r_max_cavity_m = "
+                          f"{float(machine.r_max_cavity_m) * MM:g} mm, where the gap lines end: the dees would stop "
+                          f"short of the model's edge (0 = the cavity radius)")
+    OPT, MACHINE, INFLECTOR = geometry, machine, inflector or InflectorConfig()
     EXIT_SPEC_FILE = str(OPT.exit_plane_spec_file if exit_plane_spec_file is None else exit_plane_spec_file)
     _EXIT_SPEC.clear()
 
@@ -72,7 +78,7 @@ def channel_heights(owner: str = 'dee0') -> tuple:
 
 def channel_half_height(r_mm, owner: str = 'dee0', heights=None) -> float:
     """Half the channel's full height [mm] at radius r_mm on electrode ``owner`` (or for the given heights)."""
-    return 0.5 * float(_height(r_mm, OPT.aperture_radii(), channel_heights(owner) if heights is None else heights))
+    return 0.5 * channel_height_mm(r_mm, OPT.aperture_radii(), channel_heights(owner) if heights is None else heights)
 
 
 def r_max_mm() -> float:
@@ -88,11 +94,6 @@ def exit_spec() -> dict:
     if EXIT_SPEC_FILE not in _EXIT_SPEC:
         _EXIT_SPEC[EXIT_SPEC_FILE] = json.loads(Path(EXIT_SPEC_FILE).read_text())
     return _EXIT_SPEC[EXIT_SPEC_FILE]
-
-
-def _height(r_mm, step, h):
-    """Full height [mm] at radius r [mm]: h[0] inside step[0], h[1] beyond step[1], linear between."""
-    return np.interp(np.asarray(r_mm, dtype=float), [0.0, step[0], step[1], 1.0e4], [h[0], h[0], h[1], h[1]])
 
 
 # =====================================================================================================================
@@ -155,10 +156,12 @@ def opening_deg(dees: DeeSystem) -> float:
 def read_housing_outline(path) -> dict:
     """The housing outline text file written by the spiral-inflector export.
 
-    '#' comments, 'key value' lines, and section headers 'name count' followed by that many rows. Returns
-    {'frame', 'units', 'outer' (N, 2), 'aperture' (M, 3)} in mm and, when the file has them, 'curves' as
-    [(kind, i0, i1), ...]: the exporter simplifies the outline itself (one straight plate at the exit, square to the
-    design orbit, one spline round the rest). Files without curves are a plain polygon for ``simplify_outline``.
+    '#' comments, 'key value' lines ('units mm' or 'units m' - metres when the file has no units line -, 'frame'
+    a label), and section headers 'name count' followed by that many rows: 'outer' (x y), 'aperture' (x y z) and
+    optionally 'curves' (kind i0 i1). Returns {'frame', 'units', 'outer' (N, 2), 'aperture' (M, 3)} in mm and, when
+    the file has them, 'curves' as [(kind, i0, i1), ...]: the exporter simplifies the outline itself (one straight
+    plate at the exit, square to the design orbit, one spline round the rest). Files without curves are a plain
+    polygon for ``simplify_outline``.
     """
     out, rows, name, left = {'frame': 'deck', 'units': 'm'}, [], None, 0
     with open(path, encoding='utf-8') as fh:
@@ -314,6 +317,13 @@ def exit_half_height_mm(ol: dict) -> float:
     return float(np.abs(ap[:, 2]).max())
 
 
+def exit_radius_mm(ol: dict) -> float:
+    """The spiral-inflector housing exit's outermost radius [mm]: the largest distance of its exit aperture's points
+    from the machine axis. The channel heights there are held to the exit's height too (``options.check_bounds``)."""
+    ap = np.asarray(ol['aperture'], dtype=float)
+    return float(np.hypot(ap[:, 0], ap[:, 1]).max())
+
+
 # =====================================================================================================================
 # 3. the emitting plane and the beam channel
 # =====================================================================================================================
@@ -401,6 +411,15 @@ def beam_channel(aperture: np.ndarray, plane: dict, extend: float = None, back: 
 # =====================================================================================================================
 # 4. gap centre lines as chains: junctions, inert segments
 # =====================================================================================================================
+def _on_circle(a: np.ndarray, b: np.ndarray, r: float) -> np.ndarray:
+    """Where the segment a -> b, running from inside the circle |p| = r about the machine axis to outside it, crosses
+    that circle (the outward root of |a + s (b - a)| = r, held to the segment)."""
+    ab = b - a
+    A, B, C = float(ab.dot(ab)), 2.0 * float(a.dot(ab)), float(a.dot(a)) - r ** 2
+    s = (-B + np.sqrt(max(B * B - 4.0 * A * C, 0.0))) / (2.0 * A)
+    return a + min(max(s, 0.0), 1.0) * ab
+
+
 def _clip_outer(chain: np.ndarray, r_max: float) -> np.ndarray:
     """Cut an inner-to-outer chain at r_max, landing the last point exactly on that circle."""
     p = np.asarray(chain, dtype=float)
@@ -410,11 +429,7 @@ def _clip_outer(chain: np.ndarray, r_max: float) -> np.ndarray:
     k = int(np.argmax(r > r_max))
     if k == 0:
         raise ValueError(f"chain starts beyond r_max = {r_max:.1f} mm")
-    a, b = p[k - 1], p[k]
-    ab = b - a
-    A, B, C = float(ab.dot(ab)), 2.0 * float(a.dot(ab)), float(a.dot(a)) - r_max ** 2
-    s = (-B + np.sqrt(max(B * B - 4.0 * A * C, 0.0))) / (2.0 * A)
-    return np.vstack([p[:k], a + min(max(s, 0.0), 1.0) * ab])
+    return np.vstack([p[:k], _on_circle(p[k - 1], p[k], r_max)])
 
 
 def junction(cav):
@@ -531,15 +546,6 @@ def move_junctions(dees: DeeSystem, moves, verbose: bool = True):
                   f"rotation {rots[-1]:+.3f} -> {sol.x[1]:+.3f} deg, line kept to {err * 1e3:.2f} um); jog "
                   f"{j_old['jog']:.1f} -> {j_new['jog']:.1f} mm, net step {j_old['step_deg']:+.2f} -> "
                   f"{j_new['step_deg']:+.2f} deg")
-    return out
-
-
-def apply_junction_moves(dees: DeeSystem, verbose: bool = False):
-    """The configured junction moves, then gap 0 onto the exit plate when asked: what the build does after the node
-    snap, for the tools that rebuild the gap lines themselves."""
-    out = move_junctions(dees, OPT.junctions, verbose=verbose)
-    if OPT.gap0_on_plate:
-        refit_gap0_on_plate(dees, verbose=verbose)
     return out
 
 
@@ -735,9 +741,9 @@ def _cut_inner_at_clearance(chain: np.ndarray, wall: np.ndarray, clearance: floa
     return np.vstack([dn[ok[0]], keep]), float(d[ok[0]]), True
 
 
-def _all_crossings(a: np.ndarray, b: np.ndarray):
-    """Every point where polyline a crosses polyline b, as (point, i_a, i_b) with the segment indices."""
-    out = []
+def _crossings(a: np.ndarray, b: np.ndarray):
+    """The points where polyline a crosses polyline b, walking a from its inner end, as (point, i_a, i_b) with the
+    segment indices (parallel segments never cross; the ends count, within 1e-9 of a segment's length)."""
     for i in range(len(a) - 1):
         p, r = a[i], a[i + 1] - a[i]
         for j in range(len(b) - 1):
@@ -748,24 +754,17 @@ def _all_crossings(a: np.ndarray, b: np.ndarray):
             ta = ((q - p)[0] * t[1] - (q - p)[1] * t[0]) / den
             tb = ((q - p)[0] * r[1] - (q - p)[1] * r[0]) / den
             if -1e-9 <= ta <= 1 + 1e-9 and -1e-9 <= tb <= 1 + 1e-9:
-                out.append((p + ta * r, i, j))
-    return out
+                yield p + ta * r, i, j
+
+
+def _all_crossings(a: np.ndarray, b: np.ndarray) -> list:
+    """Every point where polyline a crosses polyline b: [(point, i_a, i_b), ...]."""
+    return list(_crossings(a, b))
 
 
 def _first_crossing(a: np.ndarray, b: np.ndarray):
     """First point (walking a from its inner end) where polyline a crosses polyline b: (point, i_a) or (None, None)."""
-    for i in range(len(a) - 1):
-        p, r = a[i], a[i + 1] - a[i]
-        for j in range(len(b) - 1):
-            q, t = b[j], b[j + 1] - b[j]
-            den = r[0] * t[1] - r[1] * t[0]
-            if abs(den) < 1e-12:
-                continue
-            ta = ((q - p)[0] * t[1] - (q - p)[1] * t[0]) / den
-            tb = ((q - p)[0] * r[1] - (q - p)[1] * r[0]) / den
-            if -1e-9 <= ta <= 1 + 1e-9 and -1e-9 <= tb <= 1 + 1e-9:
-                return p + ta * r, i
-    return None, None
+    return next(((q, i) for q, i, _ in _crossings(a, b)), (None, None))
 
 
 def _clip_inner(chain: np.ndarray, r_min: float) -> np.ndarray:
@@ -777,11 +776,7 @@ def _clip_inner(chain: np.ndarray, r_min: float) -> np.ndarray:
     k = int(np.argmax(r >= r_min))
     if k == 0:
         raise ValueError(f"chain never reaches r_min = {r_min:.3f} mm")
-    a, b = p[k - 1], p[k]
-    ab = b - a
-    A, B, C = float(ab.dot(ab)), 2.0 * float(a.dot(ab)), float(a.dot(a)) - r_min ** 2
-    s = (-B + np.sqrt(max(B * B - 4.0 * A * C, 0.0))) / (2.0 * A)
-    return np.vstack([a + min(max(s, 0.0), 1.0) * ab, p[k:]])
+    return np.vstack([_on_circle(p[k - 1], p[k], r_min), p[k:]])
 
 
 def _meet_chains(a: np.ndarray, b: np.ndarray):
@@ -1021,27 +1016,32 @@ def dee_boundaries(dees: DeeSystem, wall: np.ndarray, r_max: float = None, junct
         bnd[0] = _start_at(full[0], meet, i0)
         bnd[1] = _start_at(full[1], meet, i1)
         how = 'meets gap 1' if i0 >= 0 else 'meets gap 1 (extended)'
+        cut = ''                                   # what was cut off the vertex, if anything
         if dee0_clear > 0.0:
-            bnd[0], d_a, _ = _cut_inner_at_clearance(bnd[0], wall, dee0_clear)
-            bnd[1], d_b, _ = _cut_inner_at_clearance(bnd[1], wall, dee0_clear)
-            how += f', then cut to {dee0_clear:.2f} mm clearance'
+            bnd[0], _, cut_lo = _cut_inner_at_clearance(bnd[0], wall, dee0_clear)
+            bnd[1], _, cut_hi = _cut_inner_at_clearance(bnd[1], wall, dee0_clear)
+            cut = f"cut to {dee0_clear:.2f} mm housing clearance" if cut_lo or cut_hi else ''
+            how += f', then cut to {dee0_clear:.2f} mm clearance' if cut else f', {dee0_clear:.2f} mm clear: not cut'
         elif trim > 0.0:
             bnd[0] = _advance_chain(bnd[0], trim)
             bnd[1] = _advance_chain(bnd[1], trim)
+            cut = f"cut back {trim:.2f} mm"
             how += f', then cut back {trim:.2f} mm'
         d_meet = float(_wall_distance([meet], wall)[0])
         inner[0] = {'rule': how, 'moved': True, 'meet': meet, 'trim': trim,
                     'd': float(_wall_distance(bnd[0][:1], wall)[0]), 'start': bnd[0][0].copy()}
         inner[1] = {'rule': how.replace('gap 1', 'gap 0'), 'moved': True, 'meet': meet, 'trim': trim,
                     'd': float(_wall_distance(bnd[1][:1], wall)[0]), 'start': bnd[1][0].copy()}
-        if trim > 0.0 or dee0_clear > 0.0:
-            how_much = f"cut to {dee0_clear:.2f} mm housing clearance" if dee0_clear > 0.0 else f"cut back {trim:.2f} mm"
-            print(f"[dee0] tip {how_much}: the gap0/gap1 vertex at r = {np.hypot(*meet):.2f} mm "
+        if cut:
+            print(f"[dee0] tip {cut}: the gap0/gap1 vertex at r = {np.hypot(*meet):.2f} mm "
                   f"(housing clearance {d_meet:+.2f} mm) becomes a {np.hypot(*(bnd[0][0] - bnd[1][0])):.2f} mm face "
                   f"from r = {np.hypot(*bnd[1][0]):.2f} to {np.hypot(*bnd[0][0]):.2f} mm, clearing the housing by "
                   f"{min(inner[0]['d'], inner[1]['d']):+.2f} mm")
             print("[dee0] ARCLENGTH ORIGIN MOVED on the gap-0-dee and gap-1-dee edges - any post spec written "
                   "against a different dee0 tip is stale and must be RE-DERIVED")
+        elif dee0_clear > 0.0:
+            print(f"[dee0] tip not cut: the gap0/gap1 vertex at r = {np.hypot(*meet):.2f} mm already clears the housing "
+                  f"by {d_meet:+.2f} mm (dee0_clearance_mm {dee0_clear:.2f}); the arclength origin stays at the vertex")
     for g in range(len(bnd)):                      # what the metal really clears, end to end
         inner[g]['min_d'] = float(_wall_distance(_densify(bnd[g], 0.05)[0], wall).min())
 
@@ -1446,7 +1446,7 @@ def _aperture_ring(r0: float, r1: float, step=None, h=None):
     step = OPT.aperture_radii() if step is None else step
     h = OPT.aperture_heights() if h is None else h
     rr = sorted(set([r0] + [v for v in step if r0 < v < r1] + [r1]))
-    zz = [0.5 * float(_height(v, step, h)) for v in rr]
+    zz = [0.5 * channel_height_mm(v, step, h) for v in rr]
     return list(zip(rr, [-v for v in zz])) + list(zip(rr[::-1], zz[::-1]))
 
 
@@ -1610,21 +1610,34 @@ def _into(poly, p, t, what: str, owner: str):
     return n
 
 
+def _channel_top(corners, owner: str, aperture) -> float:
+    """The highest half height [mm] of ``owner``'s channel over a piece of hardware's plan-view footprint (its corners
+    [mm]). Posts, window blocks and hole plates run ``post_overhang_mm`` past this: inside the taper the channel
+    changes across a footprint, and a block as high as the channel at one point of it would leave the channel open
+    over its higher end. The profile is monotonic in r, so the highest is at the footprint's nearest or farthest
+    radius (the machine axis never lies inside hardware)."""
+    p = np.asarray(corners, dtype=float)
+    ab = np.roll(p, -1, axis=0) - p
+    t = np.clip(-np.einsum('ij,ij->i', p, ab) / np.maximum(np.einsum('ij,ij->i', ab, ab), 1e-30), 0.0, 1.0)
+    r_near, r_far = float(np.hypot(*(p + t[:, None] * ab).T).min()), float(np.hypot(p[:, 0], p[:, 1]).max())
+    return max(channel_half_height(r_near, owner, aperture), channel_half_height(r_far, owner, aperture))
+
+
 def _post_on_edge(edge, poly, s: float, aperture, size: float, offset: float, overhang: float, name: str,
                   owner: str, length: float = None) -> dict:
     """One post on `edge` at arclength `s`, its centre `offset` into the solid whose footprint is `poly` - the same
     routine serves a dee edge and the dummy edge facing it, and the two come out pointing at each other across the
     gap. ``length`` (default ``size``) is its extent along the edge, centred on `s`; ``aperture`` the channel heights
-    of the owner (None: ``channel_heights(owner)``)."""
+    of the owner (None: ``channel_heights(owner)``). It runs `overhang` past the channel (``_channel_top``)."""
     p, t, sl = _edge_point(edge, s)
     if not (0.0 <= s <= sl[-1]):
         raise ConfigError(f"post {name}: arclength {s:.2f} mm is off the edge (0 .. {sl[-1]:.2f})")
     n = _into(poly, p, t, f"post {name}", owner)
     c = p + offset * n
     length = float(size if length is None else length)
+    corners = _post_corners(c, t, n, size, length)
     return {'name': name, 'owner': owner, 's': float(s), 'point': p, 'tangent': t, 'normal': n, 'centre': c,
-            'corners': _post_corners(c, t, n, size, length),
-            'half_height': channel_half_height(np.hypot(*p), owner, aperture) + overhang,
+            'corners': corners, 'half_height': _channel_top(corners, owner, aperture) + overhang,
             'length': length, 'r': float(np.hypot(*p)), 'r_centre': float(np.hypot(*c))}
 
 
@@ -1673,9 +1686,10 @@ def gap_window(foot, dummy, gap: int, side: str, s_lo: float, s_hi: float, z_lo:
 
     Built like a post - near face on the edge, `depth` into the electrode, fused into the solid that owns the edge -
     but spanning an arclength RANGE and split into an upper and a lower block, each running from the opening to
-    `overhang` past the channel (solid metal already, so the fuse has real overlap instead of a coincident face). The
-    opening must lie inside the channel at the window (|z_center| + half height <= the channel's half height there):
-    a ConfigError names ``where`` (the config item) otherwise."""
+    `overhang` past the channel's highest point over the window (``_channel_top``; solid metal already, so the fuse has
+    real overlap instead of a coincident face). The opening must lie inside the channel at the window's middle
+    (|z_center| + half height <= the channel's half height there): a ConfigError names ``where`` (the config item)
+    otherwise."""
     depth = OPT.post_size_mm if depth is None else depth
     overhang = OPT.post_overhang_mm if overhang is None else overhang
     where = where or f"the gap-{gap} {side} window"
@@ -1706,7 +1720,7 @@ def gap_window(foot, dummy, gap: int, side: str, s_lo: float, s_hi: float, z_lo:
     mid = 0.5 * (p_lo + p_hi)
     r_mid = float(np.hypot(*mid))
     ap_half = channel_half_height(r_mid, owner, aperture)
-    top = ap_half + overhang
+    top = _channel_top(corners, owner, aperture) + overhang
     if not (float(z_hi) <= ap_half + 1e-9 and float(z_lo) >= -ap_half - 1e-9 and float(z_hi) > float(z_lo)):
         raise ConfigError(f"{where}: the opening {float(z_lo):+.3f} .. {float(z_hi):+.3f} mm must lie inside the channel "
                           f"at the window, |z_center_mm| + half_height_mm <= {ap_half:.3f} mm (half the channel height "
@@ -1727,8 +1741,8 @@ def gap_aperture(foot, dummy, gap: int, side: str, r_hole: float, s_c: float, z_
     """A CIRCULAR aperture on one gap edge: a plate the beam passes through by a round hole.
 
     The plate's near face is the chord from s_lo to s_hi on the edge, `depth` into the electrode that owns the edge,
-    the whole aperture height plus `overhang` each way; a cylinder of radius `r_hole` is cut through it along the edge
-    normal, centred on the face at arclength s_c and height z_c [mm]."""
+    the whole channel height plus `overhang` each way (``_channel_top``); a cylinder of radius `r_hole` is cut through
+    it along the edge normal, centred on the face at arclength s_c and height z_c [mm]."""
     depth = OPT.post_size_mm if depth is None else depth
     overhang = OPT.post_overhang_mm if overhang is None else overhang
     edge, poly, owner = gap_edge(foot, dummy, int(gap), side)
@@ -1747,12 +1761,13 @@ def gap_aperture(foot, dummy, gap: int, side: str, r_hole: float, s_c: float, z_
     p_face = p_lo + float(np.dot(p_c - p_lo, tt)) * tt     # the hole centre ON the plate face (the chord)
     r_mid = float(np.hypot(*p_c))
     ap_half = channel_half_height(r_mid, owner, aperture)
-    if abs(z_c) + r_hole >= ap_half + overhang:
+    corners = np.array([p_lo, p_hi, p_hi + depth * n, p_lo + depth * n])
+    h = _channel_top(corners, owner, aperture) + overhang
+    if abs(z_c) + r_hole >= h:
         raise ConfigError(f"gap-{gap} hole: the hole (z {z_c:+.1f} +- {r_hole:g}) reaches past the plate "
-                          f"(+-{ap_half + overhang:.1f} mm)")
-    h = ap_half + overhang
+                          f"(+-{h:.1f} mm)")
     return {'name': name or f"g{int(gap)}_{side}_ap", 'owner': owner, 'kind': 'aperture',
-            'corners': np.array([p_lo, p_hi, p_hi + depth * n, p_lo + depth * n]), 'z_lo': -h, 'z_hi': h,
+            'corners': corners, 'z_lo': -h, 'z_hi': h,
             'half_height': h, 'hole_centre': np.array([p_face[0], p_face[1], float(z_c)]), 'hole_axis': n,
             'hole_r': float(r_hole), 'depth': float(depth), 's_lo': float(s_lo), 's_hi': float(s_hi), 's': float(s_c),
             'r_mid': r_mid, 'r': r_mid, 'ap_half': ap_half, 'point': p_c, 'centre': p_c + 0.5 * depth * n,
@@ -2445,10 +2460,11 @@ def to_electrode_model(gmsh, groups, dee_voltage: float, half_height: float = No
                                             [step[1] / MM, aperture[1] / MM], [1.0, aperture[1] / MM]],
                            'dummy_aperture': [[0.0, dummy_ap[0] / MM], [step[0] / MM, dummy_ap[0] / MM],
                                               [step[1] / MM, dummy_ap[1] / MM], [1.0, dummy_ap[1] / MM]]},
-              # every consumer reads the radial layout from here; the dees stop at r_cut, so a blend onto an RF-cavity
-              # map has to start inside it - unless the BEM is the whole machine (bem_only), when there is no map
+              # every consumer reads the radial layout from here. The BEM field is the whole accelerating field
+              # (bem_only, always: the tracker blends no RF-cavity map on); 'seam' is where such a blend would start,
+              # inside the dees' end r_cut, kept for the consumers of the original design deck's layout
               'layout': {'r_features': r_c, 'seam': (r_c - 0.055, r_c - 0.030), 'r_cut': r_c, 'z_cut': z_cut,
-                         'bem_only': bool(OPT.bem_only)},
+                         'bem_only': True},
               'si_rotation_deg': float(si_rotation_deg)}
     model = ElectrodeModel(vertices=verts, triangles=tris, potentials=pots, wedges=[], params=params)
     if verbose:

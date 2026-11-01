@@ -11,7 +11,8 @@ first turn (trim_trajectory). Differences are physics (in-plane fringe fields, f
 are reported, not fitted away.
 Inputs: <resources>/uCyclo_v3_midplane_field.comsol and an optimizer result pickle (default
 <out>/optimized_cavity_geometry.pkl from example 06; example 08 writes optimized_cavity_geometry_bem.pkl).
-Runtime: about a minute on the CPU (a 25k-element solve, the midplane gridding and two tracks).
+Runtime: 1-2 minutes on the CPU, most of it the BEM solve (25-27k elements, GMRES 40-80 s depending on the
+geometry), then the midplane gridding (10 s) and two tracks.
 Outputs: <out>/bem_gap_verification.png, bem_gap_verification.json.
 
 Usage:

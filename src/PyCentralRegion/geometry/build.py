@@ -16,20 +16,24 @@ reports it prints on the way):
   5. the emitting plane (turned) and the beam channel, the hardware, the OCC model, the surface mesh;
   6. the ElectrodeModel -> paths.model3d, recording the inflector rotation the electrodes were built around
      (params['si_rotation_deg']: the tracker refuses an inflector.rotation_deg that differs from it), with
-     <prefix>.msh / <prefix>.step and <prefix>_build.json (what the build used).
+     <prefix>.msh (the surface mesh; physical groups dee0..dee3, ground), <prefix>.step (the CAD: the dees and the
+     ground as unnamed OCC solids, in mm, machine frame - z = 0 the median plane, the housing and its exit turned by
+     the inflector rotation; the ground holds the spiral-inflector housing, its outline extruded over
+     +-half_height_mm, with the exit opening cut through it) and <prefix>_build.json (what the build used).
 
 <prefix> is paths.model3d without '_model3d.pkl' (or without '.pkl'). Every output is written under a temporary name
 and renamed once all of them exist, the model last: an existing paths.model3d is reused and nothing is rebuilt or
-overwritten, and a build that finds some of its other outputs but no model refuses to run. No BEM solve here
+overwritten, a build that finds some of its other outputs but no model refuses to run, and a build that fails (a
+ConfigError from a bound that needs the layout, such as a window's) removes its temporary files. No BEM solve here
 (``pcr fields`` does that).
 
 Tools that work on the same edges the build lays out (each from a run config):
   ``layout(cfg)``      the 2D electrodes exactly as the build has them, with every report;
   ``bounds(cfg)``      the channel-height bounds, for a campaign's variable ranges;
   ``gap0_hole(cfg)``   a round hole on dee0's gap-0 edge around where the hand-off bunch meets it, as a
-                       [[geometry.holes]] item (the design deck's MiniDAR_handoff_aperture, part 2);
+                       [[geometry.holes]] item (part 2 of the design deck's hand-off aperture tool);
   ``cut_handoff(...)`` a hand-off file cut to a circle on its own plane (that tool's part 1);
-  ``edge_shift(cfg, moves)``  a radius change of a point on a gap edge as an arclength (MiniDAR_edge_shift).
+  ``edge_shift(cfg, moves)``  a radius change of a point on a gap edge as an arclength (the deck's edge-shift tool).
 
     python -m PyCentralRegion.geometry.build build run.toml [--set k=v ...]
     python -m PyCentralRegion.geometry.build bounds run.toml
@@ -146,8 +150,9 @@ def _channel_report(g, bounds: dict, exit_half: float) -> None:
           f"(taper centre {g.aperture_taper_center_mm:g}, length {g.aperture_taper_length_mm:g} mm)")
     print("  dummy dees and ground: " + ("the dees' heights" if same else f"{d_in:g} / {d_out:g} mm (an asymmetric gap)"))
     print(f"  bounds: every height <= 2 x (plate_half_gap_mm {g.plate_half_gap_mm:g} - dee_wall_mm {g.dee_wall_mm:g}) "
-          f"= {bounds['height_max_mm']:g} mm; the inner heights >= 2 x the housing exit's half height "
-          f"{exit_half:.3f} = {bounds['inner_min_mm']:.3f} mm  -> within bounds")
+          f"= {bounds['height_max_mm']:g} mm; the inner heights and the heights at the housing exit's outermost "
+          f"radius {bounds['exit_r_mm']:.2f} mm >= 2 x its half height {exit_half:.3f} = {bounds['inner_min_mm']:.3f} mm"
+          f"  -> within bounds")
 
 
 def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
@@ -192,7 +197,7 @@ def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
         ol['aperture'] = B.inset_aperture(ol['aperture'], *map(float, g.aperture_inset_mm))
     sim = B.housing_outline(ol)
     exit_half = B.exit_half_height_mm(ol)
-    bounds = check_bounds(g, exit_half)
+    bounds = check_bounds(g, exit_half, B.exit_radius_mm(ol))
     _channel_report(g, bounds, exit_half)
 
     V.print_junctions(dees)
@@ -211,9 +216,10 @@ def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
 
 def bounds(cfg) -> dict:
     """The channel-height bounds of this config's build [mm] without building: {'height_max_mm' (every height),
-    'inner_min_mm' (aperture_inner_mm and dummy_aperture_inner_mm), 'exit_half_height_mm', 'plate_half_gap_mm',
-    'dee_wall_mm'}: what a campaign sets its geometry.aperture_*_mm ranges from. Reads the housing outline only and does
-    not check the current heights (``build`` does)."""
+    'inner_min_mm' (aperture_inner_mm and dummy_aperture_inner_mm, and the heights at exit_r_mm), 'exit_r_mm' (the
+    housing exit's outermost radius), 'exit_half_height_mm', 'plate_half_gap_mm', 'dee_wall_mm'}: what a campaign sets
+    its geometry.aperture_*_mm ranges from. Reads the housing outline only and does not check the current heights
+    (``build`` does)."""
     g = C.section(cfg, 'geometry')
     pc = C.section(cfg, 'paths')
     ol = B.read_housing_outline(_existing(C.require(pc.housing_outline, 'paths.housing_outline'),
@@ -222,8 +228,9 @@ def bounds(cfg) -> dict:
         with contextlib.redirect_stdout(io.StringIO()):
             ol['aperture'] = B.inset_aperture(ol['aperture'], *map(float, g.aperture_inset_mm))
     e = B.exit_half_height_mm(ol)
-    return {'height_max_mm': channel_height_max_mm(g), 'inner_min_mm': 2.0 * e, 'exit_half_height_mm': e,
-            'plate_half_gap_mm': float(g.plate_half_gap_mm), 'dee_wall_mm': float(g.dee_wall_mm)}
+    return {'height_max_mm': channel_height_max_mm(g), 'inner_min_mm': 2.0 * e, 'exit_r_mm': B.exit_radius_mm(ol),
+            'exit_half_height_mm': e, 'plate_half_gap_mm': float(g.plate_half_gap_mm),
+            'dee_wall_mm': float(g.dee_wall_mm)}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -252,7 +259,38 @@ def build(cfg) -> dict:
         p.unlink(missing_ok=True)
     print(f"[build] {out['model3d']}\n[build] seed {inp['seed']}\n[build] housing outline {inp['housing_outline']}",
           flush=True)
+    try:
+        si_rot = _build_parts(cfg, s, inp, out['model3d'], part, t0)
+    except BaseException:
+        for p in part.values():           # a build that fails (a window out of its bound, ...) leaves no temporary
+            try:                          # file behind; the error it raised is the one that propagates
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
+    written = {}
+    for k, final in out.items():                               # commit: the model last, nothing overwritten
+        if not part[k].exists():
+            continue
+        if final.exists():
+            raise ConfigError(f"{final} appeared while this build ran: not overwritten; this build's file is "
+                              f"{part[k]}")
+        os.replace(part[k], final)
+        written[k] = str(final)
+    print(f"\n[build] wrote " + ", ".join(Path(v).name for v in written.values()) + f" in {out['model3d'].parent} "
+          f"({time.time() - t0:.0f} s)")
+    if abs(si_rot - float(inf.rotation_deg)) > SI_ROTATION_TOL_DEG:
+        print(f"[build] WARNING: the electrodes were built around the inflector turned by {si_rot:+.12g} deg "
+              f"(si_rotation = {g.si_rotation!r}) but inflector.rotation_deg = {inf.rotation_deg:+.12g}: the tracker "
+              f"refuses this model until the run sets inflector.rotation_deg = {si_rot!r}")
+    return written
+
+
+def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) -> float:
+    """The build proper: every output of ``build`` under its temporary name ``part[k]``. Returns the inflector
+    rotation [deg] the electrodes were built around."""
+    g, inf = s['geometry'], s['inflector']
     lay = layout(cfg, verbose=True, inp=inp, dees_png=part['dees_png'] if g.plot_dees else None)
     dees, ol, si_rot = lay['dees'], lay['outline'], lay['si_rotation_deg']
     plane = B.rotate_plane(B.emitting_plane(inp['emitting_plane']), si_rot)
@@ -288,7 +326,7 @@ def build(cfg) -> dict:
         pickle.dump(model, fh, protocol=4)
 
     solids = {sd['name']: int(sd['tri_range'][1] - sd['tri_range'][0]) for sd in model.params['solids']}
-    record = {'model3d': str(out['model3d']), 'built': time.strftime('%Y-%m-%d %H:%M:%S'),
+    record = {'model3d': str(model3d), 'built': time.strftime('%Y-%m-%d %H:%M:%S'),
               'wall_s': round(time.time() - t0, 1), 'config': cfg.get('_source', ''),
               'inputs': {k: str(v) for k, v in inp.items() if v},
               'si_rotation': g.si_rotation, 'si_rotation_deg': si_rot, 'inflector_rotation_deg': inf.rotation_deg,
@@ -298,23 +336,7 @@ def build(cfg) -> dict:
               'gmsh': getattr(gmsh, '__version__', ''),
               'geometry': C.to_dict(g), 'machine': C.to_dict(s['machine']), 'inflector': C.to_dict(inf)}
     part['build_json'].write_text(json.dumps(record, indent=1, default=str))
-
-    written = {}
-    for k, final in out.items():                               # commit: the model last, nothing overwritten
-        if not part[k].exists():
-            continue
-        if final.exists():
-            raise ConfigError(f"{final} appeared while this build ran: not overwritten; this build's file is "
-                              f"{part[k]}")
-        os.replace(part[k], final)
-        written[k] = str(final)
-    print(f"\n[build] wrote " + ", ".join(Path(v).name for v in written.values()) + f" in {out['model3d'].parent} "
-          f"({time.time() - t0:.0f} s)")
-    if abs(si_rot - float(inf.rotation_deg)) > SI_ROTATION_TOL_DEG:
-        print(f"[build] WARNING: the electrodes were built around the inflector turned by {si_rot:+.12g} deg "
-              f"(si_rotation = {g.si_rotation!r}) but inflector.rotation_deg = {inf.rotation_deg:+.12g}: the tracker "
-              f"refuses this model until the run sets inflector.rotation_deg = {si_rot!r}")
-    return written
+    return si_rot
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -528,10 +550,12 @@ def gap0_hole(cfg, r_mm: float = 10.0, rim_mm: float = 8.0, dr_mm: float = 0.0, 
     if dr_mm:
         moved = _shift_on_edge(edge, s_beam, float(dr_mm), "the gap-0 hole")
         s_c = moved['s1']
+    # the spec to 0.1 um, as it is written into a design file: a hole re-derived from the same beam is then EQUAL to
+    # the one in the file (46.12 - 18 is 28.119999999999997 in floating point, not the 28.12 the file holds)
     s_c = round(s_c, 4)
     rr = np.hypot(s_hit[k] - s_c, z_hit[k] - float(z_mm))
-    hole = HoleSpec(0, 'dee', float(r_mm), s_c, float(z_mm), s_c - float(r_mm) - float(rim_mm),
-                    s_c + float(r_mm) + float(rim_mm))
+    hole = HoleSpec(0, 'dee', float(r_mm), s_c, float(z_mm), round(s_c - float(r_mm) - float(rim_mm), 4),
+                    round(s_c + float(r_mm) + float(rim_mm), 4))
     toml = "\n".join(["[[geometry.holes]]"] + [f"{f} = " + (json.dumps(v) if isinstance(v, str) else
                                                             repr(round(v, 6) if isinstance(v, float) else v))
                                                 for f, v in dataclasses.asdict(hole).items()])

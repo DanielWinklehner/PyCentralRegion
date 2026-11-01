@@ -2,7 +2,9 @@
 
 ``ScoreConfig`` is the ``[score]`` section of a run file: every threshold and choice of ``metrics.score_run`` and
 ``twins.vortex_twin`` is one of its fields, documented with its default in ``configs/defaults/score.toml``. The defaults
-reproduce the 3D campaign's run scoring of 2026-11-01, so new scores stay comparable with its tables.
+reproduce the 3D campaign's run scoring of 2026-11-01, so new scores stay comparable with its tables. What describes
+the machine (harmonic, loss limits, species) is not a scoring choice: it comes from the run itself, its json and
+hand-off file and the ``[machine]`` table it was tracked with (``runs.RunData.machine``; ``metrics.run_constants``).
 
 ``METRICS`` lists the scalar score keys an optimizer may use as an objective or a constraint: name -> direction hint,
 unit and meaning (with what the campaign learned about it). All of them are top-level keys of the score dict, so the
@@ -14,7 +16,7 @@ The campaign's choice (53 runs of one injected beam): maximise I_final (or W_eff
 ratio; constrain E_med to the design energy and the turn width turn_sigR to <= 3 mm (8 sigma at a 24 mm turn
 separation), which needs dE_E_robust <= ~1.3 % at R = 330 mm (sigR_E = R / 2 x dE/E) and a centre fan held below
 ~2 mm in projection (fan_proj_last). There is no vortex objective: at that bunch density the vortex cannot shape the
-beam in 6 turns. The low-fidelity proxies (turns 0-3) are evaluated on the final survivors, which for a turns 0-3 run
+beam in 7 turns. The low-fidelity proxies (turns 0-3) are evaluated on the final survivors, which for a turns 0-3 run
 are the particles alive at turn 3: the correlations quoted were measured on full runs, re-check them there.
 """
 import dataclasses
@@ -25,12 +27,9 @@ DIRECTIONS = ('max', 'min', 'target', 'info')
 
 @dataclasses.dataclass
 class ScoreConfig:
-    # what the run json may not record (legacy runs): fallbacks only
-    harmonic: int = 4                    # RF harmonic when the json lacks harmonic, rf_mhz or f_rev_mhz
-    r_max_m: float = 0.38                # loss radius when the run records no limits
-    z_max_m: float = 0.030               # loss half-height when the run records no limits
     b0_t: float = 0.0                    # |B| at the bunch for the vortex prediction when the json has no field check;
-    #                                      0 = the isochronous central field 2 pi f_rev m / q of the hand-off species
+    #                                      0 = the isochronous central field 2 pi f_rev m / q of the tracked species
+    beam: str = ''                       # label of the injected beam in the score; '' = the hand-off file's stem
     # which runs are scored
     min_tracks: int = 5000               # fewer recorded tracks: the run is skipped
     min_survivors: int = 200             # fewer tracked survivors: the run is skipped
@@ -38,8 +37,9 @@ class ScoreConfig:
     energy_windows: tuple = (0.05, 0.02, 0.01)     # +-rel windows: I_<p>pct (median-centred), I_<p>pct_best (best)
     # acceptance in hand-off release phase
     phase_bin_deg: float = 5.0           # release-phase bins of the survival curve
-    phase_range_deg: float = 120.0       # bins span +-range (phases beyond fall into the end bins)
+    phase_range_deg: float = 120.0       # bins span +-range (beyond: the survival curve's end bins, not release_bins)
     min_bin_count: int = 40              # bins with fewer tracked particles do not count
+    min_bin_survivors: int = 11          # a release bin with fewer survivors reports no final energy and lag
     acceptance_levels: tuple = (0.9, 0.8)          # acc<level>: widest run of bins with survival >= level
     survival_bands_deg: tuple = (30.0, 40.0)       # S30 = survival for |phase| <= 30, S30_40 for 30 < |phase| <= 40
     compression_clip_sigma: float = 2.5  # compression slope fitted to survivors within this many sigma of the median
@@ -90,8 +90,9 @@ class Metric:
 
 
 # Scalar score keys a campaign may optimise. Names with a number carry a ScoreConfig default (halo3: halo_sigma 3,
-# I_2pct: energy window 0.02, acc90: level 0.9, valley_rad20: slit budget 0.2, *_t3: proxy turn 3). Spearman rank
-# correlations are over the campaign's 53 runs of one injected beam (2026-11-01).
+# I_2pct: energy window 0.02, acc90: level 0.9, valley_rad20: slit budget 0.2, *_t3: proxy turn 3, the time-turn
+# [3, 4) revolutions); other settings rename the key (halo_sigma = 2.5 writes halo2.5), so a campaign names its metrics
+# after its own [score]. Spearman rank correlations are over the campaign's 53 runs of one injected beam (2026-11-01).
 METRICS = {
     # objectives
     'I_final': Metric('max', 'mA', "final current: transmission T x the injected current I0 (T: the run's full-beam "

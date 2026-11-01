@@ -18,7 +18,18 @@ when the user stops the driver, and when the driver ends in any other way: on Wi
 the system empties when the driver's last handle to it closes (a hard kill of the driver included); on POSIX in a
 session of its own, signalled as a group (a hard-killed driver cannot signal it: the campaign lock, which the
 evaluation inherits, then keeps a new driver from starting beside it). Nothing an evaluation starts outlives it:
-stragglers are stopped when it ends.
+stragglers are stopped when it ends. The evaluation never sees the driver's console or terminal (Windows: a hidden
+console of its own; POSIX: no controlling terminal): Ctrl+C and Ctrl+Break reach the driver alone, which stops the
+tree and records the evaluation interrupted - a keystroke never ends an evaluation as if its design had failed. While
+the evaluation is being started, those signals are held until it is in its tree (``_signals_held``): one arriving
+after the process exists but before ``Popen`` returns it would leave a process nobody can stop.
+
+The driver waits for an evaluation in short sleeps, never in ``Popen.wait(timeout)``: on Windows (CPython 3.12), a
+Ctrl+C noticed as such a timed wait ends - and a signal is noticed exactly then, when the waiting thread takes the
+interpreter back - makes ``wait`` wait once more for the time left, which is then negative and which
+``WaitForSingleObject`` reads as INFINITE (-1 ms as a DWORD). The driver would sit until the evaluation ended by
+itself, minutes to hours later; a loaded machine, which wakes the waiting thread late, made that the rule. A sleep
+is woken by Ctrl+C at once.
 
 The subprocess inherits the driver's environment, with the source folder of the driver's own PyCentralRegion in
 front of PYTHONPATH (the evaluations run the code the driver runs, whether or not the physics environment has the
@@ -27,6 +38,7 @@ and, when the interpreter belongs to a conda environment, CONDA_PREFIX and the D
 front of PATH (what activation would do: CUDA libraries fail to load without them on Windows).
 """
 import argparse
+import contextlib
 import dataclasses
 import functools
 import json
@@ -34,12 +46,18 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 RESULT = 'result.json'
-POLL_S = 0.25                    # the driver checks for Ctrl+C and the time limit this often while it waits
+POLL_S = 0.25                    # the driver checks the evaluation's end and its time limit this often, after
+                                 # first waits of 10 ms doubling up to it (a short evaluation - the preflight, the
+                                 # toy - ends without a 0.25 s wait); Ctrl+C wakes it at once
 GRACE_S = 5.0                    # POSIX: SIGTERM to SIGKILL
+# the signals that stop the driver (Ctrl+C, SIGTERM, Ctrl+Break, a closed terminal), held while an evaluation starts
+STOP_SIGNALS = tuple(s for s in (getattr(signal, n, None) for n in ('SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP'))
+                     if s is not None)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -158,6 +176,7 @@ class _JobTree:
 
     def __init__(self):
         ctypes, k32, _, ExtendedLimits = _win32()
+        self.joined = False                                              # the evaluation is in the job
         self.job = k32.CreateJobObjectW(None, None)
         if not self.job:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -169,8 +188,10 @@ class _JobTree:
             raise error
 
     def popen_kwargs(self, keep_fds):
-        # a process group of its own: Ctrl+C in the console reaches the driver only, which then stops the tree
-        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | self.CREATE_SUSPENDED}
+        # a hidden console of its own (and a process group of its own): the driver's console events reach the driver
+        # only, which then stops the tree
+        return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+                                 | self.CREATE_SUSPENDED}
 
     def started(self, proc):
         """Put the suspended process into the job, then let it run (ntdll's NtResumeProcess: subprocess keeps no
@@ -181,8 +202,10 @@ class _JobTree:
             raise ctypes.WinError(ctypes.get_last_error())
         try:
             if not k32.AssignProcessToJobObject(self.job, handle):
-                raise OSError(f"could not put the evaluation into a job object ({ctypes.WinError(ctypes.get_last_error())})"
-                              f": the driver runs no evaluation it could not stop with everything it starts")
+                why = ctypes.WinError(ctypes.get_last_error())
+                raise OSError(f"could not put the evaluation into a job object ({why}): the driver runs no "
+                              f"evaluation it could not stop with everything it starts")
+            self.joined = True
             status = ntdll.NtResumeProcess(handle)
             if status:
                 raise OSError(f"could not resume the evaluation process (NTSTATUS {status & 0xffffffff:#010x})")
@@ -190,16 +213,18 @@ class _JobTree:
             k32.CloseHandle(handle)
 
     def stop(self, proc):
-        """End every process of the tree (a finished evaluation's stragglers too) and release the job."""
+        """End every process of the tree (a finished evaluation's stragglers too) and release the job. Closing the job
+        ends what TerminateJobObject might have missed (KILL_ON_JOB_CLOSE); an evaluation that never joined it is still
+        suspended and is killed directly."""
         if self.job:
             _, k32, _, _ = _win32()
             k32.TerminateJobObject(self.job, 1)
             k32.CloseHandle(self.job)
             self.job = None
         if proc is not None:
-            if proc.poll() is None:               # not in the job (started() failed): still suspended
+            if not self.joined:
                 proc.kill()
-            proc.wait()
+            proc.wait()                           # ended: it returns at once
 
 
 class _GroupTree:
@@ -231,6 +256,28 @@ class _GroupTree:
             pass
 
 
+@contextlib.contextmanager
+def _signals_held():
+    """Hold the stop signals while an evaluation is started, then deliver the first that came (to the handler it
+    would have reached: the driver's KeyboardInterrupt, or the default action). Raised inside ``Popen`` after the
+    process exists, a KeyboardInterrupt would lose the process (Windows: suspended outside its job; POSIX: running
+    in its own session). Only the main thread can set signal handlers: elsewhere nothing is held. Ctrl+C's handler
+    is put back last, so a second Ctrl+C while the others are put back is held and delivered too."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    caught, previous = [], {}
+    try:
+        for s in STOP_SIGNALS:
+            previous[s] = signal.signal(s, lambda signum, frame: caught.append(signum))
+        yield
+    finally:
+        for s, handler in reversed(previous.items()):
+            signal.signal(s, signal.SIG_DFL if handler is None else handler)
+        if caught:
+            signal.raise_signal(caught[0])
+
+
 @dataclasses.dataclass
 class Outcome:
     returncode: int = None
@@ -251,19 +298,19 @@ def run(cmd, eval_dir, timeout_s=0.0, env=None, on_start=None, keep_fds=()):
     t0 = time.monotonic()
     with open(eval_dir / 'stdout.log', 'w') as fo, open(eval_dir / 'stderr.log', 'w') as fe:
         try:
-            proc = subprocess.Popen(cmd, stdout=fo, stderr=fe, stdin=subprocess.DEVNULL, env=env,
-                                    **tree.popen_kwargs(keep_fds))
-            tree.started(proc)
+            with _signals_held():                 # a stop arriving now is delivered once the process is in its tree
+                proc = subprocess.Popen(cmd, stdout=fo, stderr=fe, stdin=subprocess.DEVNULL, env=env,
+                                        **tree.popen_kwargs(keep_fds))
+                tree.started(proc)
             if on_start is not None:
                 on_start(proc.pid)
-            while True:                           # short waits: a blocking one would not see Ctrl+C on Windows
-                try:
-                    proc.wait(timeout=POLL_S)
+            delay = 0.01
+            while proc.poll() is None:            # sleeps, not proc.wait(timeout): see the module docstring
+                if timeout_s and time.monotonic() - t0 >= timeout_s:
+                    out.timed_out = True
                     break
-                except subprocess.TimeoutExpired:
-                    if timeout_s and time.monotonic() - t0 >= timeout_s:
-                        out.timed_out = True
-                        break
+                time.sleep(delay)
+                delay = min(2.0 * delay, POLL_S)
         except KeyboardInterrupt:
             out.interrupted = True
         finally:

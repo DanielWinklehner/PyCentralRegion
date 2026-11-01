@@ -44,8 +44,9 @@ phases_deg = [-15.0]
 - Overrides: `--set section.key=value`, the value read as TOML (`--set track.phases_deg=[-15.0]`,
   `--set track.sc=false`), else as a string. An integer part indexes an array of tables:
   `--set geometry.windows.1.half_height_mm=11.5` changes the second window. An override cannot create an array item.
-- `pcr show run.toml [--set ...]` prints the configuration exactly as the stages see it. Every stage also writes it
-  next to its output (`config.json`).
+- `pcr show run.toml [--set ...]` prints the configuration exactly as the stages see it. `pcr track` writes it next
+  to its output (`run.out_dir/config.json`), `pcr build` the sections it used into `<prefix>_build.json`, and
+  `pcr evaluate` into `result.json`.
 - Paths: everything in `[paths]`, and any key ending in `_path`, `_dir` or `_file` (also inside arrays of tables), is
   resolved relative to the file that sets it. `""` means "not given".
 - No stage reads an environment variable.
@@ -57,14 +58,17 @@ whose cached model and fields are on disk).
 
 | command | reads | writes | notes |
 |---|---|---|---|
-| `pcr build` | `[geometry]`, `[machine]`, `paths.seed`, `paths.housing_*` | `paths.model3d` | OCC solids, mesh, electrode potentials (`geometry.build`) |
-| `pcr fields` | `paths.model3d`, `[fields]` | `paths.fields` | 3D BEM solve, E-field grid, metal raster |
-| `pcr track` | `paths.fields`, `paths.bfield_3d`, `paths.handoff`, `[track]`, `[slit]`, `[btrim]`, `[inflector]` | `run.out_dir` | reference, phase scan, final run |
-| `pcr score` | `run.out_dir`, `[score]` | `run.out_dir/score.json` | metrics and objectives (`analysis`) |
+| `pcr build` | `[geometry]`, `[machine]`, `[inflector]`, `paths.seed`, `paths.housing_outline`, the emitting-plane hand-off (`geometry.emitting_plane_file`, else the export's own beside the outline, else `paths.handoff`), `exit_plane_spec.json` (for `si_rotation = "corner"` or `gap0_on_plate`) | `paths.model3d`, and beside it `<prefix>.msh`, `<prefix>.step`, `<prefix>_build.json`, `<prefix>_dees.png` | OCC solids, mesh, electrode potentials (`geometry.build`); the `.step` is the CAD: 5 solids (dee0..dee3, the ground with the spiral-inflector housing fused in), mm, machine frame |
+| `pcr fields` | `paths.model3d`, `paths.seed`, `[fields]`, `[machine]` | `paths.fields` | 3D BEM solve, E-field grid, metal raster |
+| `pcr track` | `paths.fields`, `paths.seed`, `paths.bfield_3d`, `paths.handoff`, `paths.inflector_efield`, `paths.housing_step`, `[run]`, `[machine]`, `[magnet]`, `[btrim]`, `[inflector]`, `[fields]`, `[track]`, `[slit]` | `run.out_dir`: `track.json`, `track_data.pkl`, `config.json`, `probe_<a>deg.npz` | reference, phase scan, final run |
+| `pcr score` | `run.out_dir` (its `config.json` gives the `[machine]` the run was tracked with), `[score]` | `run.out_dir/score.json` | metrics and objectives (`analysis`); a run with fewer than `score.min_tracks` tracks or `score.min_survivors` survivors scores `{"tag", "skip"}` |
 | `pcr evaluate --config run.toml --out DIR` | all of the above | `DIR/result.json` | the chain; a failure is written to result.json, exit code 1 |
 
-Reuse rule: a stage whose output exists says so and returns it. To recompute, point the path elsewhere. Outputs are
-written through a `.part` file and renamed, so a killed run never leaves a truncated file to be reused.
+Reuse rule: a stage whose output exists says so and returns it. To recompute, point the path elsewhere. The outputs
+a stage is judged done by are written under a temporary name and renamed: `<file>.part` for the field cache,
+track.json and track_data.pkl, `<stem>.part<suffix>` for the build's (the model last), `<file>.tmp` for score.json and
+result.json. A killed run never leaves a truncated file to be reused. A `pcr build` that fails removes its temporary
+files; the bounds it can check before the layout (the channel heights) are checked before anything is written.
 
 ### fields
 
@@ -110,8 +114,8 @@ the probes. It needs:
 - plain gridded fields;
 - at most two nearest-node obstacle rasters: the model's (with any extra posts and boxes painted in) and the slit's.
 
-When a run cannot use it, the result's `fast_path` record says why, and the run goes the Python path: same answer,
-far slower.
+Every run record of track.json carries `fast_path`: whether the compiled kernel ran and, if not, why. A run that
+cannot use it goes the Python path: same answer, far slower.
 
 Outputs in `run.out_dir`:
 - `track.json`: summary, per-turn statistics of every run, the reference particle, the inputs;
@@ -135,17 +139,30 @@ new field:
     `pass_index = -1` the centre is `slit.r_center_mm`.
   - The jaws are a 0.1 mm raster of their own, so the edges are good to 0.1 mm, and the compiled kernel carries it as
     its second raster.
-  - Refused: a jaw thinner than one tracking step at its radius (2π r / `track.steps_per_turn`) plus the raster
-    diagonal, because particles could step over it.
+  - Refused: a jaw thinner than one tracking step at the outer jaw's outer edge (2π r / `track.steps_per_turn`,
+    r = r_c + hw + L) plus the raster diagonal (√2 × 0.1 mm), because particles could step over it; and an inner jaw
+    that reaches the machine axis.
   - A warning when the reference particle crosses a jaw on any pass.
   - Every run record gets `slit`: placement, jaws, raster columns, `n_lost` on the jaws, and the reference passes on
     a jaw.
 
 ### Validation of the port
 
+Every record is in `E:\HCHC1.5\Results\CR\pcr_validation\`.
+
+`pcr build` replaces the design deck's electrode builder. The worked example's `design_wnop3_rotn3_g0ap.toml` builds
+the deck's 2026-10-31 model bit for bit (`geometry\`): the same vertices, triangles and potentials (20,974 nodes,
+41,936 triangles), a byte-identical `.msh`, and a `.step` that differs only in its header's time stamp. The build takes
+17-18 s. This needs the deck's gap-width floor 6.5 * 1e-3 = 0.006500000000000001 m, which the example's
+`machine.toml` sets; 0.0065 gives the same metal with 8 more ground triangles.
+
+`pcr score` replaces the run scoring of 2026-11-01 (`analysis\`): on the every-particle run of the design (`p128`),
+T, I_final (4.0239 mA), valley_all, ratio, E_med, dE_E_robust, turn_sigR, W_eff and ratio_t3 equal the original
+scores exactly; the halo and vortex-prediction keys differ by at most 1.5e-4 relative, because the port uses the
+exact core-variance factor (0.842330 for `score.core_q` = 0.95) where the campaign used 0.8423.
+
 `pcr track` replaces the design deck's 3D tracking script. On the deck's cached `_wnop3_rotn3_g0ap` fields at -15 deg
-it reproduces the deck particle for particle (records and scripts in
-`E:\HCHC1.5\Results\CR\pcr_validation\track`):
+it reproduces the deck particle for particle (records and scripts in `track\`):
 
 | run | agreement | T, final current |
 |---|---|---|
