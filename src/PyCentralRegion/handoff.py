@@ -119,8 +119,12 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
             raise ValueError(f"{d.get('path')}: the file names no species (pypatools_species_name): pass species=")
         species = IonSpecies(str(meta['pypatools_species_name']))
     m_mev = meta.get('species_mass_mev')
+    m_species = getattr(species, 'mass_mev', None)          # PyPATools gives MeV / c^2 too
+    if m_mev is not None and m_species is not None and abs(float(m_species) / float(m_mev) - 1.0) > 1e-3:
+        raise ValueError(f"{d.get('path')}: the file's species has {float(m_mev):.3f} MeV, the tracked species "
+                         f"{float(m_species):.3f} MeV: a hand-off of another species")
     if m_mev is None:
-        m_mev = getattr(species, 'mass_mev', None)          # PyPATools gives MeV / c^2 too
+        m_mev = m_species
     if m_mev is None:
         raise ValueError("species mass unknown: the file has no species_mass_mev and the species no mass_mev")
     m_ev = 1e6 * float(m_mev)

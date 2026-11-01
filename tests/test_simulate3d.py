@@ -1,5 +1,6 @@
 """simulate3d: the radial slit (its jaw raster, its place on the fast path, the placement rules, the pass numbering it
-is placed by) and the inflector-rotation guard. No field cache needed: synthetic rasters and a stub tracker."""
+is placed by), the inflector-rotation guard and the hand-off bunch's species mass. No field cache needed: synthetic
+rasters, a stub tracker and a synthetic hand-off."""
 import types
 
 import numpy as np
@@ -107,3 +108,30 @@ def test_si_rotation_guard():
     S.check_si_rotation(types.SimpleNamespace(params={}), 7.0)        # a model that does not record it
     with pytest.raises(C.ConfigError, match='turned by 4.726'):
         S.check_si_rotation(model, 0.0, 'fields.pkl')
+
+
+def _handoff(meta):
+    """A load_handoff dict: three 62 keV protons (p = 10.787 MeV/c) on a plane, with the given file attributes."""
+    p = np.sqrt(0.062 ** 2 + 2 * 0.062 * 938.272) * 1e6
+    return {'r': np.zeros((3, 3)), 'p_ev_c': np.array([[p, 0.0, 0.0], [0.0, p, 0.0], [0.0, 0.0, p]]),
+            'time': None, 'weight': None, 'meta': meta, 'path': 'synthetic.h5'}
+
+
+def test_handoff_species_mass():
+    """The hand-off's mass: the file's species_mass_mev, else the species' (MeV, like the file's); a species of
+    another mass, or no species at all, is refused."""
+    from PyCentralRegion.handoff import make_beam_from_handoff
+    from PyPATools.species import IonSpecies
+    proton = IonSpecies('proton')
+
+    def speed(meta, **kw):                     # the centroid reference: the particles' mean speed
+        pd = make_beam_from_handoff(_handoff(meta), reference='centroid', verbose=False, **kw)
+        return np.linalg.norm(pd.reference_state[1])
+
+    v_62kev = np.sqrt(1.0 - 1.0 / (1.0 + 0.062 / 938.272) ** 2) * 2.99792458e8
+    assert speed({'species_mass_mev': 938.272}, species=proton) == pytest.approx(v_62kev, rel=1e-6)
+    assert speed({}, species=proton) == pytest.approx(v_62kev, rel=1e-6)
+    with pytest.raises(ValueError, match='another species'):
+        speed({'species_mass_mev': 1877.268}, species=proton)
+    with pytest.raises(ValueError, match='names no species'):
+        speed({})
