@@ -1,4 +1,4 @@
-# Defaults of the core pipeline sections: [run], [paths], [machine], [magnet], [inflector], [fields], [track].
+# Defaults of the core pipeline sections: [run], [paths], [machine], [magnet], [inflector], [fields], [track], [slit].
 # A run file includes what it needs and sets only what differs, e.g.
 #     include = ["../../defaults/core.toml"]
 #     [run]
@@ -103,3 +103,14 @@ snapshot_ns = [10.0, 20.0, 30.0, 40.0]   # times [ns] of full-beam snapshots (fi
 obstacles = "raster"        # metal test: "raster" (the cached slices) | "mesh" (the model's triangles)
 extra_posts_mm = []         # full-height grounded posts [[x, y, r], ...] mm; obstacle test only, the field is unchanged
 extra_boxes_mm = []         # full-height grounded boxes [[xmin, xmax, ymin, ymax], ...] mm; obstacle test only
+
+[slit]                      # a two-sided radial slit: two thin full-height jaws on one ray (obstacle only, no field;
+                            # exact for jaws mounted inside a dee, away from its gaps). Cheap to optimise: no new BEM.
+half_width_mm = 0.0         # half the opening between the jaws; 0 = no slit
+azimuth_deg = 315.0         # the ray the jaws sit on
+pass_index = 3              # centre = the reference particle's radius at its crossing number pass_index of that ray
+                            # (the probes' pass numbering), or r_center_mm with pass_index = -1 ...
+offset_mm = 0.0             # ... plus offset_mm
+r_center_mm = 0.0           # the slit centre when pass_index = -1
+jaw_length_mm = 6.0         # radial length of each jaw (keep it below the gap to the neighbouring turns)
+thickness_mm = 2.0          # azimuthal thickness of each jaw: more than a tracking step there (2 pi r / steps_per_turn)

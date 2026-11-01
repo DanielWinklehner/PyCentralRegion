@@ -8,7 +8,8 @@ track    paths.fields + the 3D magnet map + the spiral-inflector bunch -> refere
 The BEM field is the whole accelerating field: every dee at the model's potential times ``track.volt_scale``,
 modulated in time with the RF of the dee system and the bunch phase of the run; no RF-cavity map is blended in. The
 metal test is the model's stacked-slice raster (or its triangle mesh with ``track.obstacles = 'mesh'``), plus the
-optional full-height posts and boxes of [track] (obstacle test only: the cached field is unchanged).
+optional full-height posts and boxes of [track] and the radial slit of [slit] (obstacle tests only: the cached field is
+unchanged). The slit is a raster of its own, finer than the model's, so the fast path carries it as its second one.
 
 The field cache and the outputs keep the layout of the design deck this package grew out of (its
 ``bunch_fields3d<tag>.pkl`` and ``bunch_simulation3d<tag>.json`` / ``_data.pkl``), so a deck cache can be tracked here
@@ -27,6 +28,7 @@ from .machine import (check_supported, load_seed, magnet_field_3d, make_design, 
                       seed_orbit)
 
 TRACK_IDS_SEED = 12345        # sampling seed of the particles whose paths are kept
+SLIT_H_M = 1e-4               # node spacing of the slit raster [m]
 
 
 def kinetic_energy_mev(v, mass_mev):
@@ -170,6 +172,25 @@ def add_columns(grid, xs, tc, info):
     return grid
 
 
+def slit_raster(sl, r_center_m, z_half_m, h=SLIT_H_M):
+    """The jaws of the [slit] ``sl`` centred at radius ``r_center_m``: a nearest-node raster of spacing ``h`` over their
+    bounding box (``fields3d.Raster3D``), full height (z nodes -z_half_m, 0, +z_half_m). Along the ray (u) the jaws span
+    [r_c - hw - L, r_c - hw] and [r_c + hw, r_c + hw + L], across it (w) |w| <= thickness / 2. Returns (test, jaws [m])."""
+    from .fields3d import Raster3D
+    rc, hw, length, t = (float(r_center_m), sl.half_width_mm * 1e-3, sl.jaw_length_mm * 1e-3, sl.thickness_mm * 1e-3)
+    jaws = ((rc - hw - length, rc - hw), (rc + hw, rc + hw + length))
+    phi = np.deg2rad(sl.azimuth_deg)
+    eu, ew = np.array([np.cos(phi), np.sin(phi)]), np.array([-np.sin(phi), np.cos(phi)])
+    corners = np.array([u * eu + w * ew for u in (jaws[0][0], jaws[1][1]) for w in (-0.5 * t, 0.5 * t)])
+    lo, hi = corners.min(axis=0) - 2 * h, corners.max(axis=0) + 2 * h
+    xs, ys = (np.arange(lo[k], hi[k] + 0.5 * h, h) for k in (0, 1))
+    u = xs[:, None] * eu[0] + ys[None, :] * eu[1]
+    w = xs[:, None] * ew[0] + ys[None, :] * ew[1]
+    cols = (np.abs(w) <= 0.5 * t) & (((u >= jaws[0][0]) & (u <= jaws[0][1])) | ((u >= jaws[1][0]) & (u <= jaws[1][1])))
+    zs = np.array([-z_half_m, 0.0, z_half_m])
+    return Raster3D(np.repeat(cols[:, :, None], len(zs), axis=2), (xs, ys, zs), name='slit'), jaws
+
+
 def load_fields(path, tc, fc):
     """The field cache of ``fields_stage`` (or of the design deck): {'bem3d': Field, 'stack': metal test,
     'model3d', 'info'}. The metal test is the run's choice (``track.obstacles``), not the cache's."""
@@ -194,6 +215,16 @@ def load_fields(path, tc, fc):
     else:
         raise ConfigError(f"track.obstacles = {tc.obstacles!r}: 'raster' or 'mesh'")
     return {'bem3d': field_from_arrays(d['bem3d']), 'stack': stack, 'model3d': d['model3d'], 'info': info}
+
+
+def check_si_rotation(model3d, rotation_deg, where=''):
+    """The inflector of a run must sit where its electrode model was built around it: a model that records the turn
+    (params['si_rotation_deg'], written by geometry.build) is checked against inflector.rotation_deg; models without
+    it (the design deck's) are not."""
+    built = model3d.params.get('si_rotation_deg')
+    if built is not None and abs(float(built) - float(rotation_deg)) > 1e-6:
+        raise ConfigError(f"inflector.rotation_deg = {rotation_deg:g}, but the electrode model {where} was built around "
+                          f"the inflector turned by {float(built):g} deg: track with that value or rebuild")
 
 
 def install(finder, fields, cav0, volt_scale):
@@ -271,9 +302,17 @@ class BunchTracker:
         finder.fast3d_interp = tc.fast3d_interp
         self.finder = finder
         self.mass_mev = float(self.design.species.mass_mev)
-        self.ref_beam, self.handoff_meta = reference_beam(self.design.species, self.pc.handoff,
-                                                          section(cfg, 'inflector').rotation_deg)
+        rot = section(cfg, 'inflector').rotation_deg
+        self.ref_beam, self.handoff_meta = reference_beam(self.design.species, self.pc.handoff, rot)
         self.fields = load_fields(self.pc.fields, tc, section(cfg, 'fields'))
+        check_si_rotation(self.fields['model3d'], rot, self.pc.fields)
+        self.slit = section(cfg, 'slit')
+        sl = self.slit
+        if sl.half_width_mm < 0 or (sl.half_width_mm > 0 and not (sl.jaw_length_mm > 0 and sl.thickness_mm > 0)):
+            raise ConfigError("[slit] needs half_width_mm >= 0 (0 = no slit), jaw_length_mm > 0 and thickness_mm > 0")
+        if sl.half_width_mm > 0 and not (sl.pass_index >= 0 or (sl.pass_index == -1 and sl.r_center_mm > 0)):
+            raise ConfigError("[slit] needs pass_index >= 0, or pass_index = -1 with r_center_mm > 0")
+        self.slit_passes = {}        # phase -> {pass: radius [m]} of the reference particle on the slit ray
         install(finder, self.fields, self.design.rf_cavities[0], tc.volt_scale)
         self.info = {'bfield_check': bcheck}
         self.info.update(self.fields['info'])
@@ -289,19 +328,70 @@ class BunchTracker:
                 or [round(self.phase0 - 10.0), round(self.phase0), round(self.phase0 + 10.0)])
 
     def reference(self, phases):
-        """The design particle tracked at each phase: {phase: energies per turn, n_turns, orbit, max |z|, ...}."""
+        """The design particle tracked at each phase: {phase: energies per turn, n_turns, orbit, max |z|, ...}. With a
+        slit, also its crossings of the slit ray (``slit_passes``), which place the slit of the runs at that phase."""
+        from .accelerated_orbit_finder import ProbeRecorder
+        sl = self.slit
         ref = {}
         for ph in phases:
             t1 = time.time()
-            r = self.finder.track_once(self.ref_beam, bunch_phase_deg=ph, rf_freq_mhz=self.f_mhz,
-                                       max_turns=self.tc.turns)
+            probe = ProbeRecorder([sl.azimuth_deg]) if sl.half_width_mm > 0 else None
+            self.finder.probes = probe
+            try:
+                r = self.finder.track_once(self.ref_beam, bunch_phase_deg=ph, rf_freq_mhz=self.f_mhz,
+                                           max_turns=self.tc.turns)
+            finally:
+                self.finder.probes = None
             tr = np.asarray(r.trajectory_reference)
             ref[ph] = {'energies': [float(t.mean_energy_mev) for t in r.turn_statistics], 'n_turns': int(r.n_turns),
                        'traj': tr, 'max_abs_z_mm': float(np.abs(tr[:, 2]).max() * 1e3) if len(tr) else 0.0,
                        'obstacles': r.metadata.get('obstacles'), 'time_s': time.time() - t1}
+            if probe is not None:
+                d = probe.data()[0]
+                fwd = d['direction'] > 0
+                radii = np.hypot(d['xyz'][fwd, 0], d['xyz'][fwd, 1])
+                self.slit_passes[ph] = {int(p): float(v) for p, v in zip(d['pass'][fwd], radii)}
+                ref[ph]['slit_passes_mm'] = {str(p): v * 1e3 for p, v in self.slit_passes[ph].items()}
             say(f"[ref] phase {ph:+.1f}: {r.n_turns} turns, {r.final_energy_mev:.3f} MeV, "
                 f"|z| max {ref[ph]['max_abs_z_mm']:.2f} mm ({ref[ph]['time_s']:.0f} s)")
         return ref
+
+    def slit_for(self, ph):
+        """The [slit] of a run at phase ``ph`` as (obstacle test, record), or (None, None) without one. Its centre is
+        the reference particle's radius at crossing number slit.pass_index of the slit ray (``reference`` records them)
+        or slit.r_center_mm, plus slit.offset_mm. A jaw thinner than a tracking step plus the raster diagonal could be
+        stepped over, so that is refused."""
+        sl = self.slit
+        if sl.half_width_mm <= 0:
+            return None, None
+        passes = self.slit_passes.get(ph)
+        if passes is None and sl.pass_index >= 0:
+            raise RuntimeError(f"slit: no reference run at phase {ph:+.1f} deg (call reference() first)")
+        passes = passes or {}
+        if sl.pass_index >= 0 and sl.pass_index not in passes:
+            raise ConfigError(f"slit.pass_index = {sl.pass_index}: the reference particle at phase {ph:+.1f} deg crosses "
+                              f"azimuth {sl.azimuth_deg:g} deg on passes {sorted(passes)} only")
+        rc = (passes[sl.pass_index] if sl.pass_index >= 0 else sl.r_center_mm * 1e-3) + sl.offset_mm * 1e-3
+        test, jaws = slit_raster(sl, rc, self.mc.z_max_m)
+        if jaws[0][0] <= 0.0:
+            raise ConfigError(f"[slit]: the inner jaw reaches the machine axis (centre {rc * 1e3:.2f} mm)")
+        step = 2.0 * np.pi * jaws[1][1] / self.tc.steps_per_turn
+        if sl.thickness_mm * 1e-3 < step + np.sqrt(2.0) * SLIT_H_M:
+            raise ConfigError(f"slit.thickness_mm = {sl.thickness_mm:g} is less than a tracking step at the outer jaw "
+                              f"({step * 1e3:.2f} mm = 2 pi r / track.steps_per_turn) plus the raster diagonal "
+                              f"({np.sqrt(2.0) * SLIT_H_M * 1e3:.2f} mm): particles could step over a jaw")
+        on_jaw = {p: r * 1e3 for p, r in sorted(passes.items()) if any(a <= r <= b for a, b in jaws)}
+        rec = {'azimuth_deg': sl.azimuth_deg, 'pass_index': sl.pass_index, 'offset_mm': sl.offset_mm,
+               'r_center_mm': rc * 1e3, 'half_width_mm': sl.half_width_mm, 'jaw_length_mm': sl.jaw_length_mm,
+               'thickness_mm': sl.thickness_mm, 'jaws_mm': [[a * 1e3, b * 1e3] for a, b in jaws],
+               'raster_h_mm': SLIT_H_M * 1e3, 'columns': int(test.grid[:, :, 0].sum()),
+               'reference_on_jaw_mm': {str(p): v for p, v in on_jaw.items()}}
+        say(f"[slit] azimuth {sl.azimuth_deg:g} deg, centre {rc * 1e3:.2f} mm, opening {2 * sl.half_width_mm:g} mm, jaws "
+            + ', '.join(f"{a * 1e3:.2f}..{b * 1e3:.2f}" for a, b in jaws) + f" mm, {rec['columns']} raster columns")
+        if on_jaw:
+            say(f"[slit] WARNING: the reference particle crosses a jaw on pass(es) "
+                + ', '.join(f"{p} (r {v:.2f} mm)" for p, v in on_jaw.items()))
+        return test, rec
 
     def run_bunch(self, ph, n, full, seed_rng, cells, every, out_dir=None):
         """Track ``n`` hand-off particles (0 = all; sampled with ``seed_rng``) at phase ``ph`` with space charge on a
@@ -313,25 +403,30 @@ class BunchTracker:
         bunch = self.inflector.beam(n_particles=(int(n) or None), seed=seed_rng)
         r0 = np.column_stack([np.asarray(bunch.x, dtype=float), np.asarray(bunch.y, dtype=float),
                               np.asarray(bunch.z, dtype=float)])
-        n_start_metal = int(np.count_nonzero(np.asarray(finder.obstacle_mask(r0), dtype=bool)))
-        if n_start_metal:
-            say(f"[metal] {n_start_metal} of {bunch.numpart} particles start INSIDE metal (lost at turn 0)")
-        sc_kick, i_ma = None, 0.0
-        if tc.sc:
-            i_ma = (tc.sc_current_ma if tc.sc_current_ma > 0
-                    else 1e3 * float(bunch.macro_charge_c) * bunch.numpart * self.f_rf)
-            sc_kick = space_charge_kick(tc, cells, every, i_ma, self.f_rf)
-            grid = f"{cells}^3 nodes" if cells else f"h = {tc.sc_h_m * 1e3:.2f} mm"
-            say(f"[sc] FFT solver ({'GPU' if tc.sc_gpu else 'CPU'}) {grid} ({tc.sc_frame} frame), every {every} steps, "
-                f"{i_ma:.3f} mA")
-        finder.space_charge = sc_kick
-        track_ids = None
-        if full and tc.n_tracks > 0:
-            track_ids = np.sort(np.random.default_rng(TRACK_IDS_SEED).choice(
-                bunch.numpart, size=min(tc.n_tracks, bunch.numpart), replace=False))
-        probe = ProbeRecorder(list(tc.probes_deg)) if (full and tc.probes_deg) else None
-        finder.probes = probe
+        slit, slit_rec = self.slit_for(ph)
+        metal = finder.obstacle_mask
+        if slit is not None:
+            from .electrodes3d import combine_obstacles
+            finder.obstacle_mask = combine_obstacles(metal, slit)
         try:
+            n_start_metal = int(np.count_nonzero(np.asarray(finder.obstacle_mask(r0), dtype=bool)))
+            if n_start_metal:
+                say(f"[metal] {n_start_metal} of {bunch.numpart} particles start INSIDE metal (lost at turn 0)")
+            sc_kick, i_ma = None, 0.0
+            if tc.sc:
+                i_ma = (tc.sc_current_ma if tc.sc_current_ma > 0
+                        else 1e3 * float(bunch.macro_charge_c) * bunch.numpart * self.f_rf)
+                sc_kick = space_charge_kick(tc, cells, every, i_ma, self.f_rf)
+                grid = f"{cells}^3 nodes" if cells else f"h = {tc.sc_h_m * 1e3:.2f} mm"
+                say(f"[sc] FFT solver ({'GPU' if tc.sc_gpu else 'CPU'}) {grid} ({tc.sc_frame} frame), every {every} "
+                    f"steps, {i_ma:.3f} mA")
+            finder.space_charge = sc_kick
+            track_ids = None
+            if full and tc.n_tracks > 0:
+                track_ids = np.sort(np.random.default_rng(TRACK_IDS_SEED).choice(
+                    bunch.numpart, size=min(tc.n_tracks, bunch.numpart), replace=False))
+            probe = ProbeRecorder(list(tc.probes_deg)) if (full and tc.probes_deg) else None
+            finder.probes = probe
             res = finder.track_once(bunch, bunch_phase_deg=ph, rf_freq_mhz=self.f_mhz, max_turns=tc.turns,
                                     save_full_beam=False,
                                     save_times_s=[t * 1e-9 for t in tc.snapshot_ns] if full else None,
@@ -339,9 +434,14 @@ class BunchTracker:
         finally:
             finder.probes = None
             finder.space_charge = None
+            finder.obstacle_mask = metal
         term = finder._obstacle_terminator
         hits = np.array(term.hits, dtype=float).reshape(-1, 4) if term is not None and term.hits else np.zeros((0, 4))
         hits_z = np.array(getattr(term, 'hits_z', []), dtype=float) if term is not None else np.zeros(0)
+        if slit is not None:
+            on_slit = slit(np.column_stack([hits[:, 2], hits[:, 3], hits_z])) if len(hits) else np.zeros(0, bool)
+            slit_rec['n_lost'] = int(np.count_nonzero(on_slit))
+            slit_rec['n_start_inside'] = int(np.count_nonzero(slit(r0)))
         ts = res.turn_statistics
         alive = [int(t.n_active) for t in ts]
         out = {'phase': ph, 'n': int(bunch.numpart), 'n_turns': int(res.n_turns), 'sc': sc_kick is not None,
@@ -358,6 +458,8 @@ class BunchTracker:
                'space_charge': res.metadata.get('space_charge')}
         if out['space_charge'] is not None:
             out['space_charge'] = {k: v for k, v in out['space_charge'].items() if k != 'log'}
+        if slit_rec is not None:
+            out['slit'] = slit_rec
         survived = None
         fb = res.metadata.get('full_beam') if full else None
         if fb is not None:
@@ -367,7 +469,8 @@ class BunchTracker:
             self._write_probes(probe, out_dir, ph, bunch.numpart, survived, sc_kick is not None)
         say(f"[bunch] phase {ph:+.1f}: {out['n']} particles, alive per turn {alive}, T {100 * out['transmission']:.2f} %, "
             f"E {(out['e_mean'] or [0])[-1]:.3f} +- {(out['e_std'] or [0])[-1]:.3f} MeV, z rms "
-            f"{(out['std_z'] or [0])[-1] * 1e3:.2f} mm, lost on metal {out['n_lost_metal']} ({out['time_s']:.0f} s)")
+            f"{(out['std_z'] or [0])[-1] * 1e3:.2f} mm, lost on metal {out['n_lost_metal']}"
+            + (f" (on the slit {slit_rec['n_lost']})" if slit_rec is not None else '') + f" ({out['time_s']:.0f} s)")
         return out
 
     def _full_record(self, out, fb, res, bunch, hits, track_ids):

@@ -36,6 +36,7 @@ SECTIONS = {
     'geometry': 'PyCentralRegion.geometry.options:GeometryConfig',
     'fields': 'PyCentralRegion.config:FieldsConfig',
     'track': 'PyCentralRegion.config:TrackConfig',
+    'slit': 'PyCentralRegion.config:SlitConfig',
     'btrim': 'PyCentralRegion.btrim:BTrimConfig',
     'score': 'PyCentralRegion.analysis.objectives:ScoreConfig',
     'mobo': 'PyCentralRegion.mobo.space:MoboConfig',
@@ -81,6 +82,9 @@ def _resolve_paths(node, folder, in_paths):
     for key, value in node.items():
         if isinstance(value, dict):
             _resolve_paths(value, folder, in_paths=in_paths or key == 'paths')
+        elif isinstance(value, list) and value and all(isinstance(v, dict) for v in value):     # array of tables
+            for v in value:
+                _resolve_paths(v, folder, in_paths=in_paths)
         elif isinstance(value, str) and value and (in_paths or key.endswith(PATH_SUFFIXES)):
             p = Path(value)
             node[key] = str(p if p.is_absolute() else (folder / p).resolve())
@@ -112,23 +116,48 @@ def parse_override(item):
     return keys, value
 
 
+def _split(keys):
+    return keys.split('.') if isinstance(keys, str) else [str(k) for k in keys]
+
+
 def get_dotted(cfg, keys, default=None):
+    """``cfg['a']['b']`` for ``'a.b'``; a part that is an integer indexes an array (of tables), so
+    ``'geometry.windows.0.half_height_mm'`` is the first window's half height. ``default`` when the path is absent."""
     node = cfg
-    for k in (keys.split('.') if isinstance(keys, str) else keys):
-        if not isinstance(node, dict) or k not in node:
+    for k in _split(keys):
+        if isinstance(node, dict) and k in node:
+            node = node[k]
+        elif isinstance(node, list) and k.isdigit() and int(k) < len(node):
+            node = node[int(k)]
+        else:
             return default
-        node = node[k]
     return node
 
 
 def set_dotted(cfg, keys, value):
-    keys = keys.split('.') if isinstance(keys, str) else list(keys)
+    """Set ``cfg['a']['b']`` for ``'a.b'``, creating missing tables. An integer part indexes an array element that
+    the config already has (an override can change one item of an array of tables, not create one)."""
+    keys = _split(keys)
+    where = '.'.join(keys)
     node = cfg
-    for k in keys[:-1]:
-        node = node.setdefault(k, {})
-        if not isinstance(node, dict):
-            raise ConfigError(f"cannot set {'.'.join(keys)}: {k} is not a table")
-    node[keys[-1]] = value
+    for i, k in enumerate(keys):
+        last = i == len(keys) - 1
+        if isinstance(node, list):
+            if not (k.isdigit() and int(k) < len(node)):
+                raise ConfigError(f"cannot set {where}: {k!r} is not an index of an array of {len(node)} items")
+            if last:
+                node[int(k)] = value
+                return
+            node = node[int(k)]
+        elif isinstance(node, dict):
+            if last:
+                node[k] = value
+                return
+            if k not in node and keys[i + 1].isdigit():
+                raise ConfigError(f"cannot set {where}: there is no array {k!r} to index (set the whole array)")
+            node = node.setdefault(k, {})
+        else:
+            raise ConfigError(f"cannot set {where}: {keys[i - 1]!r} is not a table or an array")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -322,3 +351,21 @@ class TrackConfig:
     obstacles: str = 'raster'        # metal test: 'raster' (the cached slices) | 'mesh' (the model's triangles)
     extra_posts_mm: tuple = ()       # full-height grounded posts [[x, y, r], ...] mm, obstacle test only
     extra_boxes_mm: tuple = ()       # full-height grounded boxes [[xmin, xmax, ymin, ymax], ...] mm, obstacle test only
+
+
+@dataclasses.dataclass
+class SlitConfig:
+    """A two-sided radial slit: two thin full-height jaws on the ray at ``azimuth_deg`` that pass the particles with
+    ``|r - r_c| < half_width_mm`` there and stop those that hit a jaw. An obstacle only (the jaws add no field): exact
+    for jaws mounted inside a dee, away from its gaps, where the field is zero. The centre ``r_c`` follows the design:
+    the reference particle's radius at its crossing number ``pass_index`` of the ray (the probes' pass numbering, from
+    the reference run at the bunch's phase), or ``r_center_mm`` with ``pass_index = -1``, plus ``offset_mm``. The jaws
+    must stay clear of the neighbouring turns (``jaw_length_mm`` < the turn gap: the tracker warns when the reference
+    crosses a jaw on another pass) and be thicker than a tracking step there (checked)."""
+    half_width_mm: float = 0.0       # half the opening between the jaws; 0 = no slit
+    azimuth_deg: float = 315.0       # the ray the jaws sit on
+    pass_index: int = 3              # centred on the reference particle's crossing number pass_index; -1 = r_center_mm
+    offset_mm: float = 0.0           # added to the centre
+    r_center_mm: float = 0.0         # the slit centre when pass_index = -1
+    jaw_length_mm: float = 6.0       # radial length of each jaw
+    thickness_mm: float = 2.0        # azimuthal thickness of each jaw

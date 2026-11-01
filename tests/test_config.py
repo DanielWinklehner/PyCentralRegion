@@ -44,6 +44,19 @@ def test_int_to_float_and_include_loop(tmp_path):
         C.load(tmp_path / 'a.toml')
 
 
+def test_array_index_overrides_and_paths(tmp_path):
+    """An integer part of a dotted key indexes an array of tables; *_file keys inside such arrays are resolved."""
+    _write(tmp_path / 'r.toml', '[g]\nwindows = [{gap = 1, half_mm = 10.0, spec_file = "w1.json"}, {gap = 3, half_mm = 12.3}]\n')
+    cfg = C.load(tmp_path / 'r.toml', overrides=['g.windows.1.half_mm=11.5'])
+    assert cfg['g']['windows'][1]['half_mm'] == 11.5 and cfg['g']['windows'][0]['half_mm'] == 10.0
+    assert C.get_dotted(cfg, 'g.windows.1.gap') == 3 and C.get_dotted(cfg, 'g.windows.2.gap', 'absent') == 'absent'
+    assert Path(cfg['g']['windows'][0]['spec_file']) == (tmp_path / 'w1.json').resolve()
+    with pytest.raises(C.ConfigError, match='not an index'):
+        C.load(tmp_path / 'r.toml', overrides=['g.windows.2.half_mm=1.0'])
+    with pytest.raises(C.ConfigError, match='no array'):
+        C.load(tmp_path / 'r.toml', overrides=['g.posts.0.r_mm=1.0'])
+
+
 def _importable(name):
     module = C.SECTIONS[name].split(':')[0]
     try:
