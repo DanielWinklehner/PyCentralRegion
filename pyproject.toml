@@ -5,7 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "PyCentralRegion"
 version = "1.0.0"
-dependencies = []
+description = "Central-region design for compact cyclotrons: gap geometry, 3D electrodes and BEM fields, 3D bunch tracking with space charge, scoring, and multi-objective Bayesian optimisation"
+readme = "README.md"
+requires-python = ">=3.11"          # tomllib
+# PyPATools (fields, particles, the FFT Poisson solver) is a sibling package: install it from its own repository
+# first (pip install -e path/to/PyPATools); it is not listed here so that pip never looks for it on an index.
+dependencies = ["numpy", "scipy", "matplotlib"]
+
+[project.optional-dependencies]
+track = ["numba", "h5py", "pandas", "trimesh"]   # pcr track: compiled 3D kernel, hand-off files, map crops, housing
+bem = ["bempp-cl", "gmsh", "trimesh"]           # pcr build / pcr fields: OCC electrode model, mesh, 3D BEM solve
+gpu = ["cupy"]                                  # GPU BEM solve, potentials and space charge (match the CUDA version)
+mobo = ["optuna>=4", "torch"]                   # pcr optimize (the GP sampler needs torch)
+cavity = ["dfols", "tqdm"]                      # the 2D cavity optimisers of the examples
+test = ["pytest"]
+
+[project.scripts]
+pcr = "PyCentralRegion.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".*", "build", "local"]           # tests/local: untracked machine-specific checks
