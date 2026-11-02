@@ -60,9 +60,9 @@ dxy_m = 0.0015              # grid spacing in x and y
 margin_m = 0.005            # grid half-width = model r_cut + margin
 z_half_m = 0.028            # grid covers |z| <= z_half_m
 dz_m = 0.002
-stack_z_half_m = 0.030      # metal raster used as the obstacle test: |z| range and spacings
+stack_z_half_m = 0.030      # the z slices of track.obstacles = "raster": |z| range and spacing
 stack_dz_m = 0.001
-stack_dxy_m = 0.0005
+stack_dxy_m = 0.0005        # x-y node spacing of the metal test (columns and slices) and of the field's metal mask
 max_elements = 80000        # refuse larger meshes
 tol = 1e-5                  # GMRES tolerance
 solver = "auto"             # auto | cupy | scipy | strong | dense
@@ -102,7 +102,9 @@ n_tracks = 20000            # particles whose full tracks are stored (final run)
 track_every = 4             # steps between stored track points
 probes_deg = [25.0, 45.0]   # azimuths of the radial probes (final run)
 snapshot_ns = [10.0, 20.0, 30.0, 40.0]   # times [ns] of full-beam snapshots (final run)
-obstacles = "raster"        # metal test: "raster" (the cached slices) | "mesh" (the model's triangles)
+obstacles = "columns"       # metal test: "columns" (the metal's z intervals per x-y node, exact in z) | "raster"
+                            # (the design deck's z slices 1 mm apart: a face acts at the half millimetre next to it;
+                            # for comparisons with deck runs) | "mesh" (the model's triangles, GPU, no fast path)
 extra_posts_mm = []         # full-height grounded posts [[x, y, r], ...] mm; obstacle test only, the field is unchanged
 extra_boxes_mm = []         # full-height grounded boxes [[xmin, xmax, ymin, ymax], ...] mm; obstacle test only
 

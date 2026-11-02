@@ -101,8 +101,10 @@ so it has a new `campaign_dir`.
 ```
 
 The driver logs every evaluation as it starts and ends. The first evaluation is the warm start, the design as
-tracked. Its I_final should come out at 4.05 mA (T = 50.40 % of 8.03 mA at the search fidelity: 4.049 mA in the
-first pilot). The base design reaches 3 MeV at its 7th turn, so 7 turns should give it the run it had with the stop
+tracked. The first pilot gave it 4.049 mA (T = 50.40 % of 8.03 mA at the search fidelity) with the deck's slice test;
+the default column test stops other particles on the channel's faces, as many in a 4000-particle check with space
+charge, so expect about 4.05 mA, not exactly that. Add `'track.obstacles="raster"'` to `fixed` to repeat the first
+pilot's run. The base design reaches 3 MeV at its 7th turn, so 7 turns should give it the run it had with the stop
 (array for array in a 200-particle check without space charge).
 
 ## 4. The campaign with geometry variables
@@ -112,11 +114,10 @@ and length) and the spiral-inflector rotation (`kind = "geometry"`): 9 variables
 design, start from it or from the pilot's file. Read its header first: it lists what the loop does not see, among them
 that the gap-0 hole does not follow the inflector rotation (at the ends of the ±3° range the bunch, flown straight
 from the hand-off plane as `gap0_hole` places the hole, meets gap 0's edge 4.7 / 0.6 mm from the hole's centre,
-against 2.2 mm at the base, where the tracked bunch meets it 1.1 mm from the centre) and that the metal test sees the
-channel heights in 2 mm steps.
+against 2.2 mm at the base, where the tracked bunch meets it 1.1 mm from the centre).
 
 Every new geometry is built and solved under `<campaign_dir>\geometries\<key>\`. The first evaluation, the warm start,
-rebuilds the base design there (about 6 min; the build equals the design deck's model bit for bit).
+rebuilds the base design there (about 4 min; the build equals the design deck's model bit for bit).
 
 ```powershell
 $campaign = "$repo\configs\examples\hchc1p5\mobo_campaign.toml"
@@ -127,7 +128,7 @@ $campaign = "$repo\configs\examples\hchc1p5\mobo_campaign.toml"
 ```
 
 Planning the budget:
-- a new geometry's evaluation takes about 6 min on the worked example (build about 20 s, fields about 4 min, then
+- a new geometry's evaluation takes about 4 min on the worked example (build about 20 s, fields about 2 min, then
   the tracking), and the driver follows it with `cheap_per_geometry` cheap evaluations of about 1.6 min each;
 - every evaluation process first compiles the tracking kernel, about 65 s of those 1.6 min;
 - with `cheap_per_geometry = 3`, a quarter of the evaluations build a geometry;
@@ -136,8 +137,8 @@ Planning the budget:
   their cheap followers; `mobo_pilot.toml`: 9);
 - designs of one flat channel (`ap_inner` = `ap_outer`) share one geometry whatever the taper's place, so they build
   once;
-- `mobo_campaign.toml`: 30 × 6 min + 90 × 1.6 min, about 5.5 h for its 120 evaluations (`--max-hours 10` runs it to
-  the end, with room for fields as slow as the design deck's run: 8 min instead of 4).
+- `mobo_campaign.toml`: 30 × 4 min + 90 × 1.6 min, about 4.5 h for its 120 evaluations (`--max-hours 10` runs it to
+  the end, with room for evaluations twice as slow).
 
 A radial slit comes after, in a campaign of its own on the design this one chooses: `mobo_slit.toml` varies the slit's
 opening, azimuth and offset at one fixed pass (one campaign per pass), 20 evaluations of about 1.6 min. Its header

@@ -404,9 +404,9 @@ class FieldsConfig:
     margin_m: float = 0.005          # grid half-width = model r_cut + margin
     z_half_m: float = 0.028          # grid covers |z| <= z_half
     dz_m: float = 0.002
-    stack_z_half_m: float = 0.030    # metal raster (obstacle test): |z| range, spacing
+    stack_z_half_m: float = 0.030    # the z slices of track.obstacles = 'raster': |z| range, spacing
     stack_dz_m: float = 0.001
-    stack_dxy_m: float = 5e-4
+    stack_dxy_m: float = 5e-4        # x-y node spacing of the metal test (columns and slices) and of the BEM mask
     max_elements: int = 80000        # refuse larger meshes
     tol: float = 1e-5                # GMRES tolerance
     solver: str = 'auto'             # BEM solver backend: auto | cupy | scipy | strong | dense
@@ -447,7 +447,8 @@ class TrackConfig:
     track_every: int = 4             # steps between stored track points
     probes_deg: tuple = (25.0, 45.0)  # azimuths of the radial probes (final run)
     snapshot_ns: tuple = (10.0, 20.0, 30.0, 40.0)   # times [ns] of full-beam snapshots (final run)
-    obstacles: str = 'raster'        # metal test: 'raster' (the cached slices) | 'mesh' (the model's triangles)
+    obstacles: str = 'columns'       # metal test: 'columns' (exact in z) | 'raster' (the deck's z slices, 1 mm apart)
+    #                                  | 'mesh' (the model's triangles, GPU, no fast path)
     extra_posts_mm: tuple = ()       # full-height grounded posts [[x, y, r], ...] mm, obstacle test only
     extra_boxes_mm: tuple = ()       # full-height grounded boxes [[xmin, xmax, ymin, ymax], ...] mm, obstacle test only
 

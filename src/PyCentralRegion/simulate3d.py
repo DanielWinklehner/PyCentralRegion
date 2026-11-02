@@ -1,15 +1,19 @@
 """The `fields` and `track` stages: the 3D BEM field of an electrode model, and 3D bunch tracking through it.
 
-fields   paths.model3d (gap_fields.ElectrodeModel) -> 3D BEM solve -> E-field grid + metal raster -> paths.fields
+fields   paths.model3d (gap_fields.ElectrodeModel) -> 3D BEM solve -> E-field grid (zeroed deep inside the model's
+         metal columns) -> paths.fields
 track    paths.fields + the 3D magnet map + the spiral-inflector bunch -> reference particle per RF phase, phase scan,
          final run with space charge, probes and particle tracks -> run.out_dir: track.json (summary),
          track_data.pkl (arrays), probe_<angle>deg.npz (one per probe), config.json (the resolved configuration)
 
 The BEM field is the whole accelerating field: every dee at the model's potential times ``track.volt_scale``,
 modulated in time with the RF of the dee system and the bunch phase of the run; no RF-cavity map is blended in. The
-metal test is the model's stacked-slice raster (or its triangle mesh with ``track.obstacles = 'mesh'``), plus the
-optional full-height posts and boxes of [track] and the radial slit of [slit] (obstacle tests only: the cached field is
-unchanged). The slit is a raster of its own, finer than the model's, so the fast path carries it as its second one.
+metal test (``track.obstacles``) is by default the model's metal columns: the z intervals of metal at every node of an
+x-y grid, cut from its triangles, so every face acts at its own height (``metal_columns``). 'raster' tests the design
+deck's stacked z slices instead (the nearest of levels 1 mm apart, so a face acts at the half millimetre next to it),
+'mesh' the triangles themselves (GPU, the Python path). To that the optional full-height posts and boxes of [track] and
+the radial slit of [slit] are added (obstacle tests only: the cached field is unchanged). The slit is a raster of its
+own, finer than the model's grid, which the fast path carries beside the model's metal.
 
 The field cache and the outputs keep the layout of the design deck this package grew out of (its
 ``bunch_fields3d<tag>.pkl`` and ``bunch_simulation3d<tag>.json`` / ``_data.pkl``), so a deck cache can be tracked here
@@ -45,8 +49,18 @@ def load_model3d(path):
     return model3d
 
 
+def column_obstacles(model3d, fc, verbose=True, odd='raise'):
+    """The model's metal columns on the x-y nodes of ``fields.stack_dxy_m`` (``metal_columns.ColumnObstacles``): the
+    tracker's obstacle test, exact in z, and the fields stage's metal mask. ``odd``: a solid that is not closed is
+    refused ('raise', the tracker) or left out of the columns where it is open ('drop', the mask)."""
+    from .metal_columns import ColumnObstacles
+    return ColumnObstacles.from_model(model3d, spacing=fc.stack_dxy_m, extent=model3d.extent() + fc.margin_m,
+                                      verbose=verbose, odd=odd)
+
+
 def metal_raster(model3d, fc, verbose=True):
-    """The model's metal on z slices (``electrodes3d.stacked_obstacles``): the tracker's obstacle test."""
+    """The model's metal on z slices (``electrodes3d.stacked_obstacles``): the obstacle test of
+    ``track.obstacles = 'raster'``."""
     from .electrodes3d import stacked_obstacles
     zs = np.arange(-fc.stack_z_half_m, fc.stack_z_half_m + 0.5 * fc.stack_dz_m, fc.stack_dz_m)
     return stacked_obstacles(model3d, zs, spacing=fc.stack_dxy_m, extent=model3d.extent() + fc.margin_m,
@@ -55,8 +69,8 @@ def metal_raster(model3d, fc, verbose=True):
 
 def fields_stage(cfg, verbose=True):
     """`pcr fields`: solve the 3D BEM of paths.model3d, sample its E-field on the grid of [fields] (out to the model's
-    r_cut + margin), rasterise its metal, and write the cache paths.fields. An existing cache is reused, never
-    overwritten. Returns the cache path."""
+    r_cut + margin; zeroed deep inside its metal columns), and write the cache paths.fields. An existing cache is
+    reused, never overwritten. Returns the cache path."""
     from .electrodes3d import check_trajectory_clearance, midplane_obstacles
     from .fields3d import bem_field3d, field_to_arrays
     from .gap_fields import solve_gap_field
@@ -72,8 +86,15 @@ def fields_stage(cfg, verbose=True):
     if model3d.n_elements > fc.max_elements:
         raise ConfigError(f"3D model too large ({model3d.n_elements} > fields.max_elements = {fc.max_elements})")
     traj = seed_orbit(load_seed(pc.seed))
-    stack = metal_raster(model3d, fc, verbose=verbose)
-    say(f"[fields] stacked metal in {time.time() - t0:.0f} s")
+    # the mask zeroes the field only two cells deep inside metal, which no point in vacuum reads: a column left out
+    # where a solid is open keeps its BEM values there and changes nothing a particle sees
+    metal = column_obstacles(model3d, fc, verbose=verbose, odd='drop')
+    say(f"[fields] metal columns in {time.time() - t0:.0f} s")
+    odd = metal.info['odd_columns']
+    if odd:
+        where = ', '.join(f"{k} in {n} columns" for k, n in odd.items())
+        say(f"[fields] WARNING: the model is not closed ({where}): left out of the metal mask there; the tracker's "
+            f"column test refuses this model (track it with track.obstacles = 'raster')")
     mid = midplane_obstacles(model3d, extent=mc.r_max_m)
     clr = check_trajectory_clearance(mid, traj, raise_on_contact=False, label='seed orbit vs 3D model (z = 0)')
     say(f"[fields] seed orbit vs metal at z = 0: {clr['n_contact']} of {clr['n_points']} points")
@@ -92,7 +113,7 @@ def fields_stage(cfg, verbose=True):
     bem_xy = lay['r_cut'] + fc.margin_m
     xs = np.arange(-bem_xy, bem_xy + 0.5 * fc.dxy_m, fc.dxy_m)
     zb = np.arange(-fc.z_half_m, fc.z_half_m + 0.5 * fc.dz_m, fc.dz_m)
-    bem3d = bem_field3d(sol3d, xs, xs, zb, metal=stack, chunk=fc.pot_chunk, r_max=bem_xy, pot_device=fc.pot_device,
+    bem3d = bem_field3d(sol3d, xs, xs, zb, metal=metal, chunk=fc.pot_chunk, r_max=bem_xy, pot_device=fc.pot_device,
                         pot_precision=fc.pot_precision, pot_check=fc.pot_check, verbose=verbose)
     info['bem_pot'] = {'device': fc.pot_device, 'precision': fc.pot_precision, 'chunk': fc.pot_chunk,
                        'seconds': time.time() - t1}
@@ -101,8 +122,10 @@ def fields_stage(cfg, verbose=True):
     del sol3d
     info['rf_map'] = {'bem_only': True, 'v_dee_signed': float(np.min(np.asarray(model3d.potentials, dtype=float)))}
     info['layout'] = {k: (list(v) if isinstance(v, tuple) else v) for k, v in lay.items()}
+    # the tracker builds its metal test from the cached model (the columns in under a second); 'stack' records the mask
     cache = {'static2d': None, 'bem3d': field_to_arrays(bem3d), 'rf': None, 'rf_metal': None,
-             'stack': {'kind': 'raster', 'grid': stack.grid, 'xs': stack.xs, 'zs': stack.zs},
+             'stack': {'kind': 'columns', 'spacing_m': metal.spacing, 'extent_m': float(metal.xs[-1]),
+                       'odd_columns': odd},
              'model3d': model3d, 'bars': [], 'patches': [], 'info': info, 'seed': str(pc.seed)}
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -132,26 +155,27 @@ def _raster_inside(grid, xs, zs):
     return inside
 
 
-def add_columns(grid, xs, tc, info):
-    """The full-height posts (x, y, r) and boxes (xmin, xmax, ymin, ymax) [mm] of [track] put into a metal raster: a
-    raster column is metal when its node lies inside (box edges on half-nodes are exact)."""
+def extra_columns(xs, tc, info):
+    """The full-height posts (x, y, r) and boxes (xmin, xmax, ymin, ymax) [mm] of [track] on the x-y nodes ``xs`` of a
+    metal test: the (n, n) mask of the nodes inside them (box edges on half-nodes are exact), or None without any.
+    The metal test makes those columns metal at every height."""
     if not (tc.extra_posts_mm or tc.extra_boxes_mm):
-        return grid
-    grid = grid.copy()
+        return None
+    mask = np.zeros((len(xs), len(xs)), dtype=bool)
     for (px, py, pr) in ([v * 1e-3 for v in q] for q in tc.extra_posts_mm):
         disc = np.hypot(xs[:, None] - px, xs[None, :] - py) <= pr
-        grid[disc, :] = True
+        mask |= disc
         say(f"[metal] extra post at x {px * 1e3:.1f} y {py * 1e3:.1f} mm, radius {pr * 1e3:.1f} mm: "
             f"{int(disc.sum())} raster columns")
     eps = 1e-9
     for (xa, xb, ya, yb) in ([v * 1e-3 for v in q] for q in tc.extra_boxes_mm):
         col = (((xs >= xa - eps) & (xs <= xb + eps))[:, None]) & (((xs >= ya - eps) & (xs <= yb + eps))[None, :])
-        grid[col, :] = True
+        mask |= col
         say(f"[metal] extra box x {xa * 1e3:.2f}..{xb * 1e3:.2f}, y {ya * 1e3:.2f}..{yb * 1e3:.2f} mm: "
             f"{int(col.sum())} raster columns")
     info['extra_posts'] = [list(q) for q in tc.extra_posts_mm]
     info['extra_boxes'] = [list(q) for q in tc.extra_boxes_mm]
-    return grid
+    return mask
 
 
 def slit_raster(sl, r_center_m, z_half_m, h=SLIT_H_M):
@@ -175,7 +199,9 @@ def slit_raster(sl, r_center_m, z_half_m, h=SLIT_H_M):
 
 def load_fields(path, tc, fc):
     """The field cache of ``fields_stage`` (or of the design deck): {'bem3d': Field, 'stack': metal test,
-    'model3d', 'info'}. The metal test is the run's choice (``track.obstacles``), not the cache's."""
+    'model3d', 'info'}. The metal test is the run's choice (``track.obstacles``), not the cache's: 'columns' are built
+    here from the cached model; 'raster' takes the cache's own slices when it has them (a cache written before
+    2026-11-02 keeps the sections it was cut with) and cuts them here otherwise; 'mesh' is the model's triangles."""
     from .fields3d import field_from_arrays
     with open(require(path, 'paths.fields'), 'rb') as fh:
         d = pickle.load(fh)
@@ -184,18 +210,34 @@ def load_fields(path, tc, fc):
     info = dict(d['info'])
     if tc.obstacles == 'mesh':
         if tc.extra_posts_mm or tc.extra_boxes_mm:
-            raise ConfigError("track.extra_posts_mm / extra_boxes_mm need track.obstacles = 'raster'")
+            raise ConfigError("track.extra_posts_mm / extra_boxes_mm need track.obstacles = 'columns' or 'raster'")
         from .electrodes3d import MeshObstacles
         stack = MeshObstacles(d['model3d'])
         say(f"[metal] mesh obstacles: BVH over {stack.n_tri:,} triangles")
+        info['metal_test'] = {'kind': 'mesh', 'n_triangles': int(stack.n_tri)}
+    elif tc.obstacles == 'columns':
+        stack = column_obstacles(d['model3d'], fc, verbose=False)
+        say(f"[metal] metal columns: {stack.info['n_intervals']:,} intervals on {len(stack.xs)}^2 nodes at "
+            f"{stack.spacing * 1e3:.2f} mm ({stack.info['build_s']:.1f} s)")
+        info['metal_test'] = {'kind': 'columns', **stack.info}
+        mask = extra_columns(stack.xs, tc, info)
+        if mask is not None:
+            stack = stack.with_full_height(mask)
     elif tc.obstacles == 'raster':
         st = d['stack']
         if st.get('kind') != 'raster' or 'grid' not in st:
             st_ = metal_raster(d['model3d'], fc, verbose=False)
             st = {'grid': st_.grid, 'xs': st_.xs, 'zs': st_.zs}
-        stack = _raster_inside(add_columns(st['grid'], st['xs'], tc, info), st['xs'], st['zs'])
+        info['metal_test'] = {'kind': 'raster', 'cached': st is d['stack'],
+                              'dxy_m': float(st['xs'][1] - st['xs'][0]), 'dz_m': float(st['zs'][1] - st['zs'][0])}
+        grid = st['grid']
+        mask = extra_columns(st['xs'], tc, info)
+        if mask is not None:
+            grid = grid.copy()
+            grid[mask, :] = True
+        stack = _raster_inside(grid, st['xs'], st['zs'])
     else:
-        raise ConfigError(f"track.obstacles = {tc.obstacles!r}: 'raster' or 'mesh'")
+        raise ConfigError(f"track.obstacles = {tc.obstacles!r}: 'columns', 'raster' or 'mesh'")
     return {'bem3d': field_from_arrays(d['bem3d']), 'stack': stack, 'model3d': d['model3d'], 'info': info}
 
 

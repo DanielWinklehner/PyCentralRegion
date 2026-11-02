@@ -36,6 +36,8 @@ _EXPORTS = {
     'ExtraSolid': 'electrodes3d', 'build_electrodes_3d': 'electrodes3d', 'auto_bars': 'electrodes3d',
     'bar_clearances': 'electrodes3d', 'midplane_obstacles': 'electrodes3d', 'raster_obstacles': 'electrodes3d',
     'combine_obstacles': 'electrodes3d', 'check_trajectory_clearance': 'electrodes3d',
+    # metal_columns (the 3D metal test, exact in z)
+    'ColumnObstacles': 'metal_columns',
     # inflector (static field + housing + bunch of the spiral inflector in the CR model)
     'InflectorModel': 'inflector', 'load_inflector_field': 'inflector', 'midplane_field': 'inflector',
     'housing_mesh': 'inflector', 'housing_section': 'inflector', 'StaticPlusRFField': 'inflector',
@@ -46,8 +48,8 @@ _EXPORTS = {
 }
 _SUBMODULES = ('accelerated_orbit_finder', 'analysis', 'btrim', 'cavity_optimizer', 'central_region', 'cli',
                'closed_orbit', 'config', 'diagnostics', 'electrodes3d', 'fast_track', 'fast_track3d', 'fields3d',
-               'frames', 'gap_fields', 'geometry', 'handoff', 'inflector', 'kinematics', 'machine', 'mobo',
-               'polyprism', 'probes', 'rf_cavity', 'seo_finder', 'simulate3d', 'tracking')
+               'frames', 'gap_fields', 'geometry', 'handoff', 'inflector', 'kinematics', 'machine', 'metal_columns',
+               'mobo', 'polyprism', 'probes', 'rf_cavity', 'seo_finder', 'simulate3d', 'tracking')
 # the package used to star-import these two modules: their other public names stay reachable
 _STAR_MODULES = ('seo_finder', 'central_region')
 

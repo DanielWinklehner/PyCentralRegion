@@ -1066,22 +1066,82 @@ def metal_mask(model: ElectrodeModel, pts: np.ndarray) -> np.ndarray:
     return inside
 
 
-def loops_from_mesh(mesh, z: float = 0.0, tol: float = 1e-6, name: str = 'solid') -> List[np.ndarray]:
+SECTION_Z_TOL_M = 1e-12      # a vertex this close to the plane of a section lies in it [m] (see loops_from_mesh)
+
+
+def _reduced(loop: np.ndarray) -> np.ndarray:
+    """The closed outline ``loop`` (K, 2) without a point twice in a row and without runs that go out to a point and
+    straight back (what a solid touching the plane along edges leaves), also where the outline closes."""
+    out = []
+    for p in map(tuple, loop):
+        if out and out[-1] == p:
+            continue
+        if len(out) >= 2 and out[-2] == p:          # ..., a, b, a: b is the tip of a run out and back
+            out.pop()
+            continue
+        out.append(p)
+    while len(out) >= 3:
+        if out[0] == out[-1]:
+            out.pop()
+        elif out[-2] == out[0]:                     # the tip is the last point
+            del out[-2:]
+        elif out[1] == out[-1]:                     # the tip is the first point
+            del out[0]
+            out.pop()
+        else:
+            break
+    return np.array(out, dtype=float).reshape(-1, 2)
+
+
+def loops_from_mesh(mesh, z: float = 0.0, name: str = 'solid') -> List[np.ndarray]:
     """Closed outlines (K, 2) [m] of one closed ``trimesh.Trimesh`` in the
-    plane at height ``z``: plane-section segments chained by shared
-    endpoints. Chains left open by a non-watertight mesh are kept when the
-    gap is below 1 mm, otherwise dropped with a warning."""
-    import trimesh
+    plane at height ``z``.
+
+    The cut is made edge by edge. A vertex within ``SECTION_Z_TOL_M`` of
+    ``z`` lies in the plane: a face's vertices carry rounding of either sign
+    at its nominal height (-13 * 1e-3 is not -0.013), up to ~1e-17 m on the
+    worked example, so an exact test would cut a face at its own height into
+    a patchwork. A vertex above the plane and out of it is above; every
+    other one is below, so the section is the one just above ``z``: a face
+    lying in the plane belongs to the solid on its upper side. Each mesh edge
+    with a vertex on either side gives one point (a vertex in the plane is
+    the point of all its crossed edges), each triangle it bounds one segment,
+    and the segments are chained through the edges they share (vertices at
+    one position count as one). A closed mesh whose every edge bounds two
+    triangles therefore always gives closed outlines, whatever lies in or
+    near the plane. Runs out to a point and straight back are removed, so a
+    solid that only touches the plane from above, at a vertex or along
+    edges, gives no outline there. Chaining the segment ends on a merge grid
+    instead, as until 2026-11-02, fused crossings that were not neighbours
+    where a vertex lay 1.7e-8 m off the plane on a nearly level face, and
+    dropped the ground's whole section there. Chains left open by a mesh that
+    is not closed (or by an edge of more than two triangles) are kept when
+    the gap is below 1 mm, otherwise dropped with a warning."""
+    v = np.asarray(mesh.vertices, dtype=float)
+    f = np.asarray(mesh.faces, dtype=np.int64)
     loops = []
-    seg = trimesh.intersections.mesh_plane(mesh, np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, float(z)]))
-    if len(seg) == 0:
+    if not len(f):
         return loops
-    seg = np.asarray(seg)[:, :, :2]
-    keys = np.round(seg.reshape(-1, 2) / tol).astype(np.int64)
-    _, ids = np.unique(keys, axis=0, return_inverse=True)
-    ids = ids.reshape(-1, 2)
-    pts = np.zeros((ids.max() + 1, 2))
-    pts[ids.ravel()] = seg.reshape(-1, 2)
+    v, inv = np.unique(v, axis=0, return_inverse=True)
+    f = np.asarray(inv).reshape(-1)[f]
+    in_plane = np.abs(v[:, 2] - float(z)) <= SECTION_Z_TOL_M
+    above = (v[:, 2] > float(z)) & ~in_plane
+    a = above[f]
+    cut = a.any(axis=1) & ~a.all(axis=1)
+    f, a = f[cut], a[cut]
+    if not len(f):
+        return loops
+    # the two edges of every cut triangle that join a vertex below to one above, keyed by their vertex pair
+    edges = np.stack([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], axis=1)
+    crossed = np.stack([a[:, 0] != a[:, 1], a[:, 1] != a[:, 2], a[:, 2] != a[:, 0]], axis=1)
+    pairs = np.sort(edges[crossed].reshape(-1, 2, 2), axis=2)
+    keys, ids = np.unique(pairs[:, :, 0] * len(v) + pairs[:, :, 1], return_inverse=True)
+    ids = np.asarray(ids).reshape(-1, 2)
+    i, j = keys // len(v), keys % len(v)
+    lo, up = np.where(above[i], j, i), np.where(above[i], i, j)
+    t = (float(z) - v[lo, 2]) / (v[up, 2] - v[lo, 2])
+    t[in_plane[lo]] = 0.0
+    pts = v[lo, :2] + t[:, None] * (v[up, :2] - v[lo, :2])
     adj: Dict[int, List[int]] = {}
     for a, b in ids:
         if a == b:
@@ -1098,13 +1158,13 @@ def loops_from_mesh(mesh, z: float = 0.0, tol: float = 1e-6, name: str = 'solid'
         for direction in (0, 1):
             cur, prev = start, None
             while True:
-                nxt = [v for v in adj[cur] if v != prev and v not in seen]
+                nxt = [k for k in adj[cur] if k != prev and k not in seen]
                 if not nxt:
                     break
                 cur, prev = nxt[0], cur
                 seen.add(cur)
                 chain.append(cur) if direction == 0 else chain.insert(0, cur)
-        loop = pts[chain]
+        loop = _reduced(pts[chain])
         if len(loop) < 3:
             continue
         # a closed loop is walked entirely in the first direction and ends
@@ -1119,12 +1179,12 @@ def loops_from_mesh(mesh, z: float = 0.0, tol: float = 1e-6, name: str = 'solid'
     return loops
 
 
-def section_loops(model: ElectrodeModel, z: float = 0.0, tol: float = 1e-6) -> List[np.ndarray]:
+def section_loops(model: ElectrodeModel, z: float = 0.0) -> List[np.ndarray]:
     """Closed outlines (K, 2) [m] of the metal of a 3D model in the plane at
     height ``z``: plane sections of every solid (see ``loops_from_mesh``)."""
     loops = []
     for name, m in solid_meshes(model).items():
-        loops.extend(loops_from_mesh(m, z=z, tol=tol, name=name))
+        loops.extend(loops_from_mesh(m, z=z, name=name))
     return loops
 
 
@@ -1291,7 +1351,8 @@ def stacked_obstacles(model: ElectrodeModel, z_levels, spacing: float = 5e-4, ex
     input is taken at z = 0. The dee plates, hill faces, bars, patches and an
     un-fused housing solid all become real 3D apertures. The callable
     carries ``grid`` (nx, ny, nz), ``xs``, ``zs``, ``spacing`` and
-    ``ndim = 3`` (read by ``tracking.MetalTerminator``)."""
+    ``ndim = 3`` (read by ``tracking.MetalTerminator``). The tracker's
+    default, ``metal_columns.ColumnObstacles``, is the same test exact in z."""
     if not (model.params.get('dim') == 3 and 'solids' in model.params):
         raise ValueError("stacked_obstacles needs a 3D electrode model (build_electrodes_3d)")
     zs = np.sort(np.asarray(z_levels, dtype=float).ravel())
@@ -1403,6 +1464,9 @@ class MeshObstacles:
     The catch, and why ``segment`` is not the whole story: a crossing test cannot see a particle
     that is ALREADY inside metal and never crosses a surface. Birth positions therefore still go
     through the point test - which is what ``__call__`` is for.
+
+    ``metal_columns.ColumnObstacles`` (the tracker's default) is exact in z too, on the CPU and in
+    the compiled kernel, but has no ``segment``.
     """
 
     ndim = 3

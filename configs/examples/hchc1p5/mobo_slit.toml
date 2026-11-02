@@ -36,8 +36,8 @@ fixed = [
     "track.turns=7", "track.stop_at_target_energy=false",   # every design scored at its 7th turn, as in the campaign
 ]
 # A 2 x 5 mm opening on the reference's 3rd crossing of the 315 deg ray. The slit smoke test of 2026-11-01 (another
-# particle sample at the same resolution, E:\HCHC1.5\Results\CR\pcr_validation\slit_sc) gave T 50.45 % = 4.053 mA
-# without a slit, 35.13 % = 2.822 mA with this one and 27.90 % = 2.241 mA with 2 x 3 mm.
+# particle sample at the same resolution and the deck's slice test, E:\HCHC1.5\Results\CR\pcr_validation\slit_sc) gave
+# T 50.45 % = 4.053 mA without a slit, 35.13 % = 2.822 mA with this one and 27.90 % = 2.241 mA with 2 x 3 mm.
 warm_start = [{slit_hw = 5.0, slit_az = 315.0, slit_off = 0.0}]
 
 [[mobo.variables]]

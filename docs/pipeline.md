@@ -59,7 +59,7 @@ whose cached model and fields are on disk).
 | command | reads | writes | notes |
 |---|---|---|---|
 | `pcr build` | `[geometry]`, `[machine]`, `[inflector]`, `paths.seed`, `paths.housing_outline`, the emitting-plane hand-off (`geometry.emitting_plane_file`, else the export's own beside the outline, else `paths.handoff`), `exit_plane_spec.json` (for `si_rotation = "corner"` or `gap0_on_plate`) | `paths.model3d`, and beside it `<prefix>.msh`, `<prefix>.step`, `<prefix>_build.json`, `<prefix>_dees.png` | OCC solids, mesh, electrode potentials (`geometry.build`); the `.step` is the CAD: 5 solids (dee0..dee3, the ground with the spiral-inflector housing fused in), mm, machine frame |
-| `pcr fields` | `paths.model3d`, `paths.seed`, `[fields]`, `[machine]` | `paths.fields` | 3D BEM solve, E-field grid, metal raster |
+| `pcr fields` | `paths.model3d`, `paths.seed`, `[fields]`, `[machine]` | `paths.fields` | 3D BEM solve, E-field grid (zeroed deep inside the metal) |
 | `pcr track` | `paths.fields`, `paths.seed`, `paths.bfield_3d`, `paths.handoff`, `paths.inflector_efield`, `paths.housing_step`, `[run]`, `[machine]`, `[magnet]`, `[btrim]`, `[inflector]`, `[fields]`, `[track]`, `[slit]` | `run.out_dir`: `track.json`, `track_data.pkl`, `config.json`, `probe_<a>deg.npz` | reference, phase scan, final run |
 | `pcr score` | `run.out_dir` (its `config.json` gives the `[machine]` the run was tracked with), `[score]` | `run.out_dir/score.json` | metrics and objectives (`analysis`); a run with fewer than `score.min_tracks` tracks or `score.min_survivors` survivors scores `{"tag", "skip"}` |
 | `pcr evaluate --config run.toml --out DIR` | all of the above | `DIR/result.json` | the chain; a failure is written to result.json, exit code 1 |
@@ -76,11 +76,40 @@ anything is written.
 
 - The BEM solution of the model (every dee at its potential, ground at 0) is sampled on a grid out to the model's
   `r_cut + fields.margin_m`: `fields.dxy_m` across, `fields.dz_m` in height, `|z| <= fields.z_half_m`.
-- The metal is rasterised on z slices (`fields.stack_*`, 0.5 mm x 1 mm by default). That raster is the tracker's
-  obstacle test.
-- The cache keeps the layout of the design deck's `bunch_fields3d<tag>.pkl`, so deck caches track here unchanged.
+- The field is zeroed two grid cells inside the metal, as the metal columns below see it; the wall layer is kept, so
+  particles feel the field up to the surface. A solid that is not closed is left out of this mask where a vertical
+  line crosses it an odd number of times, with a warning and the count in the cache (`stack['odd_columns']`): those
+  nodes keep their BEM values, which no point in vacuum reads.
+- The cache keeps the layout of the design deck's `bunch_fields3d<tag>.pkl`, so deck caches track here unchanged. It
+  holds the model, not a metal test: the tracker builds its own (`track.obstacles`).
 - Solver choices: `fields.solver` (auto | cupy | scipy | strong | dense), potentials on the GPU in single precision
   with `fields.pot_check` points re-evaluated in double precision.
+
+### The metal test
+
+`track.obstacles` chooses how the tracker decides that a particle is in metal:
+- `"columns"` (default): at every node of an x-y grid (`fields.stack_dxy_m`, 0.5 mm) the heights at which the vertical
+  line through it enters and leaves metal, cut from the model's triangles (`metal_columns`; 0.25 s for the worked
+  example). A point is tested in the column of its nearest node: exact in z, good to half a node spacing in x and y.
+  A model with a solid that is not closed is refused (a line crossing it an odd number of times); `"raster"` tracks
+  it. On 2026-11-02 that was two of the design deck's 127 models, both post-optimizer geometries whose ground is open
+  in one or two columns, and none of the 17 built by `pcr build`.
+- `"raster"`: the design deck's test, the solids' plane sections on z levels (`fields.stack_z_half_m`,
+  `fields.stack_dz_m`: 1 mm apart) tested at the nearest level, so a face acts at the half millimetre next to it: a
+  channel's full height is seen in 2 mm steps, and a face on a level acts 0.5 mm off. A deck cache (or one written
+  before 2026-11-02) carries its slices; for any other cache they are cut at the start of the run (2-5 min on the
+  worked example: 121 s on the full-chain check, 314 s in the design deck's run of the same model).
+  Use it to compare with deck runs: the regression baseline (`pcr_validation\track`) was tracked with it.
+- `"mesh"`: the triangles themselves on the GPU (Warp BVH), with a crossing test per step. The compiled kernel
+  cannot carry it, so the run takes the Python path.
+
+The plane sections (`electrodes3d.loops_from_mesh`) are cut edge by edge since 2026-11-02 and come out closed whatever
+lies in or near the plane. Before, the segment ends were chained on a 1e-6 m merge grid: where a vertex lay 1.7e-8 m
+below z = ±15 mm on the ground's nearly level taper, crossings that were not neighbours fused, and the ground's whole
+section there was dropped: the deck's slices (and the caches written until then) have no ground at those two levels.
+A vertex within 1e-12 m of the plane lies in it (`SECTION_Z_TOL_M`), and a face in the plane belongs to the solid
+above it: the model's faces carry rounding of either sign at their nominal heights (up to 1e-17 m), which would
+otherwise decide a cut at a face's own height (the `sections` views at 16 mm, a stack whose levels fall on faces).
 
 ### track
 
@@ -114,7 +143,8 @@ The compiled 3D kernel (`track.fast3d`, numba) runs the whole bunch: release, sp
 the probes. It needs:
 - the `boris_rel` pusher;
 - plain gridded fields;
-- at most two nearest-node obstacle rasters: the model's (with any extra posts and boxes painted in) and the slit's.
+- a metal test of at most one column test and two nearest-node rasters: the model's (columns or slices, with any
+  extra posts and boxes put in) and the slit's.
 
 Every run record of track.json carries `fast_path`: whether the compiled kernel ran and, if not, why. A run that
 cannot use it goes the Python path: same answer, far slower.
@@ -132,15 +162,15 @@ The layout is the deck's `bunch_simulation3d<tag>.json` / `_data.pkl`, so the an
 Field-free additions (inside a dee, away from its gaps) change only the metal test. They can be optimised without a
 new field:
 - `track.extra_posts_mm = [[x, y, r], ...]` and `track.extra_boxes_mm = [[xmin, xmax, ymin, ymax], ...]`: full-height
-  grounded posts and boxes, painted into the model raster.
+  grounded posts and boxes: the x-y nodes of the model's metal test inside them are metal at every height.
 - `[slit]`: a two-sided radial slit. Two full-height jaws on the ray at `slit.azimuth_deg`: the inner one over
   `[r_c - hw - L, r_c - hw]`, the outer one over `[r_c + hw, r_c + hw + L]`, each `slit.thickness_mm` thick
   (hw = `half_width_mm`, L = `jaw_length_mm`).
   - The centre r_c follows the design: the reference particle's radius at its crossing number `slit.pass_index` of
     the ray (the probes' pass numbering, from the reference run at the bunch's phase), plus `slit.offset_mm`. With
     `pass_index = -1` the centre is `slit.r_center_mm`.
-  - The jaws are a 0.1 mm raster of their own, so the edges are good to 0.1 mm, and the compiled kernel carries it as
-    its second raster.
+  - The jaws are a 0.1 mm raster of their own, so the edges are good to 0.1 mm, and the compiled kernel carries it
+    in a raster slot of its own, beside the model's metal test (the columns, or the slices in the other slot).
   - Refused: a jaw thinner than one tracking step at the outer jaw's outer edge (2π r / `track.steps_per_turn`,
     r = r_c + hw + L) plus the raster diagonal (√2 × 0.1 mm), because particles could step over it; and an inner jaw
     that reaches the machine axis.
@@ -174,3 +204,24 @@ it reproduces the deck particle for particle (records and scripts in `track\`):
 | every particle, SC 128³ / 1, GPU | same fates, tracks and probe crossings; within 5e-14 m | 50.09 % = 4.024 mA |
 
 The port's verification run took 429 s, the deck's 510 s.
+
+These runs used the deck's slices, `track.obstacles = "raster"` since the column test became the default
+(2026-11-02); set it to repeat them. With the slices of the deck's cache, the code of 2026-11-02 tracks the runs of
+the commit before it array for array, at 200 and at 2000 particles without space charge, and the 4000-particle CPU
+run of the table above with space charge (`metal_columns_2026-11-02\`). Only the outlines of the model's sections in
+`track_data.pkl` differ: the same lines, their points in another order and with the points back that the merge grid
+had fused (up to 0.34 µm off its lines), and the ground's section at z = 15 mm now present. The column test gives the same run on the Python path and in the
+compiled kernel, bit for bit.
+
+The column test against the slices, 7 turns at -15°, on the same cache:
+
+| run | slices | columns |
+|---|---|---|
+| no SC, 200 particles | 55.50 % = 4.458 mA | 55.50 % = 4.458 mA |
+| no SC, 2000 particles | 54.55 % = 4.382 mA | 55.25 % = 4.438 mA |
+| SC 64³ / 5 on the CPU, 4000 particles | 49.43 % = 3.970 mA | 49.43 % = 3.970 mA |
+
+The slices put both channel faces half a millimetre low, at -13.5 / +12.5 mm inside r = 100 mm and -16.5 / +15.5 mm
+beyond 140 mm, where the columns see the model's ±13 and ±16 mm. Of the 2000 particles without space charge, 17 are
+stopped only by the slices, 16 of them between z = 15.5 and 16 mm, and 3 only by the columns, at z = -16.0 mm. With
+space charge 22 and 22 are, nearly all at the same two faces: the same transmission, other particles.

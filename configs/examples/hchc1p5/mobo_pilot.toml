@@ -22,9 +22,11 @@
 #   E_med constraint judges it: with E_med >= 2.9 one that ends at 2.9-3.0 MeV stays feasible (design 0015, volt
 #   0.95 at -29 deg, ends its 7th turn near 2.93 MeV: a mean of 2.92 in the first pilot's run, a median of 2.94 in a
 #   200-particle rerun without space charge); 3.0 would ask for the design energy at the 7th turn.
-# The warm start reaches 3 MeV in 7 turns, so it should repeat the first pilot's run (4.049 mA at the search
-# fidelity): under the old and the new rule it is the same run array for array at 200 particles without space
-# charge (pcr_validation\fixes_2026-11-02\track).
+# The warm start reaches 3 MeV in 7 turns: under the old and the new rule it is the same run array for array at 200
+# particles without space charge (pcr_validation\fixes_2026-11-02\track). The first pilot gave it 4.049 mA at the
+# search fidelity with the deck's slice test; the default column test (2026-11-02) stops other particles on the
+# channel's faces, as many in a 4000-particle check with space charge, so expect about 4.05 mA, not exactly that.
+# 'track.obstacles="raster"' in `fixed` repeats the first pilot's run.
 
 [mobo]
 campaign_dir = "E:/HCHC1.5/Results/CR/mobo/pilot2_wnop3_rotn3_g0ap"

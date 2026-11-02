@@ -56,7 +56,9 @@ says where each piece went, what was retired, and what changes for the deck scri
 | `HCHC60_SPARSE_BEAM` | always: the final run records sparsely (snapshots + tracks) |
 
 New, with no deck variable: `[slit]` (a radial slit as a second obstacle raster), `[btrim]` (a first-harmonic magnet
-trim), and the inflector-rotation guard (a model records the turn it was built for).
+trim), the inflector-rotation guard (a model records the turn it was built for), and the exact metal test
+`track.obstacles = "columns"`, the default since 2026-11-02 (the deck's `HCHC60_OBSTACLES` chose between its slices,
+`"raster"` here, and the mesh).
 
 ## Building: deck variables -> run-file keys
 
@@ -203,9 +205,20 @@ library defaults, and the run config sets them:
 A deck script that sets one of these variables and calls the package without the argument gets the library default
 after the merge. For the potential device that means the CPU in double precision: the same field, more slowly.
 
+The package's plane sections (`electrodes3d.section_loops`, which `stacked_obstacles` rasterises) now close every
+outline of a closed solid (`docs/pipeline.md`, "The metal test"). On the worked example the ground's sections at
+z = ±15 mm, where its faces lie, came out empty before; now each holds the ground's 31,727 mm², so a slice there has
+about 181,000 metal nodes instead of about 54,000. A deck run on an existing cache reads the slices the cache carries
+and tracks as before. Slices the deck cuts afresh (for a new cache, or for one written by a mesh run) get the ground
+on those two levels; no run has been tracked on them yet. The outlines every deck run saves with its results
+(`sections3d`, at z = 0 and 15 mm) get the ground at 15 mm, whatever the cache.
+
 ## Validation
 
 `pcr build` was checked against the deck's builder (the same model bit for bit), `pcr track` against
 `MiniDAR_bunch_simulation_3d.py` on the same cached fields (particle for particle), and `pcr score` against
 `score_runs.py` (`docs/pipeline.md`, "Validation of the port"). The numbers are the regression baseline for later
-changes.
+changes. The tracking comparisons used the deck's slice test, which `pcr track` now runs with
+`track.obstacles = "raster"`. Its default column test puts the faces at their true heights; on the worked example it
+stops other particles on the channel's faces, about as many (`docs/pipeline.md`, "The metal test" and "Validation of
+the port").
