@@ -1,7 +1,8 @@
 # Defaults of the [mobo] section: a multi-objective Bayesian optimisation campaign (pcr optimize).
 # A campaign file holds [mobo] only and names the run TOML every evaluation starts from (base_config_file); see
 # configs/examples/toy/campaign.toml (runs in seconds), configs/examples/hchc1p5/mobo_pilot.toml (cheap variables on
-# existing fields) and configs/examples/hchc1p5/mobo_campaign.toml (geometry and cheap variables).
+# existing fields), configs/examples/hchc1p5/mobo_campaign.toml (geometry and cheap variables) and
+# configs/examples/hchc1p5/mobo_slit.toml (a slit for the chosen design).
 # tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/mobo/space.py.
 #
 #   pcr optimize        campaign.toml [--max-evals N] [--max-hours H] [--dry-run]   run or continue the campaign
@@ -19,7 +20,9 @@
 # [geometry], [machine], [inflector] and [fields] tables as written (fixed and fidelity overrides applied) and the
 # paths of the seed, hand-off and housing files, not the code's defaults or the files' contents: after a change of
 # those a cached geometry keeps its key, and its model and fields made before the change, so start another
-# campaign_dir.
+# campaign_dir. The key of a flat channel's design leaves out the taper's place, which there changes no electrode
+# (GeometryConfig.idle_keys), so the designs of one flat channel share one build; nothing is left out while a cheap
+# variable sets a [geometry] key.
 #
 # A campaign keeps its variables: the sampler sees every stored design at its stored unit coordinates, so a variable
 # added, removed, renamed, re-ranged or re-targeted once evaluations exist would move them all, and pcr optimize /
@@ -104,7 +107,9 @@ warm_start = []
 # Fidelities: named override lists. An evaluation runs with the base config, then `fixed`, then its fidelity's
 # overrides, then the variables. timeout_min stops an evaluation that runs longer (recorded failed); 0 = no limit.
 # Let them differ in resolution only (particles, space-charge grid and interval), not in what is simulated (turns,
-# energies), so that the search-to-verify shift of a score that optimize-verify shows is its resolution error.
+# energies), so that the search-to-verify shift of a score that optimize-verify shows is its resolution error. Score
+# every design at the same turn as well: "track.turns=7", "track.stop_at_target_energy=false" in `fixed` (by default
+# a run ends at the turn its reference reaches machine.target_energy_mev, a slower design's one turn later).
 [mobo.fidelities.search]
 overrides = []
 timeout_min = 0.0

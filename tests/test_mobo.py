@@ -1,12 +1,14 @@
 """MOBO driver: unit cube, config checks, store and resume (the search space fixed by the store, interrupted warm
-starts run again), the campaign lock, constraints and failures, geometry batches and cache, the samplers' pinning,
-process trees (time limit, Ctrl+C - also while an evaluation starts -, time budget, a killed driver), verify / status /
-dry run, and a toy campaign through real subprocesses that ends near the toy's front.
+starts run again), the campaign lock, constraints and failures, geometry batches and cache, the geometry key (the
+designs of one flat channel share one), the samplers' pinning, process trees (time limit, Ctrl+C - also while an
+evaluation starts -, time budget, a killed driver), verify / status / dry run, the example campaigns' first
+evaluations, and a toy campaign through real subprocesses that ends near the toy's front.
 
 Tests that need optuna skip without it (the physics environment has none); the GP tests also need torch and a
 working bounded L-BFGS-B."""
 import dataclasses
 import functools
+import hashlib
 import importlib.util
 import json
 import math
@@ -31,6 +33,7 @@ TOY = ROOT / 'configs' / 'examples' / 'toy' / 'campaign.toml'
 BASE = TOY.with_name('base.toml')
 PILOT = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_pilot.toml'
 CAMPAIGN = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_campaign.toml'
+SLIT = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_slit.toml'
 SRC = Path(PyCentralRegion.__file__).resolve().parents[1]          # subprocesses import what the tests import
 HV_FRONT = (2.0 / 3.0) * (1.0 - (1.0 - toy.I_MAX) ** 1.5)
 # a smaller toy problem for the convergence test: the RF phase, a log-scaled trim and a continuous geometry variable
@@ -684,33 +687,126 @@ def test_pilot_config_dry_run(capsys):
         pytest.skip('the pilot names a physics interpreter of the machine it runs on')
     assert [v.kind for v in cfg.variables] == ['cheap'] * 4 and cfg.sampler == 'gp'
     assert [o.metric for o in cfg.objectives] == ['I_final', 'valley_all', 'ratio']
+    assert cfg.n_startup >= 2 * len(cfg.variables) + 1
     camp = driver.Campaign(cfg)
     if camp.store.log.exists():
         pytest.skip('the pilot campaign has started')
     assert camp.dry_run() == 0
     out = capsys.readouterr().out
-    for item in ('track.phases_deg=[-15.0]', 'track.volt_scale=1.0', 'btrim.amplitude_t=0.0', 'btrim.phase_deg=0.0',
-                 'btrim.r_min_m=0.05', 'track.n_final=10000', 'track.n_tracks=10000', 'PyCentralRegion.cli evaluate'):
-        assert item in out
-    assert 'paths.model3d' not in out                          # the base config's own model and fields
+    cmd = out.strip().splitlines()[-1]                         # the command (the log above it lists the fidelities)
+    for item in ('track.phases_deg=[-15.0]', 'track.volt_scale=1.0', 'btrim.amplitude_cos_t=0.0',
+                 'btrim.amplitude_sin_t=0.0', 'btrim.r_min_m=0.05', 'track.turns=7',
+                 'track.stop_at_target_energy=false', 'track.n_final=10000', 'track.n_tracks=10000',
+                 'PyCentralRegion.cli evaluate'):
+        assert item in cmd
+    assert 'paths.model3d' not in out and 'btrim.amplitude_t' not in out  # the base's own model; the trim by components
 
 
 def test_campaign_config_dry_run(capsys):
-    """The full campaign: five geometry variables (the channel aperture, the inflector rotation) and eight cheap ones
-    (RF, trim, slit); its first evaluation is the base design, built into the campaign's geometry cache."""
+    """The full campaign: five geometry variables (the channel aperture, the inflector rotation) and four cheap ones
+    (RF phase, dee voltage, the trim's two components), every design at its 7th turn; its first evaluation is the base
+    design, built into the campaign's geometry cache."""
     from PyCentralRegion.geometry.options import GeometryConfig
     if 'aperture_inner_mm' not in {f.name for f in dataclasses.fields(GeometryConfig)}:
         pytest.skip('[geometry] has no aperture_inner_mm .. aperture_taper_length_mm yet')
     cfg = driver.load(CAMPAIGN)
     if not Path(cfg.physics_python).is_file():
         pytest.skip('the campaign names a physics interpreter of the machine it runs on')
-    assert [v.kind for v in cfg.variables] == ['geometry'] * 5 + ['cheap'] * 8
+    assert [v.kind for v in cfg.variables] == ['geometry'] * 5 + ['cheap'] * 4
+    assert cfg.n_startup >= 2 * len(cfg.variables) + 1
     camp = driver.Campaign(cfg)
     if camp.store.log.exists():
         pytest.skip('the campaign has started')
     assert camp.dry_run() == 0
     out = capsys.readouterr().out
+    cmd = out.strip().splitlines()[-1]                         # the command (the log above it lists the fidelities)
     params = camp.warm_point(0)
     key = space.geometry_key(camp.base(cfg.search_fidelity), cfg, params)
-    assert params['si_rot'] == pytest.approx(4.726034523988023) and params['slit_hw'] == 0.0
-    assert f"geometries/{key}/fields.pkl" in out and 'track.n_tracks=10000' in out
+    assert params['si_rot'] == pytest.approx(4.726034523988023) and params['trim_c'] == params['trim_s'] == 0.0
+    assert f"geometries/{key}/fields.pkl" in cmd and 'track.n_tracks=10000' in cmd
+    assert 'track.turns=7' in cmd and 'track.stop_at_target_energy=false' in cmd
+    assert 'btrim.amplitude_cos_t=0.0' in cmd and 'btrim.amplitude_sin_t=0.0' in cmd and 'btrim.amplitude_t' not in out
+
+
+def test_slit_config_dry_run(capsys):
+    """The slit's own campaign: three cheap variables at one fixed pass on the base design's model and fields."""
+    cfg = driver.load(SLIT)
+    if not Path(cfg.physics_python).is_file():
+        pytest.skip('the slit campaign names a physics interpreter of the machine it runs on')
+    assert [(v.name, v.kind) for v in cfg.variables] == [('slit_hw', 'cheap'), ('slit_az', 'cheap'),
+                                                         ('slit_off', 'cheap')]
+    assert min(v.low for v in cfg.variables if v.name == 'slit_hw') > 0.0       # an open slit in every design
+    assert cfg.n_startup >= 2 * len(cfg.variables) + 1
+    camp = driver.Campaign(cfg)
+    if camp.store.log.exists():
+        pytest.skip('the slit campaign has started')
+    assert camp.dry_run() == 0
+    out = capsys.readouterr().out
+    cmd = out.strip().splitlines()[-1]                         # the command (the log above it lists the fidelities)
+    for item in ('slit.half_width_mm=5.0', 'slit.azimuth_deg=315.0', 'slit.offset_mm=0.0', 'slit.pass_index=3',
+                 'track.turns=7', 'track.stop_at_target_energy=false', 'track.n_final=10000'):
+        assert item in cmd
+    assert 'paths.model3d' not in out                          # the base config's own model and fields
+
+
+def test_flat_channel_designs_share_one_geometry_key(tmp_path):
+    """A channel of one height at every radius (the dees' and the dummy dees') has no taper: the designs that differ
+    only in the taper's place share one geometry key, one build. A design that loses no key (a tapered channel, or a
+    flat one with no taper keys to drop) has the key of its parts as they always were, so the geometries of earlier
+    campaigns keep their keys."""
+    heights = ('{name="inner", target="geometry.aperture_inner_mm", low=22.0, high=40.0, kind="geometry"}, '
+               '{name="outer", target="geometry.aperture_outer_mm", low=26.0, high=40.0, kind="geometry"}, ')
+    phase = '{name="phase", target="toy.phases_deg", low=-40.0, high=0.0, as_list=true}'
+    cfg = campaign(tmp_path / 'taper', f'mobo.variables=[{heights}{{name="center", '
+                   f'target="geometry.aperture_taper_center_mm", low=90.0, high=220.0, kind="geometry"}}, {phase}]',
+                   'mobo.warm_start=[]')
+    base = {'geometry': {'aperture_taper_length_mm': 40.0, 'ground': 'star'}, 'paths': {'seed': 'seed.pkl'}}
+    snapshot = json.dumps(base, sort_keys=True)
+
+    def design(inner, outer, center):
+        return {'inner': inner, 'outer': outer, 'center': center, 'phase': -15.0}
+
+    def key(b, *values):
+        return space.geometry_key(b, cfg, design(*values))
+
+    def plain_key(b, variables):                       # the key as it was before flat channels shared one
+        plain = {'sections': {s: b.get(s, {}) for s in space.GEOMETRY_SECTIONS},
+                 'paths': {p: b['paths'].get(p, '') for p in space.GEOMETRY_PATHS}, 'variables': variables}
+        blob = json.dumps(plain, sort_keys=True, separators=(',', ':'), default=C.json_default)
+        return hashlib.sha256(blob.encode()).hexdigest()[:12]
+
+    assert len({key(base, 30.0, 30.0, c) for c in (90.0, 120.0, 220.0)}) == 1
+    parts = space.geometry_parts(base, cfg, design(30.0, 30.0, 120.0))
+    assert parts['idle'] == ['aperture_taper_center_mm', 'aperture_taper_length_mm']
+    assert parts['sections']['geometry'] == {'ground': 'star'}
+    assert parts['variables'] == {'geometry.aperture_inner_mm': 30.0, 'geometry.aperture_outer_mm': 30.0}
+    assert key(base, 30.0, 30.0, 120.0) != key(base, 32.0, 32.0, 120.0)      # another flat height is another build
+    # a tapered channel: the taper's place is a geometry, and the key is the plain hash of the parts
+    tapered = [key(base, 26.0, 32.0, c) for c in (90.0, 120.0)]
+    assert tapered[0] != tapered[1] and 'idle' not in space.geometry_parts(base, cfg, design(26.0, 32.0, 90.0))
+    assert tapered[0] == plain_key(base, {'geometry.aperture_inner_mm': 26.0, 'geometry.aperture_outer_mm': 32.0,
+                                          'geometry.aperture_taper_center_mm': 90.0})
+    # a flat channel with no taper key to drop (none in the base, none varied) keeps its plain key as well
+    heights_only = campaign(tmp_path / 'flat', f'mobo.variables=[{heights}{phase}]', 'mobo.warm_start=[]')
+    bare = {'geometry': {'ground': 'star'}, 'paths': {'seed': 'seed.pkl'}}
+    flat = {'inner': 30.0, 'outer': 30.0, 'phase': -15.0}
+    assert 'idle' not in space.geometry_parts(bare, heights_only, flat)
+    assert space.geometry_key(bare, heights_only, flat) == plain_key(
+        bare, {'geometry.aperture_inner_mm': 30.0, 'geometry.aperture_outer_mm': 30.0})
+    # flat dees with tapered dummy dees: the taper still shapes the dummies
+    dummy = {**base, 'geometry': {**base['geometry'], 'dummy_aperture_outer_mm': 34.0}}
+    assert len({key(dummy, 30.0, 30.0, c) for c in (90.0, 120.0)}) == 2
+    # a [geometry] the options refuse is keyed as it stands (its build then says what is wrong with it)
+    broken = {**base, 'geometry': {**base['geometry'], 'ground': 'nope'}}
+    assert 'idle' not in space.geometry_parts(broken, cfg, design(30.0, 30.0, 120.0))
+    # a cheap variable on a channel height (accepted, with a warning) can taper a channel that base and geometry
+    # variables leave flat: nothing is dropped, so every taper place stays a geometry of its own
+    cheap_outer = campaign(tmp_path / 'cheap', 'mobo.variables=[{name="center", target="geometry.aperture_taper_'
+                           'center_mm", low=90.0, high=220.0, kind="geometry"}, {name="outer", '
+                           'target="geometry.aperture_outer_mm", low=26.0, high=40.0}]', 'mobo.warm_start=[]')
+    with pytest.warns(UserWarning, match="'cheap' but sets geometry.aperture_outer_mm"):
+        cheap_outer.validate()
+    level = {**base, 'geometry': {**base['geometry'], 'aperture_inner_mm': 26.0, 'aperture_outer_mm': 26.0}}
+    assert len({space.geometry_key(level, cheap_outer, {'center': c, 'outer': 34.0}) for c in (100.0, 200.0)}) == 2
+    assert 'idle' not in space.geometry_parts(level, cheap_outer, {'center': 100.0, 'outer': 34.0})
+    assert json.dumps(base, sort_keys=True) == snapshot                     # the base config is left as it was

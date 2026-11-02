@@ -69,6 +69,9 @@ Before the first real run, check the campaign file:
 - `physics_python`: the physics interpreter.
 - The fidelities: `[mobo.fidelities.search]`, e.g. 10 000 particles and SC 64³ every 5 steps. Let the fidelities
   differ in resolution only (particles, SC grid and interval), not in `track.turns`.
+- The turn every design is scored at: `track.turns = 7` with `track.stop_at_target_energy = false` in `fixed`, as
+  in the worked example's campaigns. Without it a run ends at the turn its reference reaches
+  `machine.target_energy_mev`, so a slower design tracks an extra turn and its end-of-run scores jump.
 - `timeout_min`: about 3× an evaluation, so that a hung evaluation cannot stall the campaign.
 - The variables' ranges. For the dee aperture (`python -m PyCentralRegion.geometry.build bounds <base run toml>`
   prints the bounds; `geometry.options.check_bounds` holds the first three at build time):
@@ -86,9 +89,12 @@ Before the first real run, check the campaign file:
 
 ## 3. Pilot: cheap variables on existing fields (about 35 min)
 
-`mobo_pilot.toml` optimises RF phase, dee voltage and a first-harmonic trim on the fields of
-`design_wnop3_rotn3_g0ap`. No geometry is built, so every evaluation is about 1.6 min of tracking and scoring (95-108 s
-in the pilot of 2026-11-02, 33 min for its 20 evaluations):
+`mobo_pilot.toml` optimises RF phase, dee voltage and a first-harmonic trim (by its two Cartesian components) on the
+fields of `design_wnop3_rotn3_g0ap`, every run 7 turns. No geometry is built, so every evaluation is about 1.6 min of
+tracking and scoring (95-108 s in the first pilot of 2026-11-02, 33 min for its 20 evaluations). That first pilot
+varied the trim by amplitude and azimuth and stopped every run at 3 MeV; its report
+(`E:\HCHC1.5\Results\CR\pcr_validation\mobo\pilot_analysis\pilot_report.md`) is why the file now does neither, and
+so it has a new `campaign_dir`.
 
 ```powershell
 & $py -m PyCentralRegion.cli optimize $campaign
@@ -96,14 +102,18 @@ in the pilot of 2026-11-02, 33 min for its 20 evaluations):
 
 The driver logs every evaluation as it starts and ends. The first evaluation is the warm start, the design as
 tracked. Its I_final should come out at 4.05 mA (T = 50.40 % of 8.03 mA at the search fidelity: 4.049 mA in the
-pilot of 2026-11-02).
+first pilot). The base design reaches 3 MeV at its 7th turn, so 7 turns should give it the run it had with the stop
+(array for array in a 200-particle check without space charge).
 
 ## 4. The campaign with geometry variables
 
 `mobo_campaign.toml` adds to the pilot's variables the beam channel's aperture (inner and outer height, taper centre
-and length) and the spiral-inflector rotation (`kind = "geometry"`), and a radial slit (cheap): 13 variables, 120
-evaluations. For another design, start from it or from the pilot's file. Read its header first: it lists what the
-loop does not see, among them that the gap-0 hole does not follow the inflector rotation.
+and length) and the spiral-inflector rotation (`kind = "geometry"`): 9 variables, 120 evaluations. For another
+design, start from it or from the pilot's file. Read its header first: it lists what the loop does not see, among them
+that the gap-0 hole does not follow the inflector rotation (at the ends of the ±3° range the bunch, flown straight
+from the hand-off plane as `gap0_hole` places the hole, meets gap 0's edge 4.7 / 0.6 mm from the hole's centre,
+against 2.2 mm at the base, where the tracked bunch meets it 1.1 mm from the centre) and that the metal test sees the
+channel heights in 2 mm steps.
 
 Every new geometry is built and solved under `<campaign_dir>\geometries\<key>\`. The first evaluation, the warm start,
 rebuilds the base design there (about 6 min; the build equals the design deck's model bit for bit).
@@ -121,10 +131,17 @@ Planning the budget:
   the tracking), and the driver follows it with `cheap_per_geometry` cheap evaluations of about 1.6 min each;
 - every evaluation process first compiles the tracking kernel, about 65 s of those 1.6 min;
 - with `cheap_per_geometry = 3`, a quarter of the evaluations build a geometry;
-- `n_startup` evaluations are random (`mobo_campaign.toml`: 16, the warm start and 15 random designs). With 6-13
-  variables, 10-16 random points and 60-120 evaluations in all is a reasonable start;
+- `n_startup` evaluations come before the model takes over: at least 2 × the number of variables + 1
+  (`mobo_campaign.toml`: 20, the warm start and 19 random designs, which are the base and 4 random geometries with
+  their cheap followers; `mobo_pilot.toml`: 9);
+- designs of one flat channel (`ap_inner` = `ap_outer`) share one geometry whatever the taper's place, so they build
+  once;
 - `mobo_campaign.toml`: 30 × 6 min + 90 × 1.6 min, about 5.5 h for its 120 evaluations (`--max-hours 10` runs it to
   the end, with room for fields as slow as the design deck's run: 8 min instead of 4).
+
+A radial slit comes after, in a campaign of its own on the design this one chooses: `mobo_slit.toml` varies the slit's
+opening, azimuth and offset at one fixed pass (one campaign per pass), 20 evaluations of about 1.6 min. Its header
+says how to point it at a campaign's design.
 
 `--max-hours` bounds one run of the driver. `max_evals` bounds the whole campaign (`--max-evals N` overrides it);
 running the same command again continues to it. `--set key=value` overrides any key of the campaign file for one run,

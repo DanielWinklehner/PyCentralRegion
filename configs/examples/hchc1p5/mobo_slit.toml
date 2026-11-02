@@ -1,0 +1,85 @@
+# A radial slit for a chosen design: a cheap-only MOBO campaign over the slit's opening, azimuth and radial offset at
+# one pass, on one geometry's model and fields (the slit is an obstacle only: no new build, no new BEM), about 1.6 min
+# per evaluation. It follows the full campaign (mobo_campaign.toml), whose pilot showed why the slit is not one of its
+# variables (E:\HCHC1.5\Results\CR\pcr_validation\mobo\pilot_analysis\pilot_report.md): with no slit, the slit's other
+# coordinates do nothing; small openings lose most of the beam; and its pass is an unordered choice, not a scale.
+#   pcr optimize        configs/examples/hchc1p5/mobo_slit.toml --dry-run   (prints the first evaluation's command)
+#   pcr optimize        configs/examples/hchc1p5/mobo_slit.toml             (runs until max_evals; rerun continues)
+#   pcr optimize-status configs/examples/hchc1p5/mobo_slit.toml
+#   pcr optimize-verify configs/examples/hchc1p5/mobo_slit.toml --pareto    (every particle, SC 128^3 every step)
+# Every evaluation uses the GPU.
+#
+# The design. As written, the slit goes on the worked example as tracked on 2026-10-31: design_wnop3_rotn3_g0ap's own
+# model and fields at -15 deg, dee voltage x 1, no trim. For a design of the full campaign, add that evaluation's
+# overrides to `fixed`: the ones of its fixed list and its variables, then its geometry's
+# paths.model3d / paths.fields (<campaign_dir>/geometries/<key>/...), as its entry in <campaign_dir>/evals.jsonl lists
+# them, without the fidelity's (n_final, sc_final_*, n_tracks). The tracker checks that the model was built at the
+# design's inflector rotation, so that override has to come along. Give that campaign another campaign_dir as well
+# (e.g. slit_p3_<campaign>_<id>): the driver checks a store against the variables only, not against `fixed`, so in
+# the old folder it would take the earlier design's slits for this design's.
+#
+# The pass. The slit's centre is the reference particle's radius at its crossing number pass_index of the slit's ray
+# (the probes' pass numbering), plus slit_off. A pass is a choice, not a scale, so it is fixed here: run one campaign
+# per pass (copy this file with another slit.pass_index and another campaign_dir) and compare their fronts.
+
+[mobo]
+campaign_dir = "E:/HCHC1.5/Results/CR/mobo/slit_p3_wnop3_rotn3_g0ap"
+base_config_file = "design_wnop3_rotn3_g0ap.toml"
+physics_python = "C:/Users/Daniel/anaconda3/envs/accel-dev-env/python.exe"
+sampler = "gp"                 # constrained 3-objective GP (logCEHVI); "tpe" works on the same store
+seed = 0
+n_startup = 8                  # the warm start and 7 random slits (>= 2 x 3 + 1), then 12 model-guided ones
+max_evals = 20
+fixed = [
+    "slit.pass_index=3",                                    # the slit at the reference's 3rd crossing of its ray
+    "btrim.r_min_m=0.05", "btrim.r_max_m=0.135",            # the campaigns' trim extent (no trim on the base design)
+    "track.turns=7", "track.stop_at_target_energy=false",   # every design scored at its 7th turn, as in the campaign
+]
+# A 2 x 5 mm opening on the reference's 3rd crossing of the 315 deg ray. The slit smoke test of 2026-11-01 (another
+# particle sample at the same resolution, E:\HCHC1.5\Results\CR\pcr_validation\slit_sc) gave T 50.45 % = 4.053 mA
+# without a slit, 35.13 % = 2.822 mA with this one and 27.90 % = 2.241 mA with 2 x 3 mm.
+warm_start = [{slit_hw = 5.0, slit_az = 315.0, slit_off = 0.0}]
+
+[[mobo.variables]]
+name = "slit_hw"
+target = "slit.half_width_mm"  # half the opening between the jaws [mm]; smaller openings take most of the beam
+low = 2.5
+high = 8.0
+
+[[mobo.variables]]
+name = "slit_az"
+target = "slit.azimuth_deg"    # the jaws' ray, inside dee 3 (315 -+ 16.3 deg at the base's opening), ~3 deg in from
+low = 302.0                    # its edges: the slit is an obstacle in a field-free region, the fields stay as they are
+high = 328.0
+
+[[mobo.variables]]
+name = "slit_off"
+target = "slit.offset_mm"      # the opening's centre off the reference's radius at that pass [mm]
+low = -5.0
+high = 5.0
+
+[[mobo.objectives]]
+metric = "I_final"             # T x injected current [mA]
+direction = "maximize"
+
+[[mobo.objectives]]
+metric = "valley_all"          # share of probe crossings between the turns, the 8 probes' crossings pooled
+direction = "minimize"
+
+[[mobo.objectives]]
+metric = "ratio"               # aspect ratio of the bunch core at the last turn
+direction = "minimize"
+
+[[mobo.constraints]]
+metric = "E_med"               # median final energy [MeV], at the 7th turn
+op = ">="
+value = 2.9
+
+# The fidelities differ in resolution only; both track exactly 7 turns (`fixed` above).
+[mobo.fidelities.search]       # what the sampler learns from: 10k particles, SC 64^3 every 5 steps
+overrides = ["track.n_final=10000", "track.sc_final_cells=64", "track.sc_final_every=5", "track.n_tracks=10000"]
+timeout_min = 30.0
+
+[mobo.fidelities.verify]       # pcr optimize-verify: every particle, SC 128^3 every step
+overrides = ["track.n_final=0", "track.sc_final_cells=128", "track.sc_final_every=1"]
+timeout_min = 240.0

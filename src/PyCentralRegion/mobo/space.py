@@ -15,19 +15,20 @@ the driver refuses to continue a store that they no longer map onto its evaluate
 A variable is one of two kinds. 'geometry' variables change the electrodes, so a new value needs a new build and
 3D BEM (an evaluation of about 6 min); 'cheap' variables (RF phase, dee voltage, a magnetic trim, a slit) reuse the
 fields and only re-track (about 1.6 min). The driver uses the kind to batch cheap evaluations on each new geometry,
-and the geometry key (a hash of everything the build and the BEM read) to share one model and one field map between
-the evaluations of a geometry.
+and the geometry key (a hash of everything the build and the BEM read; for a flat channel less the taper's place,
+which then changes no electrode) to share one model and one field map between the evaluations of a geometry.
 
 Objectives and constraints are read from an evaluation's ``scores`` by dotted path. Constraints follow optuna's
 convention: a value <= 0 is feasible, so ``metric >= value`` is stored as ``value - metric``.
 """
+import copy
 import dataclasses
 import hashlib
 import json
 import math
 import warnings
 
-from ..config import ConfigError, from_dict, get_dotted, json_default, toml_value
+from ..config import ConfigError, from_dict, get_dotted, json_default, section, set_dotted, toml_value
 
 KINDS = ('cheap', 'geometry')
 DIRECTIONS = ('maximize', 'minimize')
@@ -240,11 +241,39 @@ def constraint_values(cfg, scores):
 # geometry
 def geometry_parts(base, cfg, params):
     """What one geometry's build and BEM depend on: the geometry-relevant parts of the base config (fidelity and
-    fixed overrides applied) and the values of the geometry variables."""
+    fixed overrides applied) and the values of the geometry variables, less the [geometry] keys ``idle_geometry_keys``
+    finds idle (the taper's place of a flat channel, which changes no electrode), which 'idle' then lists: the
+    designs that differ only in those share one key. Nothing is dropped while a cheap variable sets a [geometry]
+    key (``MoboConfig.validate`` warns of it): the channel a geometry is built with then depends on more than these
+    parts. A design that loses no key has the parts it always had."""
     paths = base.get('paths', {})
-    return {'sections': {s: base.get(s, {}) for s in GEOMETRY_SECTIONS},
-            'paths': {p: paths.get(p, '') for p in GEOMETRY_PATHS},
-            'variables': {v.target: params[v.name] for v in cfg.geometry_variables}}
+    parts = {'sections': {s: base.get(s, {}) for s in GEOMETRY_SECTIONS},
+             'paths': {p: paths.get(p, '') for p in GEOMETRY_PATHS},
+             'variables': {v.target: params[v.name] for v in cfg.geometry_variables}}
+    cheap_geometry = any(v.target.startswith('geometry.') for v in cfg.cheap_variables)
+    idle = () if cheap_geometry else idle_geometry_keys(parts)
+    geometry = {k: x for k, x in parts['sections']['geometry'].items() if k not in idle}
+    variables = {t: x for t, x in parts['variables'].items()
+                 if not (t.startswith('geometry.') and t.partition('.')[2] in idle)}
+    dropped = (set(parts['sections']['geometry']) - set(geometry)) | {
+        t.partition('.')[2] for t in set(parts['variables']) - set(variables)}
+    if dropped:
+        parts['sections']['geometry'], parts['variables'], parts['idle'] = geometry, variables, sorted(dropped)
+    return parts
+
+
+def idle_geometry_keys(parts):
+    """The [geometry] keys ``GeometryConfig.idle_keys`` gives for the design in these parts (the taper's place of a
+    flat channel), read from the base's [geometry] with the geometry variables applied; () when that section does not
+    read (the design is then keyed as it stands, and its build says what is wrong with it)."""
+    run = {'geometry': copy.deepcopy(parts['sections']['geometry'])}
+    try:
+        for target, x in parts['variables'].items():
+            if target.startswith('geometry.'):
+                set_dotted(run, target.split('.'), x)
+        return tuple(section(run, 'geometry').idle_keys())
+    except (TypeError, ValueError):                      # ConfigError included
+        return ()
 
 
 def geometry_key(base, cfg, params):

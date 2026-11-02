@@ -15,7 +15,8 @@ The beam channel: every dee is hollowed by a channel of full height ``aperture_i
 to r1 = aperture_taper_center_mm + aperture_taper_length_mm / 2 (``channel_height_mm``). The dummy dees (and the star
 ground) share the taper radii and take their own heights when ``dummy_aperture_inner_mm`` / ``dummy_aperture_outer_mm``
 are non-zero. The four are independent (an optimiser needs no ordering constraint: inner > outer is an inverted
-taper). ``check_bounds`` holds them to what can be built, at build time:
+taper); when both channels are flat (inner = outer, for the dees and for the dummy dees) the taper's place changes
+no electrode (``GeometryConfig.idle_keys``). ``check_bounds`` holds them to what can be built, at build time:
 
 * every height <= 2 x (plate_half_gap_mm - dee_wall_mm): the dee plates must fit inside the plate / pole gap;
 * the channel clears the spiral-inflector housing's exit, the opening the beam leaves the housing by: the inner
@@ -271,6 +272,15 @@ class GeometryConfig:
         """(r0, r1) [mm]: the full heights change linearly from the inner to the outer value between these radii."""
         c, h = float(self.aperture_taper_center_mm), 0.5 * float(self.aperture_taper_length_mm)
         return c - h, c + h
+
+    def idle_keys(self) -> tuple:
+        """The keys the MOBO geometry key leaves out of this geometry's key: the taper's place when the dees' channel
+        and the dummy dees' each have one height at every radius (a flat channel: the taper's ends then change no
+        electrode, they only add collinear points to the aperture tool, the same metal meshed along other circles),
+        so the designs of one flat channel share one build. Other keys that change no electrode (plot_dees, say)
+        stay in the key."""
+        flat = len(set(self.aperture_heights())) == 1 and len(set(self.dummy_aperture_heights())) == 1
+        return ('aperture_taper_center_mm', 'aperture_taper_length_mm') if flat else ()
 
 
 def channel_height_mm(r_mm, radii, heights) -> float:

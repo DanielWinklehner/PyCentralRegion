@@ -76,11 +76,13 @@ timeout_min = 30.0
 
 Worked examples:
 - `configs/examples/toy/campaign.toml`: the analytic toy, 30 evaluations in about 8 s (17 s with the GP);
-- `configs/examples/hchc1p5/mobo_pilot.toml`: cheap variables only (RF phase, dee voltage, first-harmonic trim), on
-  the worked example's existing fields, 20 evaluations;
+- `configs/examples/hchc1p5/mobo_pilot.toml`: cheap variables only (RF phase, dee voltage, the first-harmonic trim's
+  two components), on the worked example's existing fields, 20 evaluations;
 - `configs/examples/hchc1p5/mobo_campaign.toml`: the full campaign: the beam channel's aperture and the
-  spiral-inflector rotation (geometry) with the RF phase, the dee voltage, the trim and a radial slit (cheap); 13
-  variables, 120 evaluations, about 5.5 h. Its header lists what the loop does not see.
+  spiral-inflector rotation (geometry) with the RF phase, the dee voltage and the trim (cheap); 9 variables, 120
+  evaluations, about 5.5 h. Its header lists what the first pilot changed and what the loop does not see;
+- `configs/examples/hchc1p5/mobo_slit.toml`: a radial slit for the chosen design, a campaign of its own (cheap: the
+  slit's opening, azimuth and offset at one fixed pass), 20 evaluations.
 
 ## Variables
 
@@ -115,9 +117,15 @@ The geometry key is a hash of what the build and the BEM read: the sections `[ge
 and `[fields]` as the base run file writes them (with `fixed` and the fidelity's overrides), the paths `paths.seed`,
 `paths.handoff`, `paths.housing_outline` and `paths.housing_step`, and the geometry variables' values. It holds
 neither the code's defaults nor the files' contents: after a change of either, start another `campaign_dir`.
+The taper's place (`aperture_taper_center_mm`, `aperture_taper_length_mm`) is left out where the dees' channel and
+the dummy dees' each have one height at every radius (`GeometryConfig.idle_keys`): there it changes no electrode, it
+only adds points to the aperture tool, so the designs of one flat channel share one key and one build, and the parts
+list the keys left out (`idle`). No other key is left out (one that changes no electrode, such as `plot_dees`, still
+keys the geometry), and every other design's key is the hash of its parts as it always was.
 Evaluations with the same key share one model and one field map in `<campaign_dir>/geometries/<key>/`. A `cheap`
 variable that targets one of these sections gets a warning, because its evaluations would share fields that do not
-belong to them.
+belong to them; while one sets a `[geometry]` key, no key is left out (a cheap channel height could taper a channel
+the parts call flat).
 
 After every new geometry whose fields were made, the driver runs `cheap_per_geometry` evaluations on it. They take
 that evaluation's geometry values exactly (a warm start's included), so they share its key and its fields, and only
@@ -132,14 +140,19 @@ Useful targets:
 |---|---|---|
 | RF phase | `track.phases_deg` (`as_list = true`) | cheap |
 | dee voltage | `track.volt_scale` | cheap |
-| first-harmonic trim | `btrim.amplitude_t`, `btrim.phase_deg` | cheap |
+| first-harmonic trim | `btrim.amplitude_cos_t`, `btrim.amplitude_sin_t` (its Cartesian components) | cheap |
 | collimating slit | `slit.half_width_mm`, `slit.azimuth_deg`, `slit.offset_mm`, `slit.pass_index` (`integer = true`) | cheap |
 | spiral-inflector rotation | `inflector.rotation_deg` (with `geometry.si_rotation = "fixed"`) | geometry |
 | dee vertical aperture | `geometry.aperture_inner_mm`, `aperture_outer_mm`, `aperture_taper_center_mm`, `aperture_taper_length_mm` | geometry |
 | a gap window | `geometry.windows.<i>.half_height_mm` | geometry |
 
-Two of these are awkward for any sampler: `slit.half_width_mm = 0` means no slit, next to small widths that pass
-almost no beam, so the scores jump at that end; `btrim.phase_deg` is periodic and does nothing at zero amplitude.
+Two knobs are awkward for any sampler in their plain form:
+- The trim by amplitude and azimuth (`btrim.amplitude_t`, `btrim.phase_deg`): the azimuth is periodic, so -180° and
+  +180° are one trim on opposite faces of the box, and it does nothing at zero amplitude. Its Cartesian components
+  above, which add to the polar part, have neither a seam nor more than one zero.
+- The slit: `slit.half_width_mm = 0` means no slit, which leaves its other coordinates without effect, next to small
+  widths that pass almost no beam; and `slit.pass_index` is an unordered choice, not a scale. Give it a campaign of
+  its own on the chosen design, with the pass fixed and an open slit in every design (`mobo_slit.toml`).
 
 ## Objectives and constraints
 
@@ -190,9 +203,19 @@ A fidelity is a named list of overrides, applied after `fixed` and before the va
 `timeout_min` stops an evaluation that runs longer, which is then recorded failed.
 
 Let the fidelities differ in resolution only (particles, space-charge grid and interval), not in what is simulated
-(turns, energies): then the search-to-verify shift of a score is its resolution error. The worked example's
-fidelities both track to the base's turn cap (`track.turns = 8`; a run ends when the reference reaches
-`machine.target_energy_mev`, within 7 turns for the base design).
+(turns, energies): then the search-to-verify shift of a score is its resolution error.
+
+Score every design at the same turn too. By default a run ends at the turn its reference reaches
+`machine.target_energy_mev`, or after `track.turns`. A design that accelerates more slowly then tracks an extra
+turn, and its end-of-run scores jump with it: in the first pilot, two designs below a dee-voltage scale of about 0.97
+needed an 8th turn. The worked example's campaigns therefore set `track.turns = 7` and
+`track.stop_at_target_energy = false` in `fixed`, so every run tracks exactly 7 turns. The base design reaches 3 MeV
+at its 7th turn, so its run should be the one it had with the stop (array for array at 200 particles without space
+charge, `pcr_validation\fixes_2026-11-02\track`; with GPU space charge expect the same fates). A slow design ends
+below 3 MeV, where the `E_med` constraint judges it: with `E_med >= 2.9` one that ends at 2.9-3.0 MeV stays feasible
+(the pilot's design 0015, dee voltage × 0.95 at -29°, ends its 7th turn near 2.93 MeV: a mean of 2.92 in the pilot's
+run, a median of 2.94 in a 200-particle rerun without space charge); `>= 3.0` asks for the design energy at the 7th
+turn.
 
 | fidelity | particles | SC | one evaluation on known fields |
 |---|---|---|---|

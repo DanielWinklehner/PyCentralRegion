@@ -1,7 +1,7 @@
 # MOBO pilot on the worked example: about 20 evaluations over cheap variables only (RF phase, dee-voltage scale and a
 # first-harmonic magnetic trim), all on the existing electrode model and BEM fields of design_wnop3_rotn3_g0ap (its
 # paths.model3d / paths.fields), so every evaluation is a 3D bunch tracking with space charge plus scoring, about
-# 1.6 min (the 20 evaluations took 33 min).
+# 1.6 min (the 20 evaluations of the first pilot took 33 min).
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml --dry-run   (prints the first evaluation's command)
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml             (runs until max_evals; rerun continues)
 #   pcr optimize-status configs/examples/hchc1p5/mobo_pilot.toml
@@ -11,17 +11,34 @@
 # (they run the code the driver runs). Every evaluation uses the GPU. Stopping the driver (Ctrl+C, closing its window,
 # the end of --max-hours) stops the running evaluation with everything it started; running it again continues the
 # campaign.
+#
+# The first pilot (2026-11-02; E:\HCHC1.5\Results\CR\pcr_validation\mobo\pilot_wnop3_rotn3_g0ap, its report in
+# ..\pilot_analysis\pilot_report.md) varied the trim by amplitude and azimuth and tracked every design until its
+# reference reached 3 MeV. This file is its successor, another search space and so another campaign_dir:
+# * the trim by its Cartesian components (trim_c, trim_s): the azimuth's seam at +-180 deg and its dead value at zero
+#   amplitude put 10 of the first pilot's 12 GP proposals on a bound;
+# * every run tracks 7 turns (in `fixed`): two designs below a dee-voltage scale of about 0.97 needed an 8th turn to
+#   reach 3 MeV, and the end-of-run scores jump with the turn count. A slow design now ends below 3 MeV, where the
+#   E_med constraint judges it: with E_med >= 2.9 one that ends at 2.9-3.0 MeV stays feasible (design 0015, volt
+#   0.95 at -29 deg, ends its 7th turn near 2.93 MeV: a mean of 2.92 in the first pilot's run, a median of 2.94 in a
+#   200-particle rerun without space charge); 3.0 would ask for the design energy at the 7th turn.
+# The warm start reaches 3 MeV in 7 turns, so it should repeat the first pilot's run (4.049 mA at the search
+# fidelity): under the old and the new rule it is the same run array for array at 200 particles without space
+# charge (pcr_validation\fixes_2026-11-02\track).
 
 [mobo]
-campaign_dir = "E:/HCHC1.5/Results/CR/mobo/pilot_wnop3_rotn3_g0ap"
+campaign_dir = "E:/HCHC1.5/Results/CR/mobo/pilot2_wnop3_rotn3_g0ap"
 base_config_file = "design_wnop3_rotn3_g0ap.toml"
 physics_python = "C:/Users/Daniel/anaconda3/envs/accel-dev-env/python.exe"
 sampler = "gp"                 # constrained 3-objective GP (logCEHVI); "tpe" works on the same store
 seed = 0
-n_startup = 8                  # the warm start plus 7 random designs, then 12 model-guided ones
+n_startup = 9                  # the warm start plus 8 random designs (>= 2 x 4 + 1), then 11 model-guided ones
 max_evals = 20
-fixed = ["btrim.r_min_m=0.05", "btrim.r_max_m=0.135"]    # radial extent of the trim (its shape is not optimised here)
-warm_start = [{phase = -15.0, volt = 1.0, trim_amp = 0.0, trim_phase = 0.0}]   # the design as tracked on 2026-10-31
+fixed = [
+    "btrim.r_min_m=0.05", "btrim.r_max_m=0.135",           # radial extent of the trim (its shape is not optimised here)
+    "track.turns=7", "track.stop_at_target_energy=false",  # every design scored at its 7th turn
+]
+warm_start = [{phase = -15.0, volt = 1.0, trim_c = 0.0, trim_s = 0.0}]   # the design as tracked on 2026-10-31
 
 [[mobo.variables]]
 name = "phase"
@@ -36,17 +53,20 @@ target = "track.volt_scale"    # dee voltage / the 65 kV the BEM fields are norm
 low = 0.95
 high = 1.10
 
+# The trim b(r) [b_c cos(theta) + b_s sin(theta)] by its Cartesian components: zero trim is one point, the centre of
+# the square, and there is no seam. The square's corners reach 2.83 mT (2 mT along the axes); use +-1.41e-3 if 2 mT
+# is the coil's limit in every direction.
 [[mobo.variables]]
-name = "trim_amp"
-target = "btrim.amplitude_t"   # first-harmonic trim amplitude [T]
-low = 0.0
+name = "trim_c"
+target = "btrim.amplitude_cos_t"   # first-harmonic trim, cos(theta) component b_c [T]
+low = -2e-3
 high = 2e-3
 
 [[mobo.variables]]
-name = "trim_phase"
-target = "btrim.phase_deg"     # its azimuth [deg]
-low = -180.0
-high = 180.0
+name = "trim_s"
+target = "btrim.amplitude_sin_t"   # its sin(theta) component b_s [T]
+low = -2e-3
+high = 2e-3
 
 [[mobo.objectives]]
 metric = "I_final"             # T x injected current [mA]
@@ -61,13 +81,12 @@ metric = "ratio"               # aspect ratio of the bunch core at the last turn
 direction = "minimize"
 
 [[mobo.constraints]]
-metric = "E_med"               # median final energy [MeV]
+metric = "E_med"               # median final energy [MeV], at the 7th turn
 op = ">="
 value = 2.9
 
-# The fidelities differ in resolution only. Both track to the base's turn cap (track.turns = 8; a run ends earlier,
-# when the reference reaches machine.target_energy_mev = 3 MeV: within 7 turns for the base design), so a design too
-# slow to get there is cut at the same turn in both, and the search-to-verify shift of a score is its resolution error.
+# The fidelities differ in resolution only. Both track exactly 7 turns (`fixed` above), so every design is scored at
+# the same turn in both, and the search-to-verify shift of a score is its resolution error.
 [mobo.fidelities.search]       # what the sampler learns from: 10k particles, SC 64^3 every 5 steps
 overrides = ["track.n_final=10000", "track.sc_final_cells=64", "track.sc_final_every=5", "track.n_tracks=10000"]
 timeout_min = 30.0
