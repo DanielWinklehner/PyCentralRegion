@@ -375,7 +375,7 @@ class MachineConfig:
     r_max_cavity_m: float = 0.37     # outer end of the gap lines
     r_max_m: float = 0.38            # tracking: particles beyond this radius are lost
     z_max_m: float = 0.030           # tracking: particles beyond |z| are lost
-    target_energy_mev: float = 3.0
+    target_energy_mev: float = 3.0   # tracking: a run ends at the turn its reference reaches it (see [track])
     n_turns_design: int = 6          # turns of the seed optimization (rebuilds its dee system)
     skip_turns_design: int = 1
 
@@ -422,6 +422,8 @@ class TrackConfig:
     pusher: str = 'boris_rel'
     steps_per_turn: int = 1000
     turns: int = 8
+    stop_at_target_energy: bool = True   # end a run at the turn its reference reaches machine.target_energy_mev;
+    #                                      false: every run tracks `turns` turns (the same turn for every design)
     fast3d: bool = True              # numba 3D fast path
     fast3d_interp: str = 'point'
     volt_scale: float = 1.0          # dee voltage / the model's voltage

@@ -37,7 +37,7 @@ r_min_m = 0.005             # inner end of the gap lines
 r_max_cavity_m = 0.37       # outer end of the gap lines
 r_max_m = 0.38              # tracking: particles beyond this radius are lost
 z_max_m = 0.030             # tracking: particles beyond |z| are lost
-target_energy_mev = 3.0
+target_energy_mev = 3.0     # tracking: a run ends at the turn its reference reaches it (track.stop_at_target_energy)
 n_turns_design = 6          # turns of the seed optimization (used to rebuild its dee system)
 skip_turns_design = 1
 
@@ -76,6 +76,8 @@ gpu_fit_safety = 1.05       # GPU memory head-room factor of the potential batch
 pusher = "boris_rel"
 steps_per_turn = 1000
 turns = 8
+stop_at_target_energy = true   # end a run at the turn its reference reaches machine.target_energy_mev; false: every
+                            # run tracks `turns` turns, so designs of an optimisation are scored at the same turn
 fast3d = true               # numba 3D fast path
 fast3d_interp = "point"
 volt_scale = 1.0            # dee voltage / the model's voltage

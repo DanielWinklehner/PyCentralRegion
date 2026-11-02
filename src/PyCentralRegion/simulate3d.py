@@ -16,6 +16,7 @@ The field cache and the outputs keep the layout of the design deck this package 
 and ``analysis`` reads both. Stages reuse an existing output and never overwrite one.
 """
 import json
+import math
 import pickle
 import time
 from pathlib import Path
@@ -275,7 +276,10 @@ class BunchTracker:
         self.design, _ = make_design(cfg, self.seed, bfield=self.bfield)
         self.inflector = make_inflector(cfg, verbose=verbose)
         tc, mc = self.tc, self.mc
-        finder = AcceleratedOrbitFinder(self.design, target_energy_mev=mc.target_energy_mev, max_radius_m=mc.r_max_m,
+        # a run (the reference's and the bunch's, which ends with its virtual reference) stops at the turn the
+        # reference reaches the target energy, or after tc.turns; without that stop every run tracks tc.turns
+        stop_mev = mc.target_energy_mev if tc.stop_at_target_energy else math.inf
+        finder = AcceleratedOrbitFinder(self.design, target_energy_mev=stop_mev, max_radius_m=mc.r_max_m,
                                         algorithm=tc.pusher, steps_per_turn=tc.steps_per_turn, verbose=False,
                                         gap_model='bem2d', dimensionality='3D', z_max=mc.z_max_m)
         finder.attach_inflector(self.inflector, obstacle=False, field_dim=3)
@@ -533,7 +537,8 @@ def track_stage(cfg, verbose=True):
     t0 = time.time()
     bt = BunchTracker(cfg, verbose=verbose)
     phases = bt.phases()
-    say(f"[track] {rc.name}: pusher {tc.pusher}, {tc.steps_per_turn} steps per turn, {tc.turns} turns; seed "
+    say(f"[track] {rc.name}: pusher {tc.pusher}, {tc.steps_per_turn} steps per turn, {tc.turns} turns"
+        f"{'' if tc.stop_at_target_energy else ' (no stop at the target energy)'}; seed "
         f"{Path(pc.seed).name} (phase {bt.phase0:+.1f} deg); phases {phases}; space charge {'on' if tc.sc else 'off'}")
     ref = bt.reference(phases)
     scan = {}
@@ -550,7 +555,8 @@ def track_stage(cfg, verbose=True):
         f"E {(final['e_mean'] or [0])[-1]:.3f} +- {(final['e_std'] or [0])[-1]:.3f} MeV")
 
     mc = bt.mc
-    summary = {'seed': str(pc.seed), 'tag': rc.name, 'turns': tc.turns, 'phases': phases,
+    summary = {'seed': str(pc.seed), 'tag': rc.name, 'turns': tc.turns,
+               'stop_at_target_energy': bool(tc.stop_at_target_energy), 'phases': phases,
                'n_scan': int(tc.n_scan) if scan else 0, 'n_final': int(final['n']),
                'f_rev_mhz': bt.f_mhz, 'rf_mhz': mc.harmonic * bt.f_mhz, 'harmonic': mc.harmonic,
                'bmap': Path(pc.bfield_3d).name, 'volt_scale': float(tc.volt_scale),
