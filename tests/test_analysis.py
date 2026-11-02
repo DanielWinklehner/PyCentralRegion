@@ -1,9 +1,10 @@
 """analysis: known answers of the scoring library on synthetic bunches (no machine data): the core-variance factor,
 the bunch shape of a Gaussian of known aspect ratio and tilt, per-particle orbit centres of circles with known
-centres, probe crossings at a known radius, the turn structure, energy windows, the survivor and hand-off-index rules,
-the release-phase budget bins, the operating-point rule, a whole synthetic run through score_run, the [machine]
-fallbacks and the tracked species, a synthetic space-charge twin whose guiding-centre core rotates by a known angle
-per turn, and the summary figure of a score made with other settings."""
+centres, probe crossings at a known radius and crossing by crossing against the tracker's probe recorder (with
+PyPATools), the shared probe rules at their edges, the kinetic energy, the turn structure, energy windows, the survivor
+and hand-off-index rules, the release-phase budget bins, the operating-point rule, a whole synthetic run through
+score_run, the [machine] fallbacks and the tracked species, a synthetic space-charge twin whose guiding-centre core
+rotates by a known angle per turn, and the summary figure of a score made with other settings."""
 import json
 import pickle
 
@@ -14,7 +15,7 @@ from PyCentralRegion.analysis import metrics as M
 from PyCentralRegion.analysis import objectives as O
 from PyCentralRegion.analysis import runs as R
 from PyCentralRegion.analysis import twins as TW
-from PyCentralRegion.config import MachineConfig, get_dotted
+from PyCentralRegion.config import MachineConfig, get_dotted, json_clean
 
 pytest.importorskip('scipy')
 
@@ -125,6 +126,87 @@ def test_probe_crossings_at_known_radius_and_pass_numbering():
     rc = M.reference_crossings(ref, 90.0, 1.0)
     assert sorted(rc) == [0, 1, 2]
     assert rc[1] == pytest.approx(60.0 + 24.0 * 1.25, abs=0.01)
+
+
+def _probe_spiral(sense, spt=500, n_steps=2300, dt=1e-10):
+    """Five particles on spirals gaining 24 mm per turn from 60 mm, one record per step: born at different steps
+    (frozen where they are born until then), particle 2 stepping back across the 45 deg probe for one record, particle
+    3 lost at step 1500 (frozen there after). xyz (S, 5, 3) [m], v (S, 5, 3) [m/s], alive (S, 5)."""
+    s = np.arange(n_steps)[:, None]
+    birth = np.array([0, 0, 40, 260, 731])
+    tau = np.maximum(s - birth, 0) / spt
+    th = np.deg2rad([10.0, 30.0, 44.0, 200.0, 300.0]) + sense * 2 * np.pi * tau
+    past = np.angle(np.exp(1j * sense * (th[:, 2] - np.deg2rad(45.0)))) > 0.0
+    sx = np.flatnonzero(past[1:] & ~past[:-1] & (s[1:, 0] > birth[2]))[0] + 1    # the first record past the probe
+    th[sx + 1, 2] = np.deg2rad(45.0 - 0.2 * sense)                              # the next one back before it
+    r = 0.060 + 0.024 * tau
+    xyz = np.stack([r * np.cos(th), r * np.sin(th), 1e-3 * np.sin(2 * np.pi * 1.3 * tau + np.arange(5))], axis=2)
+    alive = s >= birth
+    alive[1500:, 3] = False
+    xyz[1500:, 3] = xyz[1499, 3]
+    return xyz, np.gradient(xyz, dt, axis=0), alive
+
+
+@pytest.mark.parametrize('sense', [1.0, -1.0])
+def test_probe_recorder_matches_probe_crossings(sense):
+    """The tracker's probes (ProbeRecorder, step by step in the run) and the probes built from recorded tracks
+    (probe_crossings) apply the same rules (``probes``): the beam's sense, each particle's starting pass, every
+    crossing with its particle, step, pass and direction (the step back gives one crossing against the beam and
+    advances the pass twice) and its position to 1e-12 m."""
+    pytest.importorskip('PyPATools')
+    from PyCentralRegion.accelerated_orbit_finder import ProbeRecorder
+    dt, angles = 1e-10, [25.0, 45.0, 160.0, -90.0]
+    xyz, v, alive = _probe_spiral(sense, dt=dt)
+    rec = ProbeRecorder(angles)
+    for k in range(len(xyz)):
+        rec.record(k, xyz[k], v[k], alive[k], k * dt)
+    assert rec.sense == M.rotation_sense(xyz, alive) == sense
+    for a, on in zip(angles, rec.data()):
+        off = M.probe_crossings(xyz, alive, np.arange(len(xyz)), dt, sense, a, forward_only=False)
+        o = np.lexsort((on['step'], on['id']))                    # the recorder's rows come step by step
+        assert len(o) == len(off['j']) > 12
+        for key, ref in (('id', off['j']), ('step', off['step']), ('pass', off['pass']),
+                         ('direction', off['direction'])):
+            np.testing.assert_array_equal(on[key][o], ref, err_msg=f"{key} at {a:g} deg")
+        assert np.abs(on['xyz'][o] - off['xyz']).max() < 1e-12
+        assert np.abs(np.hypot(on['xyz'][o, 0], on['xyz'][o, 1]) - 1e-3 * off['R']).max() < 1e-12
+        np.testing.assert_allclose(on['t'][o], off['t'], rtol=1e-12, atol=0.0)
+        assert not np.any((off['j'] == 3) & (off['step'] >= 1500))           # nothing after the loss
+    back = M.probe_crossings(xyz, alive, np.arange(len(xyz)), dt, sense, 45.0, forward_only=False)
+    m = back['j'] == 2
+    assert list(back['direction'][m][:3]) == [1, -1, 1] and np.all(np.diff(back['pass'][m]) == 1)
+    first = [M.probe_crossings(xyz, alive, np.arange(len(xyz)), dt, sense, a)['pass'][0] for a in angles]
+    assert 0 in first and 1 in first                           # particle 0 starts behind some probes, past others
+
+
+def test_probe_rules():
+    """The probe rules both callers share (``probes``) at their edges: the beam's sense (NaN rows left out, a tie is
+    +1), the starting pass on either side of a probe and across the wrap, for either sense (on the probe is pass 0),
+    the crossing fraction and interpolation, and a crossing's direction (on the plane counts as with the beam)."""
+    from PyCentralRegion import probes as P
+    r, v = np.array([[0.1, 0.0, 0.0], [0.0, 0.1, 0.0]]), np.array([[0.0, 1e6, 0.0], [1e6, 0.0, 0.0]])
+    assert P.beam_sense(r, v) == 1.0                                    # +1e5 - 1e5
+    assert P.beam_sense(r[:1], v[:1]) == 1.0 and P.beam_sense(r[:1], -v[:1]) == -1.0
+    assert P.beam_sense(np.r_[r[:1], np.full((1, 3), np.nan)], v) == 1.0
+    phi = np.deg2rad([45.0, 44.0, 46.0, 45.0 + 179.0, 45.0 - 179.0, 45.0 + 361.0])
+    assert P.start_pass(phi, 45.0, 1.0).tolist() == [0, 0, 1, 1, 0, 1]
+    assert P.start_pass(phi, 45.0, -1.0).tolist() == [0, 1, 0, 0, 1, 0]
+    assert P.start_pass(phi[:, None], [45.0, 50.0], 1.0).dtype == np.int32
+    f = P.crossing_fraction(np.array([-1.0, 3.0]), np.array([3.0, -1.0]))
+    assert f.tolist() == [0.25, 0.75]
+    assert P.interpolate(np.zeros((2, 3)), np.ones((2, 3)), f).tolist() == [[0.25] * 3, [0.75] * 3]
+    s1 = np.array([1e-3, 0.0, -1e-3])
+    assert P.crossing_direction(s1, 1.0).tolist() == [1, 1, -1] and P.crossing_direction(s1, 1.0).dtype == np.int8
+    assert P.crossing_direction(s1, -1.0).tolist() == [-1, 1, 1]
+
+
+def test_kinetic_energy():
+    """kinematics.kinetic_energy_mev (the tracker's final energies, the probes' E_mev): (gamma - 1) m from each row's
+    speed, 62 keV for a 62 keV proton in any direction, 0 at rest."""
+    from PyCentralRegion.kinematics import kinetic_energy_mev
+    beta = np.sqrt(1.0 - 1.0 / (1.0 + 0.062 / 938.272) ** 2)
+    e = kinetic_energy_mev(beta * 2.99792458e8 * np.array([[1.0, 0.0, 0.0], [0.0, 0.6, -0.8], [0.0] * 3]), 938.272)
+    assert e.shape == (3,) and e[:2] == pytest.approx(0.062, rel=1e-9) and e[2] == 0.0
 
 
 def _cfg(**kw):
@@ -304,7 +386,7 @@ def test_score_run_on_a_synthetic_bunch():
     assert bs['pass_index'] >= 0 and bs['offset_mm'] == pytest.approx(
         bs['r_center_mm'] - M.reference_crossings(run.ref_xyz, bs['azimuth_deg'], 1.0)[bs['pass_index']])
     assert get_dotted(sc, 'turns.3.sig_r') == sc['sig_r_t3']
-    assert R.clean(sc) == R.clean(R.clean(sc))                         # JSON-clean
+    assert json_clean(sc) == json_clean(json_clean(sc))                 # JSON-clean
 
 
 def test_score_without_handoff_and_saving(tmp_path):
@@ -346,7 +428,7 @@ def test_track_folder_round_trip(tmp_path):
     assert any('hand-off file unknown' in n for n in back.notes)
     np.testing.assert_array_equal(back.xyz, run.xyz)
     np.testing.assert_array_equal(back.ref_xyz, run.ref_xyz)
-    same = (lambda s: R.clean({k: v for k, v in s.items() if k not in ('tag', 'seconds', 'notes')}))
+    same = (lambda s: json_clean({k: v for k, v in s.items() if k not in ('tag', 'seconds', 'notes')}))
     assert same(M.score_run(back, _cfg())) == same(M.score_run(run, _cfg()))
 
 
@@ -445,8 +527,8 @@ def test_summary_figure_follows_the_score_settings(tmp_path):
     mpl.use('Agg')
     import matplotlib.pyplot as plt
     from PyCentralRegion.analysis.plots import summary_figure
-    sc = R.clean(M.score_run(_spiral_run(n=300, halo=0.1), _cfg(halo_sigma=2.5, acceptance_levels=(0.5, 0.95),
-                                                                 min_bin_count=10)))
+    sc = json_clean(M.score_run(_spiral_run(n=300, halo=0.1), _cfg(halo_sigma=2.5, acceptance_levels=(0.5, 0.95),
+                                                                    min_bin_count=10)))
     fig = summary_figure(sc, tmp_path / 'summary.png')
     try:
         assert 'halo2.5' in fig.axes[1].get_title() and 'nan' not in fig.axes[1].get_title()

@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from PyCentralRegion.config import ConfigError, InflectorConfig, MachineConfig
+from PyCentralRegion.frames import rotation_z, wrap_deg
 from PyCentralRegion.machine import apply_seed_geometry, check_supported
 from PyCentralRegion.rf_cavity import DeeSystem, create_dee_system
 from .options import GeometryConfig, channel_height_mm
@@ -456,7 +457,7 @@ def junction(cav):
         t = ((f1 - a)[0] * (-v[1]) - (f1 - a)[1] * (-v[0])) / det
         meet = a + t * u
         r_meet = float(np.hypot(*meet))
-    d_az = float((np.degrees(np.arctan2(b[1], b[0])) - np.degrees(np.arctan2(f1[1], f1[0])) + 180.0) % 360.0 - 180.0)
+    d_az = float(wrap_deg(np.degrees(np.arctan2(b[1], b[0])) - np.degrees(np.arctan2(f1[1], f1[0]))))
     return {'var_end': b, 'fix_start': f1, 'fix_end': f2, 'r_trans': float(np.hypot(*f1)),
             'jog': float(np.hypot(*(b - f1))), 'step_deg': d_az, 'meet': meet, 'r_meet': r_meet,
             'dr': r_meet - float(np.hypot(*f1)),
@@ -567,15 +568,10 @@ def si_rotation_deg(dees: DeeSystem) -> float:
     return float(INFLECTOR.rotation_deg)
 
 
-def _rot2(deg: float) -> np.ndarray:
-    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
-    return np.array([[c, -s], [s, c]])
-
-
 def rotate_points(xyz: np.ndarray, deg: float) -> np.ndarray:
     """(..., 2 or 3) points or vectors turned by deg about the machine (z) axis."""
     out = np.array(xyz, dtype=float, copy=True)
-    out[..., :2] = out[..., :2] @ _rot2(deg).T
+    out[..., :2] = out[..., :2] @ rotation_z(deg, 2).T
     return out
 
 
@@ -639,8 +635,8 @@ def fit_gap_to_line(cav, point, direction, s_range=(-0.06, 0.12), n: int = 4001)
         if best is None or jog < best[0]:
             best = (jog, p2, r_outer)
     jog, p2, r_outer = best
-    alpha = (np.degrees(np.arctan2(p2[1], p2[0]) - b) + 180.0) % 360.0 - 180.0
-    rho = (np.degrees(np.arctan2(d[1], d[0]) - np.arctan2(*(p2 - p1)[::-1])) + 180.0) % 360.0 - 180.0
+    alpha = wrap_deg(np.degrees(np.arctan2(p2[1], p2[0]) - b))
+    rho = wrap_deg(np.degrees(np.arctan2(d[1], d[0]) - np.arctan2(*(p2 - p1)[::-1])))
     cav.update_geometry(segment_angles=[float(alpha)], segment_radii=[float(r_outer)], segment_rotations=[float(rho)])
     seg = cav.segments[0]
     q1, q2 = np.asarray(seg['p1'][:2]), np.asarray(seg['p2'][:2])
@@ -662,7 +658,7 @@ def refit_gap0_on_plate(dees: DeeSystem, verbose: bool = True) -> dict:
     rot = si_rotation_deg(dees)
     half = 0.5 * float(cav.gap_width_at(float(sp['baseline']['r_mm']) * 1e-3))
     point, d, _ = plate_line(sp, half_gap_m=half)
-    R = _rot2(rot)
+    R = rotation_z(rot, 2)
     fit = fit_gap_to_line(cav, R @ point, R @ d)
     if verbose:
         C = R @ np.asarray(sp['corner']['rotated_mm'][:2], dtype=float)

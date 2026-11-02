@@ -12,6 +12,8 @@ from typing import Tuple, Optional, List, Dict
 from PyPATools.global_variables import CLIGHT
 from PyPATools.particles import ParticleDistribution
 
+from .frames import rotation_z
+
 
 class RFCavity:
     """
@@ -242,11 +244,10 @@ class RFCavity:
             # Optional rotation about the segment midpoint (decouples kick
             # direction from crossing azimuth). The CHAIN continues from the
             # NOMINAL (unrotated) endpoint so rotations don't propagate.
-            rot = np.deg2rad(self.segment_rotations[i]) if self.segment_rotations else 0.0
+            rot = self.segment_rotations[i] if self.segment_rotations else 0.0
             if rot != 0.0:
                 mid = 0.5 * (p1 + p2)
-                c, s = np.cos(rot), np.sin(rot)
-                R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+                R = rotation_z(rot)
                 p1_stored = mid + R @ (p1 - mid)
                 p2_stored = mid + R @ (p2 - mid)
             else:

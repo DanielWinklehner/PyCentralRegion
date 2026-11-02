@@ -39,7 +39,6 @@ failures (the driver's unusable scores).
 import hashlib
 import json
 import math
-import os
 import subprocess
 import sys
 import time
@@ -104,9 +103,7 @@ def hypervolume(points):
 def _write_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(json.dumps(data))
-    os.replace(tmp, path)
+    config.write_atomic(path, lambda p: p.write_text(json.dumps(data)))
 
 
 def build(cfg, t):

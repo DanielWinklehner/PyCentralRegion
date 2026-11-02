@@ -42,8 +42,10 @@ from typing import Optional
 
 import numpy as np
 
-from ..config import to_dict
-from .metrics import probe_crossings, run_state, wrap_deg
+from ..config import json_clean, to_dict, write_atomic
+from ..frames import wrap_deg
+from ..kinematics import kinetic_energy_mev
+from .metrics import probe_crossings, run_state
 
 TRACK_JSON, TRACK_PKL, TRACK_CONFIG = 'track.json', 'track_data.pkl', 'config.json'
 LEGACY_JSON, LEGACY_PKL, LEGACY_LOG = 'bunch_simulation3d{}.json', 'bunch_simulation3d{}_data.pkl', 's4_run{}.log'
@@ -346,8 +348,8 @@ def virtual_probe(run, angle_deg, cfg=None):
     steps_per_turn, and particle_ids, the bunch particle of each track), every crossing forward and back; id is the
     track index. The crossing rules are the tracker's (``metrics.probe_crossings``); the velocity is the chord over
     the record interval, so E_mev is that of the mean velocity between two records, with the tracked species' mass
-    (``metrics.tracked_species``; np.savez the dict to write the file)."""
-    from ..simulate3d import kinetic_energy_mev
+    (``metrics.tracked_species``) and the tracker's formula (``kinematics.kinetic_energy_mev``; np.savez the dict to
+    write the file)."""
     from .objectives import ScoreConfig
     k, steps, _, alive, surv, sense = run_state(run, cfg or ScoreConfig())
     pr = probe_crossings(run.xyz, alive, steps, 1.0 / k['f_rev'] / run.steps_per_turn, sense, angle_deg,
@@ -360,29 +362,10 @@ def virtual_probe(run, angle_deg, cfg=None):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-def clean(o):
-    """A score as plain JSON data: numpy scalars and arrays to Python, NaN and inf to None."""
-    if isinstance(o, dict):
-        return {str(k): clean(v) for k, v in o.items()}
-    if isinstance(o, (list, tuple)):
-        return [clean(v) for v in o]
-    if isinstance(o, np.ndarray):
-        return clean(o.tolist())
-    if isinstance(o, (bool, np.bool_)):
-        return bool(o)
-    if isinstance(o, (int, np.integer)):
-        return int(o)
-    if isinstance(o, (float, np.floating)):
-        return float(o) if np.isfinite(o) else None
-    return o
-
-
 def save_score(score, path):
-    """Write a score as JSON (``clean``), atomically: a reader never sees a half-written file."""
-    path = Path(path)
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(json.dumps(clean(score), indent=1))
-    tmp.replace(path)
+    """Write a score as plain JSON (``config.json_clean``: NaN and inf as null) whole (``config.write_atomic``): a
+    reader never sees a half-written file."""
+    write_atomic(Path(path), lambda p: p.write_text(json.dumps(json_clean(score), indent=1)))
 
 
 def load_score(path):

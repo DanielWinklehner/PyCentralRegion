@@ -16,39 +16,20 @@ The field cache and the outputs keep the layout of the design deck this package 
 and ``analysis`` reads both. Stages reuse an existing output and never overwrite one.
 """
 import json
-import os
 import pickle
 import time
 from pathlib import Path
 
 import numpy as np
 
-from .config import ConfigError, require, save_resolved, section, to_dict
+from .analysis.metrics import survivors
+from .config import ConfigError, json_default, require, save_resolved, section, to_dict, write_atomic
+from .kinematics import kinetic_energy_mev
 from .machine import (check_supported, load_seed, magnet_field_3d, make_design, make_inflector, reference_beam, say,
                       seed_orbit)
 
 TRACK_IDS_SEED = 12345        # sampling seed of the particles whose paths are kept
 SLIT_H_M = 1e-4               # node spacing of the slit raster [m]
-
-
-def kinetic_energy_mev(v, mass_mev):
-    beta2 = np.sum(v * v, axis=1) / 299792458.0 ** 2
-    return (1.0 / np.sqrt(1.0 - beta2) - 1.0) * mass_mev
-
-
-def _json_default(v):
-    if isinstance(v, np.generic):
-        return v.item()
-    if isinstance(v, np.ndarray):
-        return v.tolist()
-    return str(v)
-
-
-def _write_atomic(path, write):
-    """Write ``path`` through a temporary file, so a killed run never leaves a truncated output to be reused."""
-    tmp = Path(str(path) + '.part')
-    write(tmp)
-    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -127,7 +108,7 @@ def fields_stage(cfg, verbose=True):
     def write(p):
         with open(p, 'wb') as fh:
             pickle.dump(cache, fh, protocol=4)
-    _write_atomic(out, write)
+    write_atomic(out, write)
     say(f"[fields] cache {out} written ({time.time() - t0:.0f} s in all)")
     return out
 
@@ -475,28 +456,27 @@ class BunchTracker:
         return out
 
     def _full_record(self, out, fb, res, bunch, hits, track_ids):
-        """Final / initial states, snapshots and tracks of a full run into ``out``; returns the survivor mask (finite
-        last record, r < r_max, |z| < z_max, not lost on metal)."""
+        """Final / initial states, snapshots and tracks of a full run into ``out``; returns the survivor mask: the
+        scorer's rule (``analysis.metrics.survivors``) on the last full states, so position and velocity finite,
+        r < r_max, |z| < z_max and no metal hit (the stop step of the tracks: the hit's, else n_steps + 1)."""
         mc, tc, mass = self.mc, self.tc, self.mass_mev
         last = fb[-1]
-        lost_ids = set(int(h[0]) for h in hits)
+        n_steps = len(fb)
         ids = np.arange(len(last))
-        r_last = np.hypot(last[:, 0], last[:, 1])
-        ok = np.isfinite(last).all(axis=1) & (r_last < self.finder.r_max) & (np.abs(last[:, 2]) < mc.z_max_m)
-        ok &= ~np.isin(ids, list(lost_ids))
+        hit_step = {int(h[0]): int(h[1]) for h in hits}
+        stop = np.array([hit_step.get(i, n_steps + 1) for i in range(len(last))])
+        ok = survivors(last, stop, n_steps, np.full(len(last), np.inf), self.finder.r_max, mc.z_max_m)
         out['final_energies_mev'] = kinetic_energy_mev(last[ok, 3:6], mass)
         out['final_xyz'] = last[ok, :3]
         out['final_vz'] = last[ok, 5]
         out['initial_xyz'] = fb[0][:, :3]
         out['initial_energies_mev'] = kinetic_energy_mev(fb[0][:, 3:6], mass)
         out['n_lost_vertical'] = int(np.sum(np.isfinite(last).all(axis=1) & (np.abs(last[:, 2]) >= mc.z_max_m)
-                                            & ~np.isin(ids, list(lost_ids))))
-        n_steps = len(fb)
+                                            & (stop > n_steps)))
         out['hit_turn'] = hits[:, 1] / max(n_steps, 1) * max(res.n_turns, 1)
         t_clock0 = float((res.metadata.get('launch') or {}).get('t0_s', 0.0))
         dt = 1.0 / (self.f_mhz * 1e6) / tc.steps_per_turn
         birth = np.asarray(getattr(bunch, 'birth_time', np.zeros(len(last))), dtype=float)
-        hit_step = {int(h[0]): int(h[1]) for h in hits}
         snaps = []
         tref = np.asarray(res.trajectory_reference)
         for t_ns in tc.snapshot_ns:
@@ -507,14 +487,13 @@ class BunchTracker:
             if k >= n_steps:
                 continue
             snaps.append({'t_ns': t_ns, 'step': k, 'xyz': st[:, :3].copy(), 'vxyz': st[:, 3:6].copy(),
-                          'born': birth <= t_ns * 1e-9,
-                          'lost': np.array([hit_step.get(i, n_steps + 1) <= k for i in range(len(st))]),
+                          'born': birth <= t_ns * 1e-9, 'lost': stop <= k,
                           'E_mev': kinetic_energy_mev(st[:, 3:6], mass), 'ref_xyz': tref[min(k, len(tref) - 1), :3]})
         out['snapshots'] = snaps
         tr = getattr(fb, 'tracks', None)
         if tr is not None:
             out['tracks'] = {'ids': np.asarray(track_ids), 'steps': np.asarray(fb.track_steps), 'xyz': tr,
-                             'stop_step': np.array([hit_step.get(int(i), n_steps + 1) for i in track_ids]),
+                             'stop_step': stop[track_ids],
                              'n_steps': int(n_steps), 'steps_per_turn': int(tc.steps_per_turn),
                              'birth_step': np.asarray(np.round((birth - t_clock0) / dt), dtype=int)[track_ids],
                              'handoff_ids': np.asarray(getattr(bunch, 'handoff_index', ids))[track_ids],
@@ -596,7 +575,7 @@ def track_stage(cfg, verbose=True):
     def write_pkl(p):
         with open(p, 'wb') as fh:
             pickle.dump(data, fh, protocol=4)
-    _write_atomic(out_dir / 'track_data.pkl', write_pkl)
-    _write_atomic(out_json, lambda p: p.write_text(json.dumps(summary, indent=1, default=_json_default)))
+    write_atomic(out_dir / 'track_data.pkl', write_pkl)
+    write_atomic(out_json, lambda p: p.write_text(json.dumps(summary, indent=1, default=json_default)))
     say(f"[track] {out_dir}: track.json, track_data.pkl ({time.time() - t0:.0f} s in all)")
     return summary

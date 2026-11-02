@@ -48,15 +48,14 @@ def bunch_snapshot(full_beam, step, species):
     tracked when its row changes over the neighbouring step (rows never recorded are NaN). The result's
     Poincare data hold the reference particle only, so bunch phase space comes from here."""
     import numpy as np
-    from PyPATools.global_variables import CLIGHT
+    from PyCentralRegion.kinematics import kinetic_energy_mev
     step %= len(full_beam)
     s = full_beam[step]
     other = full_beam[step + 1 if step + 1 < len(full_beam) else step - 1]
     s = s[~np.isnan(s[:, 0]) & np.any(s != other, axis=1)]
     r = np.hypot(s[:, 0], s[:, 1])
     vr = (s[:, 0] * s[:, 3] + s[:, 1] * s[:, 4]) / r
-    beta2 = (s[:, 3:6] ** 2).sum(axis=1) / CLIGHT ** 2
-    return r * 1e3, vr, species.mass_mev * (1.0 / np.sqrt(1.0 - beta2) - 1.0)
+    return r * 1e3, vr, kinetic_energy_mev(s[:, 3:6], species.mass_mev)
 
 
 def load_example(filename):

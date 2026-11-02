@@ -50,6 +50,8 @@ import threading
 import time
 from pathlib import Path
 
+from ..config import json_default, write_atomic
+
 RESULT = 'result.json'
 POLL_S = 0.25                    # the driver checks the evaluation's end and its time limit this often, after
                                  # first waits of 10 ms doubling up to it (a short evaluation - the preflight, the
@@ -76,15 +78,14 @@ def evaluator_parser(prog, description=''):
 
 
 def write_result(out_dir, status, scores=None, error='', wall_s=0.0, config=None):
-    """Write result.json atomically (a reader never sees half a file)."""
+    """Write result.json whole (``config.write_atomic``: a reader never sees half a file)."""
     if status not in ('ok', 'failed'):
         raise ValueError(f"status must be 'ok' or 'failed', not {status!r}")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    tmp = out_dir / (RESULT + '.tmp')
-    tmp.write_text(json.dumps({'status': status, 'scores': scores or {}, 'error': str(error),
-                               'wall_s': float(wall_s), 'config': config or {}}, indent=1, default=str))
-    os.replace(tmp, out_dir / RESULT)
+    text = json.dumps({'status': status, 'scores': scores or {}, 'error': str(error), 'wall_s': float(wall_s),
+                       'config': config or {}}, indent=1, default=json_default)
+    write_atomic(out_dir / RESULT, lambda p: p.write_text(text))
 
 
 def read_result(out_dir):

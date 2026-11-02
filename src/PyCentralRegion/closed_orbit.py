@@ -54,7 +54,8 @@ from typing import Optional
 import numpy as np
 from scipy.ndimage import map_coordinates, spline_filter
 
-CLIGHT = 299792458.0
+from .kinematics import CLIGHT
+
 RIGIDITY_K = 299.792458        # p[MeV/c] = K * |q| * (B rho)[T m]
 
 __all__ = ['CartesianMidplane', 'PolarMidplane', 'closed_orbits',

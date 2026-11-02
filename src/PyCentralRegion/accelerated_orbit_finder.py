@@ -25,6 +25,7 @@ import csv
 from .tracking import TrackingEngine
 from .diagnostics import (PoincareAnalyzer, calculate_turn_metrics,
                           BeamStatisticsCollector, TurnStatistics)
+from .probes import beam_sense, crossing_direction, crossing_fraction, interpolate, start_pass
 from PyPATools.particles import ParticleDistribution
 from PyPATools.field import Field
 from PyPATools.global_variables import CLIGHT
@@ -136,7 +137,8 @@ class ProbeRecorder:
     that starts already past a probe (a probe just downstream of the hand-off plane cuts the
     bunch) begins at pass 1, so the passes of one turn line up across the bunch. The sense of
     rotation is taken from the beam's angular momentum at the first record; a crossing against
-    it is kept with ``direction`` -1.
+    it is kept with ``direction`` -1. The rules are those of the module ``probes``, shared with
+    the probes built from recorded tracks (``analysis.metrics.probe_crossings``).
 
     Attach to ``AcceleratedOrbitFinder.probes``; ``track_with_rf`` resets it and calls ``record``
     every step with the real particles only. ``data()`` returns one dict of arrays per probe."""
@@ -166,15 +168,12 @@ class ProbeRecorder:
             self._seen = np.zeros(len(r), dtype=bool)
             self._passes = np.zeros((len(self.angles_deg), len(r)), dtype=np.int32)
         if not self.sense and np.any(active):
-            lz = r[active, 0] * v[active, 1] - r[active, 1] * v[active, 0]
-            self.sense = 1.0 if np.sum(lz) >= 0.0 else -1.0
+            self.sense = beam_sense(r[active], v[active])
         new = active & ~self._seen
         if np.any(new) and self.sense:
-            # azimuth of each new particle relative to each probe, wrapped to (-pi, pi]: ahead of
-            # the probe (in the direction of motion) means pass 0 is already behind it
-            ph = np.arctan2(r[new, 1], r[new, 0])[:, None] - np.deg2rad(self.angles_deg)[None, :]
-            ahead = self.sense * np.angle(np.exp(1j * ph)) > 0.0
-            self._passes[:, new] = ahead.T.astype(np.int32)
+            # pass 1 at each probe a new particle is already past in the direction of motion, else 0
+            self._passes[:, new] = start_pass(np.arctan2(r[new, 1], r[new, 0])[:, None],
+                                              np.asarray(self.angles_deg)[None, :], self.sense).T
             self._seen |= new
         if self._r0 is not None and len(self._r0) == len(r):
             both = active & self._a0
@@ -183,15 +182,15 @@ class ProbeRecorder:
                 idx = np.nonzero(both & ((a < 0.0) != (b < 0.0)))[0]
                 if not len(idx):
                     continue
-                f = a[idx] / (a[idx] - b[idx])
-                rc = self._r0[idx] + f[:, None] * (r[idx] - self._r0[idx])
+                f = crossing_fraction(a[idx], b[idx])
+                rc = interpolate(self._r0[idx], r[idx], f)
                 along = rc[:, :2] @ self._along[k]
                 keep = (along >= self.r_min) & (along <= self.r_max)
                 if not np.any(keep):
                     continue
                 idx, f, rc = idx[keep], f[keep], rc[keep]
-                vc = self._v0[idx] + f[:, None] * (v[idx] - self._v0[idx])
-                direction = np.where(self.sense * b[idx] >= 0.0, 1, -1).astype(np.int8)
+                vc = interpolate(self._v0[idx], v[idx], f)
+                direction = crossing_direction(b[idx], self.sense)
                 self._rows[k].append((idx.astype(np.int32), self._passes[k, idx].copy(), direction,
                                       rc, vc, self._t0 + f * (t - self._t0), np.full(len(idx), int(step), np.int32)))
                 self._passes[k, idx] += 1
@@ -1559,7 +1558,7 @@ class AcceleratedOrbitFinder:
                     # within +-window_rel of E_c, against everything launched (post-collimator)
                     vlt = self.last_turn_v
                     if vlt is not None and len(vlt):
-                        c2 = 299792458.0 ** 2
+                        c2 = CLIGHT ** 2
                         gam = 1.0 / np.sqrt(1.0 - np.minimum(np.sum(vlt * vlt, axis=1) / c2, 1.0 - 1e-15))
                         e_last = (gam - 1.0) * float(self.design.species.mass_mev)
                         e_c = (float(np.median(e_last)) if self.window_center == 'median'

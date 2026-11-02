@@ -1,6 +1,7 @@
 """simulate3d: the radial slit (its jaw raster, its place on the fast path, the placement rules, the pass numbering it
-is placed by), the inflector-rotation guard and the hand-off bunch's species mass. No field cache needed: synthetic
-rasters, a stub tracker and a synthetic hand-off."""
+is placed by), the inflector-rotation guard, the hand-off bunch's species mass and snapshot launch, and the survivors
+of a full run (the scorer's rule). No field cache needed: synthetic rasters, a stub tracker, a synthetic hand-off and
+beam record."""
 import types
 
 import numpy as np
@@ -102,6 +103,43 @@ def test_reference_passes_on_the_slit_ray():
     assert np.hypot(d['xyz'][:, 0], d['xyz'][:, 1]) == pytest.approx(expect, abs=2e-6)
 
 
+def test_full_record_survivors():
+    """The survivors of a full run (final energies, the probe files' 'survived') are the scorer's rule
+    (``analysis.metrics.survivors``) on the last full states: not a particle lost on metal (its slot still inside), one
+    beyond r_max, one at |z| = z_max, one with a NaN velocity or a NaN position. That is the tracker's former rule
+    (finite state, inside, not among the metal hits), and the tracks carry the stop steps the scorer reads."""
+    from PyCentralRegion.accelerated_orbit_finder import SparseBeamRecord
+    from PyCentralRegion.analysis.metrics import survivors
+    n, n_steps, dt = 7, 30, 1e-10
+    fb = SparseBeamRecord([1e-9], n, 0.0, dt, track_ids=np.arange(n), track_every=1)
+    r, v = np.tile([0.2, 0.0, 0.001], (n, 1)), np.tile([0.0, 2e7, 0.0], (n, 1))
+    for k in range(n_steps):
+        if k == n_steps - 1:
+            r[2, 0], r[3, 2], v[4, 1], r[5] = 0.40, 0.03, np.nan, np.nan
+        fb.record(k, r, v)
+    hits = np.array([[1.0, 12.0, 0.2, 0.0]])                          # particle 1 on metal at step 12
+    tracker = types.SimpleNamespace(mc=types.SimpleNamespace(z_max_m=0.03), finder=types.SimpleNamespace(r_max=0.38),
+                                    tc=types.SimpleNamespace(snapshot_ns=[1.0], steps_per_turn=100), mass_mev=938.272,
+                                    f_mhz=100.0)                       # 100 steps per turn of 10 ns: dt
+    res = types.SimpleNamespace(n_turns=1, metadata={'launch': {'t0_s': 0.0}},
+                                trajectory_reference=np.zeros((n_steps, 3)))
+    bunch = types.SimpleNamespace(birth_time=np.zeros(n), handoff_index=np.arange(n))
+    out = {}
+    ok = S.BunchTracker._full_record(tracker, out, fb, res, bunch, hits, np.arange(n))
+    assert ok.tolist() == [True, False, False, False, False, False, True]
+    last = fb[-1]
+    former = (np.isfinite(last).all(axis=1) & (np.hypot(last[:, 0], last[:, 1]) < 0.38) & (np.abs(last[:, 2]) < 0.03)
+              & ~np.isin(np.arange(n), hits[:, 0].astype(int)))
+    assert np.array_equal(ok, former)
+    assert len(out['final_energies_mev']) == 2 and out['n_lost_vertical'] == 1
+    tr = out['tracks']
+    assert tr['stop_step'].tolist() == [n_steps + 1, 12] + [n_steps + 1] * 5 and tr['n_steps'] == n_steps
+    assert not out['snapshots'][0]['lost'].any() and out['snapshots'][0]['step'] == 10    # the hit comes later
+    # the scorer on the tracks (positions only: it cannot see particle 4's NaN velocity) finds the same survivors
+    seen = survivors(tr['xyz'][-1], tr['stop_step'], tr['n_steps'], np.full(n, np.inf), 0.38, 0.03)
+    assert np.array_equal(seen, ok | (np.arange(n) == 4))
+
+
 def test_si_rotation_guard():
     model = types.SimpleNamespace(params={'si_rotation_deg': 4.726})
     S.check_si_rotation(model, 4.726)
@@ -135,3 +173,25 @@ def test_handoff_species_mass():
         speed({'species_mass_mev': 1877.268}, species=proton)
     with pytest.raises(ValueError, match='names no species'):
         speed({})
+
+
+@pytest.mark.parametrize('sense', [1.0, -1.0])
+def test_handoff_snapshot_sense(sense):
+    """The snapshot launch moves every particle back along its own orbit circle by its t_rel, in the beam's sense of
+    rotation (``probes.beam_sense``): on a circle about the axis, released a quarter period late it starts a quarter
+    turn behind, released early a quarter turn ahead, and every particle is born at t = 0."""
+    from PyCentralRegion.handoff import make_beam_from_handoff
+    from PyPATools.species import IonSpecies
+    d = _handoff({'species_mass_mev': 938.272})
+    p = np.linalg.norm(d['p_ev_c'][0])
+    speed = p / np.hypot(p, 938.272e6) * 2.99792458e8
+    omega = speed / 0.02                                         # the orbit of r = 20 mm about the machine axis
+    d.update(r=np.tile([0.02, 0.0, 0.001], (3, 1)), p_ev_c=np.tile([0.0, sense * p, 0.0], (3, 1)),
+             t_rel=np.array([0.0, 0.5, -0.5]) * np.pi / omega)
+    pd = make_beam_from_handoff(d, species=IonSpecies('proton'), launch='snapshot', reference='centroid',
+                                omega_c=omega, verbose=False)
+    np.testing.assert_allclose(pd.x_vec, [[0.02, 0.0, 0.001], [0.0, -sense * 0.02, 0.001], [0.0, sense * 0.02, 0.001]],
+                               rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(pd.v_vec, [[0.0, sense * speed, 0.0], [speed, 0.0, 0.0], [-speed, 0.0, 0.0]],
+                               rtol=0.0, atol=1e-6 * speed)
+    assert not pd.birth_time.any()

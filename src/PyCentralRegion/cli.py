@@ -50,14 +50,14 @@ def build_stage(cfg):
 def score_stage(cfg):
     """Score the tracked run in run.out_dir with [score]; writes run.out_dir/score.json (reused when it exists)."""
     from .analysis.metrics import score_run
-    from .analysis.runs import clean, load_track_run, save_score
+    from .analysis.runs import load_track_run, save_score
     out_dir = Path(config.require(config.section(cfg, 'run').out_dir, 'run.out_dir'))
     path = out_dir / 'score.json'
     if path.exists():
         print(f"[score] {path} exists: reused", flush=True)
         return json.loads(path.read_text())
     sc = config.section(cfg, 'score')
-    scores = clean(score_run(load_track_run(out_dir, beam=sc.beam), sc))      # plain JSON: NaN -> null
+    scores = config.json_clean(score_run(load_track_run(out_dir, beam=sc.beam), sc))      # plain JSON: NaN -> null
     save_score(scores, path)
     return scores
 
@@ -82,7 +82,7 @@ def _cmd_evaluate(args):
     out = Path(args.out).resolve()
     cfg = {}
     try:
-        cfg = _load(args.config, list(args.set) + [f'run.out_dir={json.dumps(str(out))}'])
+        cfg = _load(args.config, list(args.set) + [f'run.out_dir={config.toml_value(str(out))}'])
         scores = evaluate(cfg)
     except (Exception, SystemExit) as exc:         # the evaluation failed (a library's sys.exit too): say why, exit 1
         traceback.print_exc()

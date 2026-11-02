@@ -15,11 +15,18 @@ its dataclass (imported only when asked for, so this module needs nothing beyond
 
 Paths: in the ``[paths]`` section, and for any key ending in ``_path``, ``_dir`` or ``_file`` anywhere, a relative
 path is taken relative to the file that sets it. An empty string means "not given".
+
+What the stages share to write values and files out lives here too: ``toml_value`` (the TOML literal that
+``parse_override`` reads back), ``write_atomic`` (a file written whole under its temporary name ``part_path``, then
+renamed by ``commit_part``) and the JSON conversions of numpy values ``json_default`` and ``json_clean``.
 """
 import copy
 import dataclasses
 import importlib
 import json
+import math
+import os
+import sys
 import tomllib
 import typing
 from pathlib import Path
@@ -114,6 +121,23 @@ def parse_override(item):
     except tomllib.TOMLDecodeError:
         value = raw.strip()
     return keys, value
+
+
+def toml_value(x):
+    """A Python value as the TOML literal ``parse_override`` reads back: a bool, an int, a float (its repr, the shortest
+    text that reads back to the same float, nan and inf included), a str (json.dumps: JSON's escapes are TOML's, but
+    for characters beyond U+FFFF) or a list or tuple of them."""
+    if isinstance(x, bool):
+        return 'true' if x else 'false'
+    if isinstance(x, int):
+        return repr(int(x))
+    if isinstance(x, float):
+        return repr(float(x))
+    if isinstance(x, str):
+        return json.dumps(x)
+    if isinstance(x, (list, tuple)):
+        return '[' + ', '.join(toml_value(v) for v in x) + ']'
+    raise TypeError(f"no TOML literal for {type(x).__name__} {x!r}")
 
 
 def _split(keys):
@@ -237,6 +261,79 @@ def require(value, what):
     if not value:
         raise ConfigError(f"{what} is not set")
     return value
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# outputs: files written whole, JSON
+def part_path(path):
+    """The temporary name of an output: <stem>.part<suffix> beside it. It keeps the extension, by which gmsh,
+    matplotlib and numpy choose the format, and no stage takes a file of that name for a finished output."""
+    p = Path(path)
+    return p.with_name(p.stem + '.part' + p.suffix)
+
+
+def commit_part(path, overwrite=True):
+    """Rename the temporary file of ``path`` (``part_path``) to ``path``; returns ``path``. ``overwrite`` False refuses
+    a ``path`` that exists, one that appeared while the file was written (ConfigError; the temporary file stays)."""
+    path, tmp = Path(path), part_path(path)
+    if not overwrite and path.exists():
+        raise ConfigError(f"{path} appeared while it was written: not overwritten; the new file is {tmp}")
+    os.replace(tmp, path)
+    return path
+
+
+def write_atomic(path, write, overwrite=True):
+    """Write an output whole or not at all: ``write(tmp)`` writes it under its temporary name ``part_path(path)``, which
+    ``commit_part`` then renames to ``path``. A killed run leaves no truncated output that a stage would reuse, and a
+    ``write`` that raises leaves no temporary file. Returns ``path``."""
+    tmp = part_path(path)
+    try:
+        write(tmp)
+    except BaseException:
+        try:                              # the error of the write is the one that propagates
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return commit_part(path, overwrite)
+
+
+def _numpy():
+    """numpy when it is loaded, else None: a numpy value comes with a loaded numpy, so the JSON conversions take numpy
+    values without this module needing numpy."""
+    return sys.modules.get('numpy')
+
+
+def json_default(v):
+    """``default`` of json.dumps: a numpy scalar or array as Python numbers and lists, anything else (a Path, a date)
+    as its str. NaN and inf are left to json (NaN, Infinity), as track.json has them."""
+    np = _numpy()
+    if np is not None and isinstance(v, np.generic):
+        return v.item()
+    if np is not None and isinstance(v, np.ndarray):
+        return v.tolist()
+    return str(v)
+
+
+def json_clean(o):
+    """Plain JSON data, as score.json and result.json hold scores: numpy scalars and arrays as Python numbers and lists,
+    NaN and inf as None (null), mapping keys as str."""
+    np = _numpy()
+    if isinstance(o, dict):
+        return {str(k): json_clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [json_clean(v) for v in o]
+    if np is None:                                # no numpy loaded, so no numpy value
+        return None if isinstance(o, float) and not math.isfinite(o) else o
+    if isinstance(o, np.ndarray):
+        return json_clean(o.tolist())
+    if isinstance(o, (bool, np.bool_)):
+        return bool(o)
+    if isinstance(o, (int, np.integer)):
+        return int(o)
+    if isinstance(o, (float, np.floating)):
+        return float(o) if np.isfinite(o) else None
+    return o
 
 
 # ---------------------------------------------------------------------------------------------------------------------

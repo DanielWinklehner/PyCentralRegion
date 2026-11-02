@@ -21,11 +21,11 @@ reports it prints on the way):
      the inflector rotation; the ground holds the spiral-inflector housing, its outline extruded over
      +-half_height_mm, with the exit opening cut through it) and <prefix>_build.json (what the build used).
 
-<prefix> is paths.model3d without '_model3d.pkl' (or without '.pkl'). Every output is written under a temporary name
-and renamed once all of them exist, the model last: an existing paths.model3d is reused and nothing is rebuilt or
-overwritten, a build that finds some of its other outputs but no model refuses to run, and a build that fails (a
-ConfigError from a bound that needs the layout, such as a window's) removes its temporary files. No BEM solve here
-(``pcr fields`` does that).
+<prefix> is paths.model3d without '_model3d.pkl' (or without '.pkl'). Every output is written under its temporary
+name <stem>.part<suffix> (``config.part_path``) and renamed once all of them exist, the model last
+(``config.commit_part``): an existing paths.model3d is reused and nothing is rebuilt or overwritten, a build that
+finds some of its other outputs but no model refuses to run, and a build that fails (a ConfigError from a bound that
+needs the layout, such as a window's) removes its temporary files. No BEM solve here (``pcr fields`` does that).
 
 Tools that work on the same edges the build lays out (each from a run config):
   ``layout(cfg)``      the 2D electrodes exactly as the build has them, with every report;
@@ -46,7 +46,6 @@ import contextlib
 import dataclasses
 import io
 import json
-import os
 import pickle
 import time
 from pathlib import Path
@@ -131,12 +130,6 @@ def output_files(model3d) -> dict:
     stem = p.name[:-len('_model3d.pkl')] if p.name.endswith('_model3d.pkl') else p.stem
     return {'dees_png': p.with_name(stem + '_dees.png'), 'msh': p.with_name(stem + '.msh'),
             'step': p.with_name(stem + '.step'), 'build_json': p.with_name(stem + '_build.json'), 'model3d': p}
-
-
-def _part(path) -> Path:
-    """The temporary name of an output: same folder and extension (gmsh and matplotlib choose the format by it)."""
-    p = Path(path)
-    return p.with_name(p.stem + '.part' + p.suffix)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -254,7 +247,7 @@ def build(cfg) -> dict:
     t0 = time.time()
     inp = inputs(cfg)                                         # every input checked before anything is built
     out['model3d'].parent.mkdir(parents=True, exist_ok=True)
-    part = {k: _part(v) for k, v in out.items()}
+    part = {k: C.part_path(v) for k, v in out.items()}
     for p in part.values():                                   # leftovers of a build that died: temporary, ours
         p.unlink(missing_ok=True)
     print(f"[build] {out['model3d']}\n[build] seed {inp['seed']}\n[build] housing outline {inp['housing_outline']}",
@@ -271,13 +264,8 @@ def build(cfg) -> dict:
 
     written = {}
     for k, final in out.items():                               # commit: the model last, nothing overwritten
-        if not part[k].exists():
-            continue
-        if final.exists():
-            raise ConfigError(f"{final} appeared while this build ran: not overwritten; this build's file is "
-                              f"{part[k]}")
-        os.replace(part[k], final)
-        written[k] = str(final)
+        if part[k].exists():
+            written[k] = str(C.commit_part(final, overwrite=False))
     print(f"\n[build] wrote " + ", ".join(Path(v).name for v in written.values()) + f" in {out['model3d'].parent} "
           f"({time.time() - t0:.0f} s)")
     if abs(si_rot - float(inf.rotation_deg)) > SI_ROTATION_TOL_DEG:
@@ -335,7 +323,7 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
               'mesh': {'nodes': int(len(model.vertices)), 'triangles': int(len(model.triangles)), 'solids': solids},
               'gmsh': getattr(gmsh, '__version__', ''),
               'geometry': C.to_dict(g), 'machine': C.to_dict(s['machine']), 'inflector': C.to_dict(inf)}
-    part['build_json'].write_text(json.dumps(record, indent=1, default=str))
+    part['build_json'].write_text(json.dumps(record, indent=1, default=C.json_default))
     return si_rot
 
 
@@ -469,21 +457,18 @@ def cut_handoff(src, dst, r_mm: float, centre: str = 'centroid', verbose: bool =
                     data = data[mask]
                 fix_attrs(item, gd.create_dataset(name, data=data))
 
-    tmp = _part(dst)
-    tmp.unlink(missing_ok=True)
-    with h5py.File(str(src), 'r') as fs, h5py.File(str(tmp), 'w') as fd:
-        walk(fs, fd)
-        pp = fd.attrs.get('particlesPath', 'particles')
-        grp = fd[pp.decode() if isinstance(pp, bytes) else str(pp)][h['meta']['species_group']]
-        grp.attrs['PyCentralRegion:cut'] = (f"circle R {r_mm:g} mm on the hand-off plane around the {centre} "
-                                            f"(u {cu:+.4f}, v {cv:+.4f} mm); kept {n1} of {n0}")
-        grp.attrs['PyCentralRegion:cut_r_mm'] = float(r_mm)
-        grp.attrs['PyCentralRegion:cut_centre_uv_mm'] = np.array([cu, cv])
-        grp.attrs['PyCentralRegion:n_before_cut'] = int(n0)
-        grp.attrs['PyCentralRegion:cut_source'] = str(src)
-    if dst.exists():
-        raise ConfigError(f"{dst} appeared while the cut was written: not overwritten; the cut is {tmp}")
-    os.replace(tmp, dst)
+    def write(tmp):
+        with h5py.File(str(src), 'r') as fs, h5py.File(str(tmp), 'w') as fd:
+            walk(fs, fd)
+            pp = fd.attrs.get('particlesPath', 'particles')
+            grp = fd[pp.decode() if isinstance(pp, bytes) else str(pp)][h['meta']['species_group']]
+            grp.attrs['PyCentralRegion:cut'] = (f"circle R {r_mm:g} mm on the hand-off plane around the {centre} "
+                                                f"(u {cu:+.4f}, v {cv:+.4f} mm); kept {n1} of {n0}")
+            grp.attrs['PyCentralRegion:cut_r_mm'] = float(r_mm)
+            grp.attrs['PyCentralRegion:cut_centre_uv_mm'] = np.array([cu, cv])
+            grp.attrs['PyCentralRegion:n_before_cut'] = int(n0)
+            grp.attrs['PyCentralRegion:cut_source'] = str(src)
+    C.write_atomic(dst, write, overwrite=False)
     if verbose:
         print(f"[cut] {src}: {n0} particles; a circle R {r_mm:g} mm around the {centre} (u {cu:+.3f}, v {cv:+.3f} mm) "
               f"keeps {n1} = {100.0 * ratio:.2f} % -> {dst}")
@@ -556,8 +541,7 @@ def gap0_hole(cfg, r_mm: float = 10.0, rim_mm: float = 8.0, dr_mm: float = 0.0, 
     rr = np.hypot(s_hit[k] - s_c, z_hit[k] - float(z_mm))
     hole = HoleSpec(0, 'dee', float(r_mm), s_c, float(z_mm), round(s_c - float(r_mm) - float(rim_mm), 4),
                     round(s_c + float(r_mm) + float(rim_mm), 4))
-    toml = "\n".join(["[[geometry.holes]]"] + [f"{f} = " + (json.dumps(v) if isinstance(v, str) else
-                                                            repr(round(v, 6) if isinstance(v, float) else v))
+    toml = "\n".join(["[[geometry.holes]]"] + [f"{f} = {C.toml_value(round(v, 6) if isinstance(v, float) else v)}"
                                                 for f, v in dataclasses.asdict(hole).items()])
     res = {'hole': hole, 'toml': toml, 's_beam_mm': s_beam, 'z_beam_mm': z_beam, 's_orbit_mm': s_orb,
            'edge_length_mm': float(np.linalg.norm(np.diff(edge, axis=0), axis=1).sum()), 'owner': owner,

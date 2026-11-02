@@ -26,16 +26,12 @@ from collections import namedtuple
 import numpy as np
 
 from ..config import MachineConfig, get_dotted
+from ..kinematics import CLIGHT
+from ..probes import beam_sense, crossing_direction, crossing_fraction, interpolate, start_pass
 from .objectives import METRICS, ScoreConfig
 
 EPS0 = 8.8541878128e-12          # vacuum permittivity [F/m]
-CLIGHT = 299792458.0             # [m/s]
 MAD_SIGMA = 1.4826               # sigma of a Gaussian / its median absolute deviation
-
-
-def wrap_deg(a):
-    """Angles [deg] wrapped to [-180, 180)."""
-    return (np.asarray(a, dtype=float) + 180.0) % 360.0 - 180.0
 
 
 def robust_sigma(x, axis=None):
@@ -84,20 +80,23 @@ def alive_mask(steps, xyz, birth_step, stop_step, ghost_step):
 def survivors(xyz_last, stop_step, n_steps, ghost_step, r_max, z_max):
     """(N,): survived to the end of the run. The tracker records only metal hits (stop_step = n_steps + 1 when there
     was none); a particle lost at the radius or height limit keeps its slot where it left the volume, so the last
-    record must also be finite and inside r < r_max, |z| < z_max. ``stop >= stop.max()`` would count those wall
-    losses as survivors. Ghosted particles do not survive."""
+    record (N, 3+: x, y, z, and any further columns) must also be finite in every column and inside r < r_max,
+    |z| < z_max. ``stop >= stop.max()`` would count those wall losses as survivors. Ghosted particles do not survive.
+    The tracker's own survivor mask (``simulate3d.BunchTracker._full_record``: the final energies, the probe files'
+    'survived') is this rule on its last full states (x, y, z, vx, vy, vz)."""
     last = np.asarray(xyz_last)
     return (stop_step > n_steps) & np.isinf(ghost_step) & np.all(np.isfinite(last), axis=1) \
         & (np.abs(last[:, 2]) < z_max) & (np.hypot(last[:, 0], last[:, 1]) < r_max)
 
 
 def rotation_sense(xyz, alive):
-    """+1 when the beam circulates counter-clockwise seen from +z (sum of L_z at the first live records), else -1."""
+    """+1 when the beam circulates counter-clockwise seen from +z, else -1: ``probes.beam_sense`` at the first live
+    records, the velocity the chord to the next record."""
     N = alive.shape[1]
     first = np.argmax(alive, axis=0)
     r0 = xyz[first, np.arange(N)]
     v0 = xyz[np.minimum(first + 1, len(xyz) - 1), np.arange(N)] - r0
-    return 1.0 if np.nansum(r0[:, 0] * v0[:, 1] - r0[:, 1] * v0[:, 0]) >= 0 else -1.0
+    return beam_sense(r0, v0)
 
 
 def loss_steps(steps, xyz, birth_step, stop_step, ghost_step, n_steps, surv, r_max, z_max):
@@ -496,29 +495,29 @@ def centre_fan(cen, ph=None, degree=3, fill=0.8):
 # ---------------------------------------------------------------------------------------------------------------------
 # virtual probes and turn structure
 def probe_crossings(xyz, alive, steps, dt_step, sense, angle_deg, forward_only=True, t0=0.0):
-    """Crossings of the vertical half-plane at azimuth angle_deg, with the tracker's probe rules applied to recorded
-    tracks: a crossing is a sign change of the signed distance between two live records, its position linearly
-    interpolated; the pass number counts from the particle's own start (pass 1 when it starts already past the probe)
-    and every crossing, forward or back, increments it. Returns j (track index), pass, R, z [mm], t [s] (t0 + the time
-    since step 0) of the forward crossings; with forward_only False of all crossings, plus direction (+1 / -1), xyz [m],
-    v [m/s] (chord over the record interval) and step (the record after the crossing)."""
+    """Crossings of the vertical half-plane at azimuth angle_deg, with the tracker's probe rules (``probes``) applied to
+    recorded tracks: a crossing is a sign change of the signed distance between two live records, its position
+    linearly interpolated; the pass number counts from the particle's own start (pass 1 when it starts already past the
+    probe) and every crossing, forward or back, increments it. Returns j (track index), pass, R, z [mm], t [s] (t0 +
+    the time since step 0) of the forward crossings; with forward_only False of all crossings, plus direction (+1 /
+    -1), xyz [m], v [m/s] (chord over the record interval) and step (the record after the crossing)."""
     th = np.deg2rad(angle_deg)
     nrm, along = np.array([-np.sin(th), np.cos(th)]), np.array([np.cos(th), np.sin(th)])
     s = xyz[..., 0] * nrm[0] + xyz[..., 1] * nrm[1]
     N = alive.shape[1]
     first = np.argmax(alive, axis=0)
     r0 = xyz[first, np.arange(N), :2]
-    passes = (sense * np.angle(np.exp(1j * (np.arctan2(r0[:, 1], r0[:, 0]) - th))) > 0.0).astype(np.int32)
+    passes = start_pass(np.arctan2(r0[:, 1], r0[:, 0]), angle_deg, sense)
     k, j = np.nonzero(alive[:-1] & alive[1:] & ((s[:-1] < 0.0) != (s[1:] < 0.0)))
-    f = s[k, j] / (s[k, j] - s[k + 1, j])
-    rc = xyz[k, j] + f[:, None] * (xyz[k + 1, j] - xyz[k, j])
+    f = crossing_fraction(s[k, j], s[k + 1, j])
+    rc = interpolate(xyz[k, j], xyz[k + 1, j], f)
     keep = rc[:, 0] * along[0] + rc[:, 1] * along[1] >= 0.0
     k, j, f, rc = k[keep], j[keep], f[keep], rc[keep]
     o = np.lexsort((k, j))
     k, j, f, rc = k[o], j[o], f[o], rc[o]
     start = np.r_[0, np.flatnonzero(np.diff(j)) + 1]
     rank = np.arange(len(j)) - np.repeat(start, np.diff(np.r_[start, len(j)]))
-    direction = np.where(sense * s[k + 1, j] >= 0.0, 1, -1).astype(np.int8)
+    direction = crossing_direction(s[k + 1, j], sense)
     ds = np.diff(steps)[k]
     out = {'j': j, 'pass': passes[j] + rank, 'R': 1e3 * np.hypot(rc[:, 0], rc[:, 1]), 'z': 1e3 * rc[:, 2],
            't': t0 + (steps[k] + f * ds) * dt_step}

@@ -112,7 +112,7 @@ def test_unit_cube_mapping():
     item = phase.override(phase.physical(0.625))
     assert item == 'track.phases_deg=[-15.0]' and C.parse_override(item) == (['track', 'phases_deg'], [-15.0])
     assert C.parse_override(posts.override(3))[1] == 3
-    assert C.parse_override(f"paths.fields={space.toml_value('D:/a b (c)/f.pkl')}")[1] == 'D:/a b (c)/f.pkl'
+    assert C.parse_override(f"paths.fields={C.toml_value('D:/a b (c)/f.pkl')}")[1] == 'D:/a b (c)/f.pkl'
 
 
 def test_campaign_config_and_validation(tmp_path):

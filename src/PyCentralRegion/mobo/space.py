@@ -27,7 +27,7 @@ import json
 import math
 import warnings
 
-from ..config import ConfigError, from_dict, get_dotted
+from ..config import ConfigError, from_dict, get_dotted, json_default, toml_value
 
 KINDS = ('cheap', 'geometry')
 DIRECTIONS = ('maximize', 'minimize')
@@ -203,17 +203,6 @@ class MoboConfig:
 
 # ---------------------------------------------------------------------------------------------------------------------
 # values
-def toml_value(x):
-    """A Python value as a TOML literal (what config.parse_override reads back)."""
-    if isinstance(x, bool):
-        return 'true' if x else 'false'
-    if isinstance(x, (int, float)):
-        return repr(x)
-    if isinstance(x, (list, tuple)):
-        return '[' + ', '.join(toml_value(v) for v in x) + ']'
-    return json.dumps(str(x))
-
-
 def physical(cfg, unit):
     """{name: unit value} -> {name: physical value}."""
     return {v.name: v.physical(unit[v.name]) for v in cfg.variables}
@@ -263,5 +252,5 @@ def geometry_key(base, cfg, params):
     use the base config's own model and fields)."""
     if not cfg.geometry_variables:
         return None
-    blob = json.dumps(geometry_parts(base, cfg, params), sort_keys=True, separators=(',', ':'), default=str)
+    blob = json.dumps(geometry_parts(base, cfg, params), sort_keys=True, separators=(',', ':'), default=json_default)
     return hashlib.sha256(blob.encode()).hexdigest()[:12]

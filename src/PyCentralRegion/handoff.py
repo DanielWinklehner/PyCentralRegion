@@ -38,7 +38,10 @@ import numpy as np
 from PyPATools.particles import ParticleDistribution
 from PyPATools.species import IonSpecies
 
-CLIGHT = 2.99792458e8
+from .frames import rotation_z
+from .kinematics import CLIGHT
+from .probes import beam_sense
+
 _PREFIX = "PyPATools:"
 
 
@@ -86,11 +89,6 @@ def load_handoff(path) -> dict:
     out['meta'] = meta
     out['path'] = str(path)
     return out
-
-
-def _rot(deg: float) -> np.ndarray:
-    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
 def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecies] = None,
@@ -170,7 +168,7 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
         v_ref = dir_mean / np.linalg.norm(dir_mean) * float(speed.mean())
 
     # ---- frame: rotation about z, optional z flip
-    R = _rot(rotation_deg)
+    R = rotation_z(rotation_deg)
     r, v = r @ R.T, v @ R.T
     x_ref, v_ref = R @ x_ref, R @ v_ref
     if flip_z:
@@ -187,7 +185,7 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
             if f_rf <= 0:
                 raise ValueError("snapshot launch needs omega_c (no rf_frequency_hz in the file)")
             omega_c = 2.0 * np.pi * f_rf / float(harmonic)
-        sense = np.sign(np.mean(r[:, 0] * v[:, 1] - r[:, 1] * v[:, 0])) or 1.0     # +1: counter-clockwise
+        sense = beam_sense(r, v)                                                   # +1: counter-clockwise
         speed = np.hypot(v[:, 0], v[:, 1])
         rho = speed / omega_c
         n_hat = np.column_stack([v[:, 1], -v[:, 0]]) / speed[:, None]              # right of travel

@@ -30,7 +30,7 @@ from .metrics import (score_run, run_state, RunState, run_constants, machine_val
                       radial_width_split, pick_operating_point, spearman, score_column, proxy_correlations,
                       campaign_summary)
 from .runs import (RunData, Handoff, load_run, load_track_run, load_legacy_run, legacy_handoff, legacy_tags,
-                   handoff_particles, handoff_track_ids, load_probe, virtual_probe, beam_label, clean, save_score,
-                   load_score, save_table)
+                   handoff_particles, handoff_track_ids, load_probe, virtual_probe, beam_label, save_score, load_score,
+                   save_table)
 from .twins import vortex_twin
 from .plots import summary_figure

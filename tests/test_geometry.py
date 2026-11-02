@@ -248,7 +248,7 @@ def test_build_files_reuse_and_refusal(tmp_path, capsys):
     assert [p.name for p in out.values()] == ['cr_model_a_dees.png', 'cr_model_a.msh', 'cr_model_a.step',
                                               'cr_model_a_build.json', 'cr_model_a_model3d.pkl']
     assert GB.output_files(tmp_path / 'model3d.pkl')['msh'].name == 'model3d.msh'
-    assert GB._part(out['msh']).name == 'cr_model_a.part.msh'
+    assert C.part_path(out['msh']).name == 'cr_model_a.part.msh'
     model = tmp_path / 'cr_model_a_model3d.pkl'
     cfg = _load(tmp_path, f'[paths]\nmodel3d = "{model.as_posix()}"\n')
     model.write_bytes(b'not rebuilt')

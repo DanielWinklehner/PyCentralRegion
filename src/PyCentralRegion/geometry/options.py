@@ -39,7 +39,7 @@ import dataclasses
 import json
 from pathlib import Path
 
-from PyCentralRegion.config import ConfigError
+from PyCentralRegion.config import ConfigError, toml_value
 
 SIDES = ('dee', 'dummy')
 
@@ -454,16 +454,6 @@ def junctions_from_json(path):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-def _toml_value(v):
-    if isinstance(v, bool):
-        return 'true' if v else 'false'
-    if isinstance(v, (int, float)):
-        return repr(float(v)) if isinstance(v, float) else str(v)
-    if isinstance(v, str):
-        return json.dumps(v)
-    return '[' + ', '.join(_toml_value(x) for x in v) + ']'
-
-
 def to_toml(geometry, only_changed=True):
     """The [geometry] table of a run file for these options (a GeometryConfig, or a dict of its keyword arguments);
     only what differs from the defaults unless told not."""
@@ -478,7 +468,7 @@ def to_toml(geometry, only_changed=True):
         if isinstance(v, (tuple, list)) and v and dataclasses.is_dataclass(v[0]):
             for item in v:
                 tables.append(f"\n[[geometry.{f.name}]]")
-                tables += [f"{k} = {_toml_value(x)}" for k, x in dataclasses.asdict(item).items()]
+                tables += [f"{k} = {toml_value(x)}" for k, x in dataclasses.asdict(item).items()]
         else:
-            lines.append(f"{f.name} = {_toml_value(v)}")
+            lines.append(f"{f.name} = {toml_value(v)}")
     return '\n'.join(lines + tables) + '\n'

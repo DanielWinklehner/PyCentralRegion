@@ -274,11 +274,12 @@ enters instead as an infeasible stand-in (see Objectives and constraints).
 An evaluation goes proposed → running → done | failed; `optimize-status` marks a done one with unusable scores
 `done!`. Search evaluations are numbered 0000, 0001, ...
 
-A geometry's model and field cache are each written under a temporary name and renamed once complete, so a stop never
-leaves them cut short: once made, they serve every later evaluation of that geometry (a stop during the BEM keeps the
-model, and a later evaluation makes only the fields). A build that failed or was stopped before its model leaves side
-files that the next build of that geometry would refuse to overwrite; the driver moves them into
-`geometries/<key>/stopped-<id>/`, so the next evaluation of that geometry builds afresh.
+A geometry's model and field cache are each written under a temporary name (`model3d.part.pkl`, `fields.part.pkl`)
+and renamed once complete, so a stop never leaves them cut short: once made, they serve every later evaluation of that
+geometry (a stop during the BEM keeps the model, and a later evaluation makes only the fields). A build that failed or
+was stopped before its model leaves side files that the next build of that geometry would refuse to overwrite (a
+stopped one also its temporary files); the driver moves them all into `geometries/<key>/stopped-<id>/`, so the next
+evaluation of that geometry builds afresh.
 
 ## Costs
 

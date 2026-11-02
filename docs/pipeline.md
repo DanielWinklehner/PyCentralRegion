@@ -65,10 +65,12 @@ whose cached model and fields are on disk).
 | `pcr evaluate --config run.toml --out DIR` | all of the above | `DIR/result.json` | the chain; a failure is written to result.json, exit code 1 |
 
 Reuse rule: a stage whose output exists says so and returns it. To recompute, point the path elsewhere. The outputs
-a stage is judged done by are written under a temporary name and renamed: `<file>.part` for the field cache,
-track.json and track_data.pkl, `<stem>.part<suffix>` for the build's (the model last), `<file>.tmp` for score.json and
-result.json. A killed run never leaves a truncated file to be reused. A `pcr build` that fails removes its temporary
-files; the bounds it can check before the layout (the channel heights) are checked before anything is written.
+a stage is judged done by (the build's, the field cache, track.json and track_data.pkl, score.json, result.json) are
+written under the temporary name `<stem>.part<suffix>` (`track.part.json` for track.json) and renamed
+(`config.write_atomic`; the build's by `config.commit_part` once all of them exist, the model last). A killed run never
+leaves a truncated file to be reused, and no stage takes a temporary file for an output. A `pcr build` that fails
+removes its temporary files; the bounds it can check before the layout (the channel heights) are checked before
+anything is written.
 
 ### fields
 

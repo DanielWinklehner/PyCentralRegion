@@ -311,8 +311,8 @@ class Campaign:
         sets = list(cfg.fixed) + list(cfg.fidelity(fidelity).overrides) + space.overrides(cfg, params)
         if key:
             folder = self.store.geometry_dir(key)
-            sets += [f"paths.model3d={space.toml_value((folder / MODEL_FILE).as_posix())}",
-                     f"paths.fields={space.toml_value((folder / FIELDS_FILE).as_posix())}"]
+            sets += [f"paths.model3d={config.toml_value((folder / MODEL_FILE).as_posix())}",
+                     f"paths.fields={config.toml_value((folder / FIELDS_FILE).as_posix())}"]
         return dict(fidelity=fidelity, kind=kind, unit=unit, params=params, geometry=key, overrides=sets, **extra)
 
     def search(self, evals):
@@ -518,7 +518,7 @@ class Campaign:
             if not gfile.exists():
                 gfile.parent.mkdir(parents=True, exist_ok=True)
                 gfile.write_text(json.dumps(space.geometry_parts(self.base(ev['fidelity']), cfg, ev['params']),
-                                            indent=1, sort_keys=True, default=str))
+                                            indent=1, sort_keys=True, default=config.json_default))
         cmd = evaluate.command(cfg.physics_python, cfg.evaluator, cfg.base_config_file, ev['overrides'], folder)
         (folder / 'command.txt').write_text(subprocess.list2cmdline(cmd) + '\n')
         geo = f" (geometry {ev['geometry']}{', new' if builds else ''})" if ev['geometry'] else ''
