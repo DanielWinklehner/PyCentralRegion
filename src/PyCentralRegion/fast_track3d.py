@@ -1147,7 +1147,8 @@ _chunk3d_serial = njit(cache=True)(_chunk3d_impl)
 # build of a parallel=True function on every load after the first: a fresh
 # compile scales with the thread count, the cached one runs single-threaded and
 # is indistinguishable from _chunk3d_serial (measured, 2026-09-16). The parallel
-# variant is only chosen for large bunches, whose runs dwarf its ~10 s compile.
+# variant is chosen from PAR_MIN_PARTICLES on. Its compile takes about 65 s with
+# 28 threads (2026-11-02), two thirds of a 10 000-particle search evaluation.
 _chunk3d_par = njit(cache=False, parallel=True)(_chunk3d_impl)
 # Below this the thread fork/join of two parallel regions per step (~25 us each
 # on the laptop) costs more than the work: measured best-of-3 on the smoke model,

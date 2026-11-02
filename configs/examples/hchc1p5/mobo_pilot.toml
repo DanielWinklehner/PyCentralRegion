@@ -1,6 +1,7 @@
 # MOBO pilot on the worked example: about 20 evaluations over cheap variables only (RF phase, dee-voltage scale and a
 # first-harmonic magnetic trim), all on the existing electrode model and BEM fields of design_wnop3_rotn3_g0ap (its
-# paths.model3d / paths.fields), so every evaluation is a 3D bunch tracking with space charge (1-2 min) plus scoring.
+# paths.model3d / paths.fields), so every evaluation is a 3D bunch tracking with space charge plus scoring, about
+# 1.6 min (the 20 evaluations took 33 min).
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml --dry-run   (prints the first evaluation's command)
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml             (runs until max_evals; rerun continues)
 #   pcr optimize-status configs/examples/hchc1p5/mobo_pilot.toml

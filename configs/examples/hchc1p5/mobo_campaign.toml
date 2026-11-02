@@ -1,9 +1,9 @@
 # The full MOBO campaign on the worked example, after the pilot: the beam channel's aperture and the spiral
 # inflector's rotation (geometry: every new value needs an electrode build and its 3D BEM fields, so that evaluation
-# takes about 10 min: build ~20 s, fields ~8 min, then the tracking) together with the RF phase, the dee-voltage
-# scale, a first-harmonic magnetic trim and a radial slit (cheap: they re-track on that geometry's fields, 1.5-2 min
-# each). After every new geometry the driver runs cheap_per_geometry cheap evaluations on it; every geometry gets its
-# own model and fields under <campaign_dir>/geometries/<key>/.
+# takes about 6 min: build ~20 s, fields ~4 min, then the tracking) together with the RF phase, the dee-voltage
+# scale, a first-harmonic magnetic trim and a radial slit (cheap: they re-track on that geometry's fields, about
+# 1.6 min each). After every new geometry the driver runs cheap_per_geometry cheap evaluations on it; every geometry
+# gets its own model and fields under <campaign_dir>/geometries/<key>/.
 #   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml --dry-run   (prints the first evaluation's command)
 #   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml             (runs until max_evals; a rerun
 #                                                                                continues; --max-hours H for a slot)
@@ -33,7 +33,7 @@ physics_python = "C:/Users/Daniel/anaconda3/envs/accel-dev-env/python.exe"
 sampler = "gp"                 # constrained 3-objective GP (logCEHVI) over 13 coordinates; "tpe" uses the same store
 seed = 0
 n_startup = 16                 # the warm start and 15 random designs (4 geometries with their cheap followers)
-max_evals = 120                # ~30 geometries x (1 + cheap_per_geometry): 30 x 10 min + 90 x 2 min, about 8 h
+max_evals = 120                # ~30 geometries x (1 + cheap_per_geometry): 30 x 6 min + 90 x 1.6 min, about 5.5 h
 cheap_per_geometry = 3
 failed_as_infeasible = false   # a failed build, BEM or tracking blocks only its own design (a design that loses its
                                # beam is learnt either way: the scorer skips it, and it enters with the worst values)

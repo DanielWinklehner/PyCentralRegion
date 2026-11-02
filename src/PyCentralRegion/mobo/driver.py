@@ -10,8 +10,8 @@ evaluation at a time and chooses each with a sample-efficient multi-objective sa
 process, both constrained) on the unit cube of the design variables (``space``).
 
 Cost structure: a new electrode geometry needs a build and its 3D BEM fields (on the worked example the build takes
-~20 s, the fields ~8 min, that evaluation ~10 min in all); the RF phase, dee voltage, a magnetic trim or a slit reuse
-the fields and only re-track (1.5-2 min, most of it the tracking kernel's compile in every new process). After every
+~20 s, the fields ~4 min, that evaluation ~6 min in all); the RF phase, dee voltage, a magnetic trim or a slit reuse
+the fields and only re-track (~1.6 min, most of it the tracking kernel's compile in every new process). After every
 new geometry the driver therefore runs ``cheap_per_geometry`` evaluations with the geometry coordinates held at that
 geometry's values and only the cheap ones proposed (TPE through optuna's PartialFixedSampler; the GP through a
 subclass that maximises its acquisition over the free coordinates while its Gaussian processes keep seeing every

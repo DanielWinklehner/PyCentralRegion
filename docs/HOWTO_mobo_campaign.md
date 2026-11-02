@@ -84,17 +84,19 @@ Before the first real run, check the campaign file:
   The driver refuses before anything runs a range whose corners break the last bullet. A range beyond the first three
   makes evaluations fail at the build instead of exploring designs.
 
-## 3. Pilot: cheap variables on existing fields (about 40 min)
+## 3. Pilot: cheap variables on existing fields (about 35 min)
 
 `mobo_pilot.toml` optimises RF phase, dee voltage and a first-harmonic trim on the fields of
-`design_wnop3_rotn3_g0ap`. No geometry is built, so every evaluation is about 2 min of tracking and scoring:
+`design_wnop3_rotn3_g0ap`. No geometry is built, so every evaluation is about 1.6 min of tracking and scoring (95-108 s
+in the pilot of 2026-11-02, 33 min for its 20 evaluations):
 
 ```powershell
 & $py -m PyCentralRegion.cli optimize $campaign
 ```
 
 The driver logs every evaluation as it starts and ends. The first evaluation is the warm start, the design as
-tracked. Its I_final should come out near 4.05 mA (T = 50.45 % of 8.03 mA at the search fidelity).
+tracked. Its I_final should come out at 4.05 mA (T = 50.40 % of 8.03 mA at the search fidelity: 4.049 mA in the
+pilot of 2026-11-02).
 
 ## 4. The campaign with geometry variables
 
@@ -104,7 +106,7 @@ evaluations. For another design, start from it or from the pilot's file. Read it
 loop does not see, among them that the gap-0 hole does not follow the inflector rotation.
 
 Every new geometry is built and solved under `<campaign_dir>\geometries\<key>\`. The first evaluation, the warm start,
-rebuilds the base design there (about 10 min; the build equals the design deck's model bit for bit).
+rebuilds the base design there (about 6 min; the build equals the design deck's model bit for bit).
 
 ```powershell
 $campaign = "$repo\configs\examples\hchc1p5\mobo_campaign.toml"
@@ -115,14 +117,14 @@ $campaign = "$repo\configs\examples\hchc1p5\mobo_campaign.toml"
 ```
 
 Planning the budget:
-- a new geometry's evaluation takes about 10 min on the worked example (build about 20 s, fields about 8 min, then
-  the tracking), and the driver follows it with `cheap_per_geometry` cheap evaluations of 1.5-2 min each;
-- every evaluation process first compiles the tracking kernel, about 65 s of those 1.5-2 min;
+- a new geometry's evaluation takes about 6 min on the worked example (build about 20 s, fields about 4 min, then
+  the tracking), and the driver follows it with `cheap_per_geometry` cheap evaluations of about 1.6 min each;
+- every evaluation process first compiles the tracking kernel, about 65 s of those 1.6 min;
 - with `cheap_per_geometry = 3`, a quarter of the evaluations build a geometry;
 - `n_startup` evaluations are random (`mobo_campaign.toml`: 16, the warm start and 15 random designs). With 6-13
   variables, 10-16 random points and 60-120 evaluations in all is a reasonable start;
-- `mobo_campaign.toml`: 30 × 10 min + 90 × 2 min, about 8 h for its 120 evaluations (`--max-hours 10` runs it to the
-  end).
+- `mobo_campaign.toml`: 30 × 6 min + 90 × 1.6 min, about 5.5 h for its 120 evaluations (`--max-hours 10` runs it to
+  the end, with room for fields as slow as the design deck's run: 8 min instead of 4).
 
 `--max-hours` bounds one run of the driver. `max_evals` bounds the whole campaign (`--max-evals N` overrides it);
 running the same command again continues to it. `--set key=value` overrides any key of the campaign file for one run,
@@ -154,7 +156,7 @@ e.g. `--set mobo.seed=3`.
 
 ## 6. Verify the Pareto set
 
-The search fidelity ranks designs; the verify fidelity tracks every particle with SC 128³ every step, about 8 min an
+The search fidelity ranks designs; the verify fidelity tracks every particle with SC 128³ every step, about 7 min an
 evaluation:
 
 ```powershell

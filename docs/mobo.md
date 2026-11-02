@@ -80,7 +80,7 @@ Worked examples:
   the worked example's existing fields, 20 evaluations;
 - `configs/examples/hchc1p5/mobo_campaign.toml`: the full campaign: the beam channel's aperture and the
   spiral-inflector rotation (geometry) with the RF phase, the dee voltage, the trim and a radial slit (cheap); 13
-  variables, 120 evaluations, about 8 h. Its header lists what the loop does not see.
+  variables, 120 evaluations, about 5.5 h. Its header lists what the loop does not see.
 
 ## Variables
 
@@ -196,11 +196,13 @@ fidelities both track to the base's turn cap (`track.turns = 8`; a run ends when
 
 | fidelity | particles | SC | one evaluation on known fields |
 |---|---|---|---|
-| search | 10 000 | 64³ every 5 steps | about 2 min (see Costs) |
-| verify | all (~98 000) | 128³ every step | about 8 min |
+| search | 10 000 | 64³ every 5 steps | about 1.6 min (see Costs) |
+| verify | all (~98 000) | 128³ every step | about 7 min |
 
-On the worked example (-15°) a 10 000-particle run at the search fidelity gave T = 50.45 % = 4.053 mA, the verify
-fidelity 50.09 % = 4.024 mA.
+On the worked example (-15°) the search fidelity gives T = 50.40 % = 4.049 mA (the pilot's warm start), the verify
+fidelity 50.09 % = 4.024 mA. Every search evaluation tracks the same 10 000 particles of the hand-off bunch (drawn with
+`track.seed_final`), so the designs are compared on one sample. A sample of 10 000 is worth about ±0.04 mA (±0.5 % in
+T) by itself, mostly the same for every design.
 
 A cheaper search over the first turns would need early stand-ins for the final objectives. The candidates are:
 - `sig_r_t3` for `valley_all` (Spearman 0.94 over the earlier runs);
@@ -283,16 +285,20 @@ evaluation of that geometry builds afresh.
 
 ## Costs
 
-On the worked example (28 threads, one GPU):
-- **Every evaluation process** compiles the parallel 3D tracking kernel first, about 65 s. numba 0.64 reloads a cached
-  parallel build single-threaded, so the cache is off on purpose.
-- **Search tracking** of 10 000 particles on known fields takes 20-25 s after that. A cheap evaluation therefore takes
-  about 1.5-2 min, most of it the compile.
-- **A new geometry** adds the build, about 20 s (17-18 s in the validation builds), and its fields, about 8 min (the
-  design deck's run of the worked example: the metal raster of the obstacle test 314 s, the 3D BEM 73 s with assembly
-  29 s and GMRES 35 s, the field grid 98 s). A new geometry's evaluation therefore takes about 10 min.
-- **Verify tracking** of every particle with SC 128³ every step takes about 7 min (429 s).
-- **A campaign** of 120 evaluations with `cheap_per_geometry = 3` (30 geometries): 30 × 10 + 90 × 2 min, about 8 h.
+Measured on the worked example (28 threads, one GPU):
+- **A cheap evaluation** (the search fidelity on known fields) takes 95-108 s, median 97 s: the pilot's 20 evaluations
+  (`mobo_pilot.toml`, 2026-11-02) took 33 min. Of that:
+  - every evaluation process compiles the parallel 3D tracking kernel first, about 65 s (numba 0.64 reloads a cached
+    parallel build single-threaded, so the cache is off on purpose);
+  - tracking the 10 000 particles takes 17-22 s after that, 11-16 s of it the space-charge solves;
+  - start-up, the system and the reference particle, the record files and the scoring take the other 13-14 s.
+- **A new geometry** adds the build, about 20 s, and its fields: 233 s on the full-chain check of 2026-11-02 (the
+  metal raster of the obstacle test 122 s, the 3D BEM solve 52 s, the field grid 59 s), 485 s in the design deck's
+  run of the same geometry. A new geometry's search evaluation therefore takes about 6 min.
+- **Verify tracking** of every particle with SC 128³ every step takes 6.5-7 min (397 s on the full-chain check, 429 s
+  in the port validation), a verify evaluation on known fields about 7 min in all.
+- **A campaign** of 120 evaluations with `cheap_per_geometry = 3` (30 geometries): 30 × 6 + 90 × 1.6 min, about
+  5.5 h.
 
 ## The toy campaign
 
