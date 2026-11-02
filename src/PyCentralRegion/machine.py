@@ -229,7 +229,7 @@ def magnet_field_3d(cfg, verbose=True):
     ``magnet.sign * magnet.scale``. With ``paths.bfield_2d`` the crop's midplane is compared with that 2D map
     (warning above 2 %). Returns (field, check)."""
     from PyPATools.field import Field
-    from .btrim import add_trim
+    from .btrim import add_trim, resolved
     from .fields3d import crop_comsol_3d, field_from_crop
     mg, pc, rc = section(cfg, 'magnet'), section(cfg, 'paths'), section(cfg, 'run')
     bmap = Path(require(pc.bfield_3d, 'paths.bfield_3d'))
@@ -248,9 +248,10 @@ def magnet_field_3d(cfg, verbose=True):
     scale = float(mg.sign) * float(mg.scale)
     bt = section(cfg, 'btrim')
     add_trim(crop, bt, scaling=scale, verbose=verbose)
+    trim_t = resolved(bt).amplitude_t
     b3 = field_from_crop(crop, scaling=scale, label=f'3D magnet map ({bmap.stem}, Bx,By = 0 at z = 0)'
                          + (f' + flat centre to {mg.flatten_r_m * 1e3:.0f} mm' if mg.flatten_r_m > 0 else '')
-                         + (f' + first-harmonic trim {bt.amplitude_t * 1e4:.2f} G' if bt.amplitude_t else ''))
+                         + (f' + first-harmonic trim {trim_t * 1e4:.2f} G' if trim_t else ''))
     check = {}
     if pc.bfield_2d:
         b2 = Field.from_file(str(pc.bfield_2d), interpolator_backend='numba', scaling=scale)
