@@ -19,7 +19,7 @@ PyPATools (fields, particles, the FFT Poisson solver) is a sibling package; inst
 
 ```
 pip install -e path/to/PyPATools
-pip install -e .[track,bem]           # + gpu (cupy), mobo (optuna, torch), cavity (dfols), test (pytest)
+pip install -e .[track,bem]           # + gpu (cupy), mobo (optuna, torch, greenlet), cavity (dfols), test (pytest)
 ```
 
 ## Use

@@ -29,6 +29,8 @@ campaign seed and the evaluation's index: every proposal follows from the store 
 continued proposes what one uninterrupted run would have proposed from the same evaluations - an uninterrupted run's
 designs up to the stop, and after it the proposals of a study without the evaluation that was running at the stop
 (it is lost, see below). A proposal not yet started when the driver stopped is run first, and then nothing is lost.
+That holds in one environment: with the GP, whether greenlet is installed changes the proposals slightly (docs/mobo.md,
+"Samplers"), and the campaign's later designs with them.
 The study places every design at its stored unit coordinates, so the variables are the campaign's for good: a
 variable added, removed, renamed, re-ranged or re-targeted once evaluations exist would move every stored design
 under the sampler, and the driver refuses to continue (``check_store``; a new search space is a new campaign_dir,

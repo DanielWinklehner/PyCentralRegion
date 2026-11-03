@@ -8,7 +8,8 @@ example (HCHC-1.5), so change them for another machine.
 
 - One GPU, one campaign: nothing else should use the GPU while a campaign runs.
 - Two Python environments:
-  - the driver's: numpy, scipy, optuna >= 5, torch (CPU), here `pcr-mobo`;
+  - the driver's: numpy, scipy, optuna >= 5, torch (CPU) and greenlet, here `pcr-mobo` (greenlet since 2026-11-02,
+    after the first pilot, whose proposals were made without it; [mobo.md](mobo.md), "Samplers");
   - the physics one: numba, PyPATools, bempp, gmsh, cupy, here `accel-dev-env`.
   The driver starts every evaluation with the physics interpreter named in `[mobo] physics_python`.
 - Free disk. On the worked example:

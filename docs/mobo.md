@@ -11,7 +11,7 @@ Step-by-step commands for a real campaign: [HOWTO_mobo_campaign.md](HOWTO_mobo_c
 
 | process | environment | needs |
 |---|---|---|
-| the driver (`pcr optimize ...`) | small: `pip install -e .[mobo]` | numpy, scipy, optuna >= 5, torch (CPU is enough; `gp` only) |
+| the driver (`pcr optimize ...`) | small: `pip install -e .[mobo]` | numpy, scipy, optuna >= 5, torch (CPU is enough; `gp` only), greenlet (`gp`, faster proposals: "Samplers") |
 | each evaluation | the physics environment, `[mobo] physics_python` | numba, PyPATools, bempp, gmsh, cupy |
 
 The driver never imports the physics modules. Each evaluation is a subprocess:
@@ -226,12 +226,12 @@ turn.
 On the worked example (-15°) the search fidelity gives T = 50.79 % = 4.080 mA (the warm start), the verify fidelity
 50.57 % = 4.063 mA, with the column test, the default. The deck's slice test (`track.obstacles = "raster"`) gave
 50.40 % = 4.049 mA (the first pilot's warm start) and 50.09 % = 4.024 mA: it puts the channel's faces up to half a
-millimetre off (the level ones half a millimetre low), but for slivers of metal or vacuum thinner than a level (146 at
-77 nodes), and so stops, net, 39 and 471 particles more. The deck's slices also lack the ground at z = ±15 mm, which
-puts the ground's faces near those heights off, those on the channel's taper at r = 113-127 mm (|z| = 14-15 mm) at
-±15.5 mm, up to 1.5 mm into the metal, and six at r = 34 and 55 mm; the particles the columns stop on the taper's
-faces (144 and 1511), the slices stop too, a median 19 steps later (`docs/pipeline.md`). Every search evaluation
-tracks the same
+millimetre off (the level ones half a millimetre low), but for slivers of metal or vacuum thinner than a level (146 in
+the whole model at |z| < 29.5 mm, at 77 nodes at r < 100 mm and at its edge: `docs/pipeline.md`, "The metal test"),
+and so stops, net, 39 and 471 particles more. The deck's slices also lack the ground at z = ±15 mm, which puts the
+ground's faces near those heights off, those on the channel's taper at r = 113-127 mm (|z| = 14-15 mm) at ±15.5 mm, up
+to 1.5 mm into the metal, and six at r = 34 and 55 mm; the particles the columns stop on those taper faces (144 and
+1511), the slices stop too, a median 19 steps later (`docs/pipeline.md`). Every search evaluation tracks the same
 10 000 particles of the hand-off bunch (drawn with `track.seed_final`), so the designs are compared on one sample. A
 sample of 10 000 is worth about ±0.04 mA (±0.5 % in T) by itself, mostly the same for every design.
 
@@ -247,10 +247,14 @@ come from the end of the run, so they are not early stand-ins.
 ## Samplers
 
 Both samplers are constrained and multi-objective, and both read the same store, so a campaign can switch between
-them. Prefer `gp` (it needs torch): on the toy, 40 evaluations reach 95 % of the true front's hypervolume with the GP
-and 70 % with TPE, whose pinned cheap followers model only the free coordinates. `tpe` is the default because it needs
-no torch. Without the `greenlet` package optuna's GP runs its acquisition restarts one after another, which costs
-about 0.5 s per proposal and prints a warning.
+them. Prefer `gp` (it needs torch): on the toy, 40 evaluations reach about 95 % of the true front's hypervolume with
+the GP and 70-79 % with TPE, whose pinned cheap followers model only the free coordinates (seeds 0-3). `tpe` is the
+default because it needs no torch. With the `greenlet` package optuna's GP runs the restarts of its acquisition's
+optimiser side by side, evaluating their points together; without it, one after another, with a warning: on the toy a
+proposal then takes about 0.4 s instead of 0.2 s (16-40 evaluations). The two make slightly different proposals from
+the same store (on the toy within 1e-9 in 242 of 264, by up to 3e-4 in the unit cube), and each later proposal follows
+from the scores of the designs before it, so a campaign repeats exactly only in an environment that has greenlet, or
+lacks it, as the original did (`pcr_validation\greenlet_2026-11-03`).
 
 ## Running
 
@@ -271,9 +275,10 @@ PowerShell 5.1, put `--%` after the interpreter: `& <python> --% -m PyCentralReg
 The campaign folder is the whole state. Running `pcr optimize` again continues where the last run stopped. Every
 proposal follows from the store alone: the study is rebuilt from the store each time and the sampler seeded from
 `seed` and the evaluation's index. A run stopped between evaluations, or after proposing one and before starting it
-(that one then runs first), continues exactly as an uninterrupted run would have. A run stopped during an evaluation
-loses that evaluation: the evaluations before it are the uninterrupted run's, the ones after it what the study
-proposes without it.
+(that one then runs first), continues exactly as an uninterrupted run would have in the same environment (with the GP,
+greenlet installed or not changes the proposals slightly, and the later ones with them: "Samplers"). A run stopped
+during an evaluation loses that evaluation: the evaluations before it are the uninterrupted run's, the ones after it
+what the study proposes without it.
 
 The driver never schedules or restarts itself. Before its first evaluation, `pcr optimize` (and `optimize-verify`,
 when it has work) checks that `physics_python` runs and finds the package and the evaluator module: the preflight,
@@ -337,10 +342,11 @@ Measured on the worked example (28 threads, one GPU):
   114 s, its kernel phase (the compile included) 80 s against the pilot's 66.5-70.6 s (67.4 s for the same warm
   start). Its verify twin's kernel phase was 12 s longer than the full-chain check's as well (98.5 s against 86.5 s),
   though the verify runs step about ten times the particles, so the extra is a fixed cost per process, the compile,
-  not the test's stepping. The compile time varies from run to run: the CPU runs of that evening
-  (`metal_columns_2026-11-02\track`) spent 71-96 s in that phase with either test, the code from before the column
-  test 83 s, and repeats differ by up to 9 s. If it stays near 80 s, a cheap evaluation takes about 1.9 min and the
-  campaign about 5 h. Its verify tracking took 396 s, as long as the full-chain check's 397 s.
+  not the test's stepping. The compile time varies from run to run: the CPU runs of that evening with 2000 and 4000
+  particles (`metal_columns_2026-11-02\track`), on the same parallel kernel as the evaluations, spent 71-96 s in that
+  phase with either test, the code from before the column test 83 s (`raster_head_2000`), and repeats differ by up to
+  9 s. If it stays near 80 s, a cheap evaluation takes about 1.9 min and the campaign about 5 h. Its verify tracking
+  took 396 s, as long as the full-chain check's 397 s.
 
 ## The toy campaign
 

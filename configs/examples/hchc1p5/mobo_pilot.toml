@@ -7,8 +7,8 @@
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml             (runs until max_evals; rerun continues)
 #   pcr optimize-status configs/examples/hchc1p5/mobo_pilot.toml
 #   pcr optimize-verify configs/examples/hchc1p5/mobo_pilot.toml --pareto    (every particle, SC 128^3 every step)
-# The driver runs in its own small environment (numpy, scipy, optuna >= 5, torch CPU); the evaluations run in the
-# physics environment below, with the source folder of the driver's own PyCentralRegion first on their PYTHONPATH
+# The driver runs in its own small environment (numpy, scipy, optuna >= 5, torch CPU, greenlet); the evaluations run in
+# the physics environment below, with the source folder of the driver's own PyCentralRegion first on their PYTHONPATH
 # (they run the code the driver runs). Every evaluation uses the GPU. Stopping the driver (Ctrl+C, closing its window,
 # the end of --max-hours) stops the running evaluation with everything it started; running it again continues the
 # campaign.

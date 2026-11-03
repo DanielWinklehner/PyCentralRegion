@@ -263,19 +263,18 @@ by one test where the other reads vacuum. Among them are the 87 and 932 that the
 level, where the deck's slices lack the ground there (with it they would read metal at those stops), 83 and 907 of
 them on the channel's taper (these stops at r = 117-127 mm), where the slices put the ground's faces 0.5-1.2 mm into
 the metal; the slices stop all of them too, a median 17 steps later. On the same faces the columns stop another 61 and
-604 nearest the ±14 mm level (r = 113-120 mm), where the slices put the faces 1.0-1.5 mm into the metal (1.5 mm at the
-taper's inner end, r = 113 mm; "The metal test", `check_taper_faces`), a millimetre further than they would with the
-ground, and read vacuum there, with the ground or without; the slices stop these a median 25 and 23 steps later, and
-all 144 and 1511 a median 19. By the end of the run the paths are a median 0.04 and 0.05 mm apart. Of the particles
-one test alone stops that both runs track (95 and 233), the other run's particle reaches the stopping test's metal in
-the same half vertical oscillation in 91 and 215 cases (74 and 168 within 4 steps of the stop), a median 0.2 mm deep,
-where its own test reads vacuum. The other 4 and 18 stay short of it, 21 of them by 0.006-0.14 mm and one by
-0.0003 mm, which the records still resolve: interpolated from every other record, that path is 0.00017 mm off next
-to its closest approach, so from all of them about 0.00002 mm (0.00009 mm even if the error only fell as the
-spacing, and on that assumption 0.00014 mm from how far the closest approach itself moves when every other record
-is left out; `check_band_entry_resolution`). For those 4 and 18 the other run's path, parted by the stops that
-differed earlier, decides, not the local difference between the tests (`check_loss_history`, `check_band_entry`).
-The scores move with the stops, `valley_all` and `ratio` about as much as between the two
-fidelities: `valley_all` 0.0695 / 0.0691 (search / verify) with the columns against 0.0698 / 0.0694 with the slices,
-`ratio` 2.459 / 2.471 against 2.446 / 2.458; `E_med` is the same to 0.2 keV (it rises 2.5-2.8 keV from search to
-verify).
+604 nearest the ±14 mm level (r = 113-120 mm), where the slices put the faces 1.0-1.5 mm into the metal (1.5 mm at
+r = 113 mm, where the taper's face is at |z| = 14 mm; "The metal test", `check_taper_faces`), a millimetre further
+than they would with the ground, and read vacuum there, with the ground or without; the slices stop these a median 25
+and 23 steps later, and all 144 and 1511 a median 19. By the end of the run the paths are a median 0.04 and 0.05 mm
+apart. Of the particles one test alone stops that both runs track (95 and 233), the other run's particle reaches the
+stopping test's metal in the same half vertical oscillation in 91 and 215 cases (74 and 168 within 4 steps of the
+stop), a median 0.2 mm deep, where its own test reads vacuum. The other 4 and 18 stay short of it, 21 of them by
+0.006-0.14 mm and one by 0.0003 mm, which the records still resolve: interpolated from every other record, that path
+is 0.00017 mm off next to its closest approach, so from all of them about 0.00002 mm (0.00009 mm even if the error
+only fell as the spacing, and on that assumption 0.00014 mm from how far the closest approach itself moves when every
+other record is left out; `check_band_entry_resolution`). For those 4 and 18 the other run's path, parted by the stops
+that differed earlier, decides, not the local difference between the tests (`check_loss_history`, `check_band_entry`).
+The scores move with the stops, `valley_all` and `ratio` about as much as between the two fidelities: `valley_all`
+0.0695 / 0.0691 (search / verify) with the columns against 0.0698 / 0.0694 with the slices, `ratio` 2.459 / 2.471
+against 2.446 / 2.458; `E_med` is the same to 0.2 keV (it rises 2.5-2.8 keV from search to verify).

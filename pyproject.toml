@@ -16,7 +16,7 @@ dependencies = ["numpy", "scipy", "matplotlib"]
 track = ["numba", "h5py", "pandas", "trimesh"]   # pcr track: compiled 3D kernel, hand-off files, map crops, housing
 bem = ["bempp-cl", "gmsh", "trimesh"]           # pcr build / pcr fields: OCC electrode model, mesh, 3D BEM solve
 gpu = ["cupy"]                                  # GPU BEM solve, potentials and space charge (match the CUDA version)
-mobo = ["optuna>=5", "torch"]                   # pcr optimize (create_trial(constraints=); the GP sampler needs torch)
+mobo = ["optuna>=5", "torch", "greenlet"]       # pcr optimize (create_trial(constraints=); gp: torch; greenlet: faster)
 cavity = ["dfols", "tqdm"]                      # the 2D cavity optimisers of the examples
 test = ["pytest"]
 
