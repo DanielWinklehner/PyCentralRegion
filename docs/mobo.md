@@ -76,14 +76,19 @@ timeout_min = 30.0
 
 Worked examples:
 - `configs/examples/toy/campaign.toml`: the analytic toy, 30 evaluations in about 8 s (17 s with the GP);
-- `configs/examples/hchc1p5/mobo_pilot.toml`: cheap variables only (RF phase, dee voltage, the first-harmonic trim's
-  two components), on the worked example's existing fields, 20 evaluations;
+- `configs/examples/hchc1p5/mobo_pilot.toml`: cheap variables only (RF phase, dee voltage), on the worked example's
+  existing fields, 20 evaluations;
 - `configs/examples/hchc1p5/mobo_campaign.toml`: the full campaign: the beam channel's aperture and the
-  spiral-inflector rotation (geometry) with the RF phase, the dee voltage and the trim (cheap); 9 variables, 120
+  spiral-inflector rotation (geometry) with the RF phase and the dee voltage (cheap); 7 variables, 120
   evaluations, about 4.5-5 h (see Costs). Its header lists what the first pilot changed and what the loop does
   not see;
 - `configs/examples/hchc1p5/mobo_slit.toml`: a radial slit for the chosen design, a campaign of its own (cheap: the
   slit's opening, azimuth and offset at one fixed pass), 20 evaluations.
+
+In the pilot and the campaign a first-harmonic magnetic trim is opt-in: the worked example's design has no trim
+coils, so its two variables (`trim_c`, `trim_s`) are commented out. Uncomment them for a what-if, in another
+`campaign_dir`, and label its results "with trim". The second pilot (2026-11-03) ran with them, so its store is read
+only with them uncommented.
 
 ## Variables
 

@@ -685,8 +685,8 @@ def test_pilot_config_dry_run(capsys):
     cfg = driver.load(PILOT)
     if not Path(cfg.physics_python).is_file():
         pytest.skip('the pilot names a physics interpreter of the machine it runs on')
-    assert [v.kind for v in cfg.variables] == ['cheap'] * 4 and cfg.sampler == 'gp'
-    assert [o.metric for o in cfg.objectives] == ['I_final', 'valley_all', 'ratio']
+    assert [(v.name, v.kind) for v in cfg.variables] == [('phase', 'cheap'), ('volt', 'cheap')]   # the trim: opt-in
+    assert cfg.sampler == 'gp' and [o.metric for o in cfg.objectives] == ['I_final', 'valley_all', 'ratio']
     assert cfg.n_startup >= 2 * len(cfg.variables) + 1
     camp = driver.Campaign(cfg)
     if camp.store.log.exists():
@@ -694,26 +694,25 @@ def test_pilot_config_dry_run(capsys):
     assert camp.dry_run() == 0
     out = capsys.readouterr().out
     cmd = out.strip().splitlines()[-1]                         # the command (the log above it lists the fidelities)
-    for item in ('track.phases_deg=[-15.0]', 'track.volt_scale=1.0', 'btrim.amplitude_cos_t=0.0',
-                 'btrim.amplitude_sin_t=0.0', 'btrim.r_min_m=0.05', 'track.turns=7',
+    for item in ('track.phases_deg=[-15.0]', 'track.volt_scale=1.0', 'btrim.r_min_m=0.05', 'track.turns=7',
                  'track.stop_at_target_energy=false', 'track.n_final=10000', 'track.n_tracks=10000',
                  'PyCentralRegion.cli evaluate'):
         assert item in cmd
-    assert 'paths.model3d' not in out and 'btrim.amplitude_t' not in out  # the base's own model; the trim by components
+    assert 'paths.model3d' not in out and 'btrim.amplitude' not in out    # the base's own model; no trim
 
 
 def test_campaign_config_dry_run(capsys):
-    """The full campaign: five geometry variables (the channel aperture, the inflector rotation) and four cheap ones
-    (RF phase, dee voltage, the trim's two components), every design at its 7th turn; its first evaluation is the base
-    design, built into the campaign's geometry cache."""
+    """The full campaign: five geometry variables (the channel aperture, the inflector rotation) and two cheap ones
+    (RF phase, dee voltage; the trim is opt-in), every design at its 7th turn; its first evaluation is the base design,
+    built into the campaign's geometry cache."""
     from PyCentralRegion.geometry.options import GeometryConfig
     if 'aperture_inner_mm' not in {f.name for f in dataclasses.fields(GeometryConfig)}:
         pytest.skip('[geometry] has no aperture_inner_mm .. aperture_taper_length_mm yet')
     cfg = driver.load(CAMPAIGN)
     if not Path(cfg.physics_python).is_file():
         pytest.skip('the campaign names a physics interpreter of the machine it runs on')
-    assert [v.kind for v in cfg.variables] == ['geometry'] * 5 + ['cheap'] * 4
-    assert cfg.n_startup >= 2 * len(cfg.variables) + 1
+    assert [v.kind for v in cfg.variables] == ['geometry'] * 5 + ['cheap'] * 2
+    assert cfg.n_startup >= 2 * (len(cfg.variables) + 2) + 1          # enough for the opt-in trim's two as well
     camp = driver.Campaign(cfg)
     if camp.store.log.exists():
         pytest.skip('the campaign has started')
@@ -722,10 +721,34 @@ def test_campaign_config_dry_run(capsys):
     cmd = out.strip().splitlines()[-1]                         # the command (the log above it lists the fidelities)
     params = camp.warm_point(0)
     key = space.geometry_key(camp.base(cfg.search_fidelity), cfg, params)
-    assert params['si_rot'] == pytest.approx(4.726034523988023) and params['trim_c'] == params['trim_s'] == 0.0
+    assert params['si_rot'] == pytest.approx(4.726034523988023) and 'trim_c' not in params
     assert f"geometries/{key}/fields.pkl" in cmd and 'track.n_tracks=10000' in cmd
     assert 'track.turns=7' in cmd and 'track.stop_at_target_energy=false' in cmd
-    assert 'btrim.amplitude_cos_t=0.0' in cmd and 'btrim.amplitude_sin_t=0.0' in cmd and 'btrim.amplitude_t' not in out
+    assert 'btrim.amplitude' not in out                                # no trim
+
+
+@pytest.mark.parametrize('path', [PILOT, CAMPAIGN], ids=['pilot', 'campaign'])
+def test_opt_in_trim(path, tmp_path):
+    """The first-harmonic trim is opt-in (the design has no trim coils): its two variables are commented out, and
+    uncommented they make a valid campaign with them. The second pilot ran with them: its store reads only so."""
+    lines, on = [], False
+    for line in path.read_text(encoding='utf-8').splitlines():
+        on = line.startswith('# [[mobo.variables]]') or (on and line.startswith('#'))
+        lines.append((line[2:] if line != '#' else '') if on else line)
+    default = driver.load(path)
+    opted = tmp_path / path.name
+    opted.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    trim = driver.load(opted, [f'mobo.base_config_file={C.toml_value(default.base_config_file)}']).validate()
+    assert [v.name for v in trim.variables] == [v.name for v in default.variables] + ['trim_c', 'trim_s']
+    assert [(v.target, v.low, v.high, v.kind) for v in trim.variables[-2:]] == [
+        ('btrim.amplitude_cos_t', -2e-3, 2e-3, 'cheap'), ('btrim.amplitude_sin_t', -2e-3, 2e-3, 'cheap')]
+    assert trim.n_startup >= 2 * len(trim.variables) + 1
+    if path != PILOT or not Path(trim.physics_python).is_file() or not store.Store(trim.campaign_dir).log.exists():
+        return
+    evals = store.Store(trim.campaign_dir).evaluations()
+    driver.Campaign(trim).check_store(evals)
+    with pytest.raises(C.ConfigError, match='the variables changed'):
+        driver.Campaign(default).check_store(evals)
 
 
 def test_slit_config_dry_run(capsys):

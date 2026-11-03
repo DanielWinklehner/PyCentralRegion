@@ -90,11 +90,12 @@ Before the first real run, check the campaign file:
 
 ## 3. Pilot: cheap variables on existing fields (35-40 min)
 
-`mobo_pilot.toml` optimises RF phase, dee voltage and a first-harmonic trim (by its two Cartesian components) on the
-fields of `design_wnop3_rotn3_g0ap`, every run 7 turns. No geometry is built, so every evaluation is about 1.6-1.9 min
-of tracking and scoring (95-108 s in the first pilot of 2026-11-02, with the deck's slice test, 33 min for its 20
-evaluations; 114 s in the one run timed with the column test, the default). That first pilot varied the trim by
-amplitude and azimuth and stopped every run at 3 MeV; its report
+`mobo_pilot.toml` optimises RF phase and dee voltage on the fields of `design_wnop3_rotn3_g0ap`, every run 7 turns. A
+first-harmonic trim (by its two Cartesian components) is opt-in: the design has no trim coils, so its two variables
+are commented out (the second pilot, of 2026-11-03, ran with them; its store needs them uncommented). No geometry is
+built, so every evaluation is about 1.6-1.9 min of tracking and scoring (95-108 s in the first pilot of 2026-11-02,
+with the deck's slice test, 33 min for its 20 evaluations; 114 s in the one run timed with the column test, the
+default). That first pilot varied the trim by amplitude and azimuth and stopped every run at 3 MeV; its report
 (`E:\HCHC1.5\Results\CR\pcr_validation\mobo\pilot_analysis\pilot_report.md`) is why the file now does neither, and
 so it has a new `campaign_dir`.
 
@@ -115,8 +116,9 @@ should give it the run it had with the stop (array for array in a 200-particle c
 ## 4. The campaign with geometry variables
 
 `mobo_campaign.toml` adds to the pilot's variables the beam channel's aperture (inner and outer height, taper centre
-and length) and the spiral-inflector rotation (`kind = "geometry"`): 9 variables, 120 evaluations. For another
-design, start from it or from the pilot's file. Read its header first: it lists what the loop does not see, among them
+and length) and the spiral-inflector rotation (`kind = "geometry"`): 7 variables (9 with the opt-in trim), 120
+evaluations. For another design, start from it or from the pilot's file. Read its header first: it lists what the
+loop does not see, among them
 that the gap-0 hole does not follow the inflector rotation (at the ends of the ±3° range the bunch, flown straight
 from the hand-off plane as `gap0_hole` places the hole, meets gap 0's edge 4.7 / 0.6 mm from the hole's centre,
 against 2.2 mm at the base, where the tracked bunch meets it 1.1 mm from the centre).

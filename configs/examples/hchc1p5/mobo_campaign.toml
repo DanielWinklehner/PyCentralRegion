@@ -1,10 +1,11 @@
 # The full MOBO campaign on the worked example, after the pilot: the beam channel's aperture and the spiral
 # inflector's rotation (geometry: every new value needs an electrode build and its 3D BEM fields, so that evaluation
-# takes about 4 min: build ~20 s, fields ~2 min, then the tracking) together with the RF phase, the dee-voltage
-# scale and a first-harmonic magnetic trim (cheap: they re-track on that geometry's fields, about 1.6-1.9 min
-# each), 9 variables. After every new geometry the driver runs cheap_per_geometry cheap evaluations on it; every
-# geometry gets its own model and fields under <campaign_dir>/geometries/<key>/. A radial slit is a later campaign of
-# its own, on the design this one chooses (mobo_slit.toml).
+# takes about 4 min: build ~20 s, fields ~2 min, then the tracking) together with the RF phase and the dee-voltage
+# scale (cheap: they re-track on that geometry's fields, about 1.6-1.9 min each), 7 variables. After every new
+# geometry the driver runs cheap_per_geometry cheap evaluations on it; every geometry gets its own model and fields
+# under <campaign_dir>/geometries/<key>/. A radial slit is a later campaign of its own, on the design this one chooses
+# (mobo_slit.toml). A first-harmonic magnetic trim is opt-in (its two variables are commented out below): the design
+# has no trim coils.
 #   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml --dry-run   (prints the first evaluation's command)
 #   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml             (runs until max_evals; a rerun
 #                                                                                continues; --max-hours H for a slot)
@@ -17,8 +18,8 @@
 # wnop3_rotn3_g0ap: star ground, hug dees, dee 0's nose, the moved junctions, gap 0's counter post and round hole).
 #
 # What the pilot of 2026-11-02 changed here (E:\HCHC1.5\Results\CR\pcr_validation\mobo\pilot_analysis\pilot_report.md):
-# * The trim is varied by its Cartesian components (trim_c, trim_s). The polar azimuth's seam at +-180 deg and its
-#   dead value at zero amplitude put 10 of the pilot GP's 12 proposals on a bound of the box.
+# * The trim, when opted in, is varied by its Cartesian components (trim_c, trim_s). The polar azimuth's seam at
+#   +-180 deg and its dead value at zero amplitude put 10 of the pilot GP's 12 proposals on a bound of the box.
 # * Every run tracks 7 turns (track.turns = 7 with track.stop_at_target_energy = false, in `fixed`). Designs below a
 #   dee-voltage scale of about 0.97 needed an 8th turn to reach 3 MeV, and the end-of-run scores jump with the turn
 #   count. A slow design now ends below 3 MeV, where the E_med constraint judges it: with E_med >= 2.9 one that ends
@@ -29,9 +30,9 @@
 #   did nothing, small openings lose the beam, and its pass is an unordered choice.
 # * The inflector rotation spans +-3 deg (+-8 deg before, where by straight flight the bunch met gap 0's edge 6-9 mm
 #   from the gap-0 hole's centre at the ends of the range; 0.6-4.7 mm now: see below).
-# * n_startup = 20 evaluations before the GP takes over, for 9 variables (>= 2 x 9 + 1; 16 for 13 variables before).
-#   They are the base and 4 random geometries with 3 cheap followers each (the base and 3 before), so the 5 geometry
-#   coordinates start from 5 points.
+# * n_startup = 20 evaluations before the GP takes over, enough for 9 variables, the opt-in trim's included
+#   (>= 2 x 9 + 1; 16 for 13 variables before). They are the base and 4 random geometries with 3 cheap followers each
+#   (the base and 3 before), so the 5 geometry coordinates start from 5 points.
 # * The metal test is exact in z (track.obstacles = "columns", the default since 2026-11-02). The pilot's test, the
 #   deck's slices, had a level every 1 mm and tested the nearest one: a channel face acted at the half millimetre next
 #   to it, so the losses saw ap_inner and ap_outer in 2 mm steps of full height (everything in (26, 28) mm acted as
@@ -56,10 +57,11 @@
 campaign_dir = "E:/HCHC1.5/Results/CR/mobo/campaign_wnop3_rotn3_g0ap"
 base_config_file = "design_wnop3_rotn3_g0ap.toml"
 physics_python = "C:/Users/Daniel/anaconda3/envs/accel-dev-env/python.exe"
-sampler = "gp"                 # constrained 3-objective GP (logCEHVI) over 9 coordinates; "tpe" uses the same store
+sampler = "gp"                 # constrained 3-objective GP (logCEHVI) over 7 coordinates (9 with the opt-in trim);
+                               # "tpe" uses the same store
 seed = 0
 n_startup = 20                 # the warm start and 19 random designs (5 geometries with their cheap followers):
-                               # at least 2 x 9 + 1 before the GP takes over
+                               # at least 2 x 9 + 1 (the opt-in trim included) before the GP takes over
 max_evals = 120                # ~30 geometries x (1 + cheap_per_geometry): 30 x 4 min + 90 x 1.6-1.9 min,
                                # about 4.5-5 h
 cheap_per_geometry = 3
@@ -68,7 +70,7 @@ failed_as_infeasible = false   # a failed build, BEM or tracking blocks only its
 fixed = [
     'geometry.si_rotation="fixed"',      # the builder turns the housing by [inflector] rotation_deg (a variable here;
                                          # the base's "corner" rule gives 4.726 deg, the same build at that angle)
-    "btrim.r_min_m=0.05", "btrim.r_max_m=0.135",   # radial extent of the trim (its shape is not optimised here)
+    "btrim.r_min_m=0.05", "btrim.r_max_m=0.135",   # radial extent of the opt-in trim (inert without it)
     "track.turns=7", "track.stop_at_target_energy=false",   # every design scored at its 7th turn
 ]
 # The base design first: its channel (26 mm inside r = 100 mm, 32 mm beyond r = 140 mm: centre 120, length 40, as its
@@ -132,7 +134,7 @@ low = 1.726
 high = 7.726
 kind = "geometry"
 
-# --- cheap: RF, dee voltage, magnetic trim -------------------------------------------------------------------------
+# --- cheap: RF phase, dee voltage ----------------------------------------------------------------------------------
 [[mobo.variables]]
 name = "phase"
 target = "track.phases_deg"              # one RF phase per evaluation [deg]
@@ -146,20 +148,25 @@ target = "track.volt_scale"              # dee voltage / the 65 kV the BEM field
 low = 0.95
 high = 1.10
 
+# --- opt-in, not part of the design: a first-harmonic magnetic trim (cheap) ---------------------------------------
+# The design has no trim coils, so the trim stays off. To study one as a what-if, uncomment the two variables below,
+# run them in another campaign_dir (a started campaign keeps its variables), and label every result that uses them
+# "with trim". On the first pilot's best design (its eval 0014) the trim was worth about +0.06 mA: 4.591 mA with its
+# 0.83 mT, 4.533 mA without, at the search fidelity with the column test
+# (E:\HCHC1.5\Results\CR\pcr_validation\mobo\pilot_analysis\retrack_0014).
 # The trim b(r) [b_c cos(theta) + b_s sin(theta)] by its Cartesian components: zero trim is one point, the centre of
-# the square, and there is no seam. The square's corners reach 2.83 mT (2 mT along the axes); use +-1.41e-3 if 2 mT
-# is the coil's limit in every direction.
-[[mobo.variables]]
-name = "trim_c"
-target = "btrim.amplitude_cos_t"         # first-harmonic trim, cos(theta) component b_c [T]
-low = -2e-3
-high = 2e-3
-
-[[mobo.variables]]
-name = "trim_s"
-target = "btrim.amplitude_sin_t"         # its sin(theta) component b_s [T]
-low = -2e-3
-high = 2e-3
+# the square, and there is no seam. The +-2 mT box is a what-if range, not a coil's limit (its corners reach 2.83 mT).
+# [[mobo.variables]]
+# name = "trim_c"
+# target = "btrim.amplitude_cos_t"         # first-harmonic trim, cos(theta) component b_c [T]
+# low = -2e-3
+# high = 2e-3
+#
+# [[mobo.variables]]
+# name = "trim_s"
+# target = "btrim.amplitude_sin_t"         # its sin(theta) component b_s [T]
+# low = -2e-3
+# high = 2e-3
 
 # --- objectives and constraints ------------------------------------------------------------------------------------
 [[mobo.objectives]]

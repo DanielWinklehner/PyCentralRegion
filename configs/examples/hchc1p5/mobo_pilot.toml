@@ -1,8 +1,8 @@
-# MOBO pilot on the worked example: about 20 evaluations over cheap variables only (RF phase, dee-voltage scale and a
-# first-harmonic magnetic trim), all on the existing electrode model and BEM fields of design_wnop3_rotn3_g0ap (its
-# paths.model3d / paths.fields), so every evaluation is a 3D bunch tracking with space charge plus scoring, about
-# 1.6-1.9 min (the first pilot's 20 evaluations took 33 min with the deck's slice test; the one search evaluation
-# timed with the column test, the default, took 114 s).
+# MOBO pilot on the worked example: about 20 evaluations over cheap variables only (RF phase and dee-voltage scale; a
+# first-harmonic magnetic trim is opt-in, below: the design has no trim coils), all on the existing electrode model
+# and BEM fields of design_wnop3_rotn3_g0ap (its paths.model3d / paths.fields), so every evaluation is a 3D bunch
+# tracking with space charge plus scoring, about 1.6-1.9 min (the first pilot's 20 evaluations took 33 min with the
+# deck's slice test; the one search evaluation timed with the column test, the default, took 114 s).
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml --dry-run   (prints the first evaluation's command)
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml             (runs until max_evals; rerun continues)
 #   pcr optimize-status configs/examples/hchc1p5/mobo_pilot.toml
@@ -23,6 +23,9 @@
 #   E_med constraint judges it: with E_med >= 2.9 one that ends at 2.9-3.0 MeV stays feasible (design 0015, volt
 #   0.95 at -29 deg, ends its 7th turn near 2.93 MeV: a mean of 2.92 in the first pilot's run, a median of 2.94 in a
 #   200-particle rerun without space charge); 3.0 would ask for the design energy at the 7th turn.
+# The second pilot (2026-11-03, the campaign_dir below) ran with the trim opted in: its store holds trim_c and trim_s,
+# so the driver reads or continues it only with the two variables uncommented (a campaign keeps its search space). A
+# pilot without the trim is another search space: give it another campaign_dir.
 # The warm start reaches 3 MeV in 7 turns: under the old and the new rule it is the same run array for array at 200
 # particles without space charge (pcr_validation\fixes_2026-11-02\track). At the search fidelity it gives 4.080 mA
 # (T = 50.79 %) with the column test, the default since 2026-11-02; the first pilot gave it 4.049 mA (50.40 %) with
@@ -40,10 +43,11 @@ seed = 0
 n_startup = 9                  # the warm start plus 8 random designs (>= 2 x 4 + 1), then 11 model-guided ones
 max_evals = 20
 fixed = [
-    "btrim.r_min_m=0.05", "btrim.r_max_m=0.135",           # radial extent of the trim (its shape is not optimised here)
+    "btrim.r_min_m=0.05", "btrim.r_max_m=0.135",           # radial extent of the opt-in trim (inert without it)
     "track.turns=7", "track.stop_at_target_energy=false",  # every design scored at its 7th turn
 ]
-warm_start = [{phase = -15.0, volt = 1.0, trim_c = 0.0, trim_s = 0.0}]   # the design as tracked on 2026-10-31
+warm_start = [{phase = -15.0, volt = 1.0}]   # the design as tracked on 2026-10-31 (an opted-in trim takes the base
+                                             # config's zero)
 
 [[mobo.variables]]
 name = "phase"
@@ -58,20 +62,22 @@ target = "track.volt_scale"    # dee voltage / the 65 kV the BEM fields are norm
 low = 0.95
 high = 1.10
 
-# The trim b(r) [b_c cos(theta) + b_s sin(theta)] by its Cartesian components: zero trim is one point, the centre of
-# the square, and there is no seam. The square's corners reach 2.83 mT (2 mT along the axes); use +-1.41e-3 if 2 mT
-# is the coil's limit in every direction.
-[[mobo.variables]]
-name = "trim_c"
-target = "btrim.amplitude_cos_t"   # first-harmonic trim, cos(theta) component b_c [T]
-low = -2e-3
-high = 2e-3
-
-[[mobo.variables]]
-name = "trim_s"
-target = "btrim.amplitude_sin_t"   # its sin(theta) component b_s [T]
-low = -2e-3
-high = 2e-3
+# Opt-in, not part of the design: a first-harmonic magnetic trim. The design has no trim coils, so the trim stays off.
+# Uncomment the two variables to study one as a what-if (in another campaign_dir) or to read the second pilot's
+# store, and label every result that uses them "with trim" (mobo_campaign.toml says what it was worth). The trim b(r)
+# [b_c cos(theta) + b_s sin(theta)] by its Cartesian components: zero trim is one point, the centre of the square, and
+# there is no seam. The +-2 mT box is a what-if range, not a coil's limit (its corners reach 2.83 mT).
+# [[mobo.variables]]
+# name = "trim_c"
+# target = "btrim.amplitude_cos_t"   # first-harmonic trim, cos(theta) component b_c [T]
+# low = -2e-3
+# high = 2e-3
+#
+# [[mobo.variables]]
+# name = "trim_s"
+# target = "btrim.amplitude_sin_t"   # its sin(theta) component b_s [T]
+# low = -2e-3
+# high = 2e-3
 
 [[mobo.objectives]]
 metric = "I_final"             # T x injected current [mA]
