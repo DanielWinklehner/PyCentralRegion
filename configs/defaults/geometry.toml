@@ -48,10 +48,25 @@
 # A rule that moves an edge's inner end (dee0's tip cut, a pinched dee, dee_rmin) moves the arclength origin:
 # geometry.build.edge_shift turns a radius change into an arclength on the build's own edges.
 #
+# CONNECTED GAP LINES (gap_lines = "connected"): the seed gives only its reference orbit. Every gap line runs from the
+# axis through P0 -> P1 -> P2 and then out along its radial ray, without the seed's steps (an RF cavity cannot have
+# them), at [machine] dee_opening_deg. In the gap's own frame (x along its ray, y across it): P2 = (r2_mm, 0),
+# P1 = (r1_mm, y1), P0 = (gap_line_r0_mm, y0); f1 and f0 are y1 and y0 as fractions in [-1, 1] of what the limits allow
+# (P0 and P1 within gap_line_d_max_deg of the ray, the bends at P1 and P2 <= bend_max_deg), so every fraction gives a
+# buildable line and all 0 is the radial line. Gap 0 starts where the turned exit-plate line meets its ray (needs
+# gap0_on_plate; its bend there is free) and has no f0. One [[geometry.gap_line]] per gap, gaps 0 .. n in order:
+#     [[geometry.gap_line]]   # gap, r1_mm, r2_mm (0 < r1 < r2), f0 (= 0), f1 (= 0)
+# snap_nodes must be false and junctions empty (both move the seed's nodes).
+#
 # tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/geometry/options.py.
 
 [geometry]
 # gap lines
+gap_lines = "seed"           # "seed": the seed's gap lines (snap, junctions, gap0_on_plate); "connected": above
+gap_line = []                # "connected": one table per gap
+gap_line_r0_mm = 50.0        # "connected": P0 of gaps 1 .. n this far out along the ray
+gap_line_d_max_deg = 8.0     # "connected": P0 and P1 at most this far off the ray (as seen from the axis)
+bend_max_deg = 35.0          # "connected": the bends at P1 and P2 at most this (gap 0's at the exit plate is free)
 snap_nodes = true            # zero inert variable segments, then put the node radii midway between turns
 junctions = []               # after the snap: junctions moved to radii between the 3D beam's passes
 junction_tol_deg = 1.0       # close a variable -> fixed junction whose net angular step is below this
@@ -102,6 +117,10 @@ posts = []
 gap0_posts_mm = []           # [s_inner, s_outer]: a post pair on dee0's gap-0 edge
 windows = []
 holes = []
+gap0_hole_r_mm = 0.0         # > 0: a round hole of this radius on dee0's gap-0 edge, placed at every build where the
+                             # hand-off bunch meets that edge (geometry.build.gap0_hole); 0 = off
+gap0_hole_rim_mm = 8.0       # ... its plate reaches this far beyond the hole on each side
+gap0_hole_dr_mm = 0.0        # ... its centre moved this far in radius along the edge
 boxes = []
 post_size_mm = 10.0          # post width and depth; window / hole plate depth
 post_offset_mm = 5.0         # post centre from its edge (half the size: face flush)

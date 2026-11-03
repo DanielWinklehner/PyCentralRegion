@@ -163,9 +163,18 @@ def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
     g = s['geometry']
     inp = inp or inputs(cfg, plane=False)
     B.configure(g, s['machine'], s['inflector'], exit_plane_spec_file=str(inp['exit_plane_spec'] or ''))
-    dees, geom, result = B.load_gap_lines(inp['seed'])
+    dees, geom, result = B.load_gap_lines(inp['seed'], note_opening=g.gap_lines != 'connected')
     trj = getattr(result, 'trajectory_reference', None)
     trj = np.zeros((0, 3)) if trj is None else np.asarray(trj, dtype=float)
+    if g.gap_lines == 'connected':
+        dees = B.connected_dee_system()
+        si_rot = B.si_rotation_deg(dees)
+        V._banner(f"GAP LINES CONNECTED (geometry.gap_lines): P0 -> P1 -> P2 -> the ray; dee opening "
+                  f"{B.opening_deg(dees):.4f} deg, the spiral inflector turned {si_rot:+.4f} deg")
+        print("  (the seed gives only its reference orbit: its gap lines and opening are not used)")
+        lines = B.lay_connected_gap_lines(dees, verbose=True)
+        V.print_gap_lines(dees, result)
+        return _layout_rest(cfg, s, g, inp, dees, geom, result, trj, si_rot, dees_png, lines)
     if g.snap_nodes and len(trj) > 2:
         V._banner("SEGMENT NODES: DROP THE INERT ONES, THEN SNAP MIDWAY BETWEEN TURNS")
         B.match_gaps_to_orbit(dees, trj, verbose=True)
@@ -183,7 +192,11 @@ def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
     elif si_rot:
         V._banner(f"SI ROTATED ABOUT THE MACHINE AXIS by {si_rot:+.6f} deg - outline, exit aperture, hand-off plane")
     V.print_gap_lines(dees, result)
+    return _layout_rest(cfg, s, g, inp, dees, geom, result, trj, si_rot, dees_png, None)
 
+
+def _layout_rest(cfg, s, g, inp, dees, geom, result, trj, si_rot, dees_png, lines) -> dict:
+    """``layout`` from the gap lines on: the housing, the channel bounds, the dees and the dummy dees."""
     ol = B.rotate_outline(B.read_housing_outline(inp['housing_outline']), si_rot)
     V.print_housing_outline(ol, inp['housing_outline'])
     if any(float(v) != 0.0 for v in g.aperture_inset_mm):
@@ -204,7 +217,7 @@ def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
     V.print_dummies(dummy)
     return {'sections': s, 'inputs': inp, 'dees': dees, 'geom': geom, 'result': result, 'trajectory': trj,
             'si_rotation_deg': float(si_rot), 'outline': ol, 'sim': sim, 'exit_half_height_mm': exit_half,
-            'bounds': bounds, 'foot': foot, 'dummy': dummy, 'orbit': orbit}
+            'bounds': bounds, 'foot': foot, 'dummy': dummy, 'orbit': orbit, 'gap_lines': lines}
 
 
 def bounds(cfg) -> dict:
@@ -269,9 +282,14 @@ def build(cfg) -> dict:
     print(f"\n[build] wrote " + ", ".join(Path(v).name for v in written.values()) + f" in {out['model3d'].parent} "
           f"({time.time() - t0:.0f} s)")
     if abs(si_rot - float(inf.rotation_deg)) > SI_ROTATION_TOL_DEG:
-        print(f"[build] WARNING: the electrodes were built around the inflector turned by {si_rot:+.12g} deg "
-              f"(si_rotation = {g.si_rotation!r}) but inflector.rotation_deg = {inf.rotation_deg:+.12g}: the tracker "
-              f"refuses this model until the run sets inflector.rotation_deg = {si_rot!r}")
+        if g.si_rotation == 'corner':
+            print(f"[build] the electrodes were built around the inflector turned by {si_rot:+.12g} deg (si_rotation "
+                  f"= 'corner'; inflector.rotation_deg = {inf.rotation_deg:+.12g} is not used): the tracker turns it "
+                  f"by the model's angle too")
+        else:
+            print(f"[build] WARNING: the electrodes were built around the inflector turned by {si_rot:+.12g} deg "
+                  f"(si_rotation = {g.si_rotation!r}) but inflector.rotation_deg = {inf.rotation_deg:+.12g}: the "
+                  f"tracker refuses this model until the run sets inflector.rotation_deg = {si_rot!r}")
     return written
 
 
@@ -281,6 +299,12 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
     g, inf = s['geometry'], s['inflector']
     lay = layout(cfg, verbose=True, inp=inp, dees_png=part['dees_png'] if g.plot_dees else None)
     dees, ol, si_rot = lay['dees'], lay['outline'], lay['si_rotation_deg']
+    hole = None
+    if g.gap0_hole_r_mm > 0.0:                                # placed for this build's edges and inflector turn
+        V._banner("GAP-0 HOLE BY RULE (geometry.gap0_hole_r_mm): where the hand-off bunch meets dee0's gap-0 edge")
+        hole = gap0_hole(cfg, r_mm=g.gap0_hole_r_mm, rim_mm=g.gap0_hole_rim_mm, dr_mm=g.gap0_hole_dr_mm,
+                         lay=lay)['hole']
+        B.OPT = dataclasses.replace(B.OPT, holes=tuple(B.OPT.holes) + (hole,), gap0_hole_r_mm=0.0)
     plane = B.rotate_plane(B.emitting_plane(inp['emitting_plane']), si_rot)
     brick = B.beam_channel(ol['aperture'], plane)
     print(f"\n[channel] emitting plane from {inp['emitting_plane']} ({inp['emitting_plane_from']}): "
@@ -320,11 +344,24 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
               'si_rotation': g.si_rotation, 'si_rotation_deg': si_rot, 'inflector_rotation_deg': inf.rotation_deg,
               'dee_potential_v': float(B.dee_potential(dees)), 'exit_half_height_mm': lay['exit_half_height_mm'],
               'bounds': lay['bounds'], 'hardware': [q['name'] for q in posts],
+              'gap0_hole': dataclasses.asdict(hole) if hole else None,
+              'gap_lines': _lines_record(lay['gap_lines']),
               'mesh': {'nodes': int(len(model.vertices)), 'triangles': int(len(model.triangles)), 'solids': solids},
               'gmsh': getattr(gmsh, '__version__', ''),
               'geometry': C.to_dict(g), 'machine': C.to_dict(s['machine']), 'inflector': C.to_dict(inf)}
     part['build_json'].write_text(json.dumps(record, indent=1, default=C.json_default))
     return si_rot
+
+
+def _lines_record(lines) -> list:
+    """The connected gap lines as built, for <prefix>_build.json (None for the seed's lines): per gap its ray, P0, P1,
+    P2 in the gap's own frame [mm], P0's and P1's azimuths off the ray and the bends [deg]."""
+    if lines is None:
+        return None
+    keep = ('gap', 'ray_deg', 'P0', 'P1', 'P2', 'd0_deg', 'd1_deg', 'bends_deg', 'y1_max', 'y0_range',
+            'corner_bend_deg')
+    return [{k: (list(map(float, ln[k])) if isinstance(ln[k], tuple) else ln[k]) for k in keep if k in ln}
+            for ln in lines]
 
 
 # ---------------------------------------------------------------------------------------------------------------------

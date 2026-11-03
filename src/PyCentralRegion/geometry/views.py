@@ -326,8 +326,9 @@ def plot_dee_boundaries(foot, ol: dict, out=None, orbit=None) -> None:
                 label='inner closure' if i == 0 else None)
     for i, d in enumerate(foot):
         for j, closed in zip(d['junction'], d['closed']):
-            if closed:
-                ax.plot(*j['meet'], 'o', mfc='none', mec='k', ms=9, mew=1.4, zorder=6,
+            if closed:                     # a connected line ends its chain on the ray (meet None when collinear)
+                ax.plot(*(j['meet'] if j['meet'] is not None else j['fix_start']), 'o', mfc='none', mec='k', ms=9,
+                        mew=1.4, zorder=6,
                         label='junction closed' if i == 0 and j is d['junction'][0] else None)
             else:
                 ax.plot([j['var_end'][0], j['fix_start'][0]], [j['var_end'][1], j['fix_start'][1]], '-', color='k',

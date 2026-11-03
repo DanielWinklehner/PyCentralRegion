@@ -126,6 +126,25 @@ def value(scores, path):
         return math.nan
 
 
+FULL_CORNERS_MAX = 12        # a section box of up to this many variables is checked at every corner
+RANDOM_CORNERS = 64          # ... a larger one per table, plus this many random corners of the whole box
+
+
+def _box_corners(box):
+    """The corners ``check_overrides`` tries for one section's variables: [(variables, unit corner), ...]. Every
+    corner of a box of up to FULL_CORNERS_MAX variables; beyond (2^n would never end: a campaign over every gap line
+    has 35 [geometry] variables) every corner of each table's own variables (the target less its last key: the
+    channel's keys, one gap line's), whose checks relate them, and RANDOM_CORNERS corners of the whole box, seeded."""
+    if len(box) <= FULL_CORNERS_MAX:
+        return [(box, c) for c in itertools.product((0.0, 1.0), repeat=len(box))]
+    tables = {}
+    for v in box:
+        tables.setdefault(v.target.rpartition('.')[0], []).append(v)
+    out = [(part, c) for part in tables.values() for c in itertools.product((0.0, 1.0), repeat=len(part))]
+    rng = np.random.default_rng(0)
+    return out + [(box, tuple(float(u) for u in rng.integers(0, 2, len(box)))) for _ in range(RANDOM_CORNERS)]
+
+
 def runs_pcr_evaluate(evaluator):
     """Whether the evaluator is `pcr evaluate`: its run config is read through the [section]s of config.SECTIONS."""
     return evaluator.split()[:1] == ['PyCentralRegion.cli']
@@ -273,8 +292,9 @@ class Campaign:
         names = sorted(roots & set(config.SECTIONS))
         boxes = {name: [v for v in cfg.variables if v.target.split('.')[0] == name] for name in names}
         cases = [(fidelity, [], names) for fidelity in cfg.fidelities]
-        cases += [(cfg.search_fidelity, [v.override(v.physical(u)) for v, u in zip(box, corner)], [name])
-                  for name, box in boxes.items() if box for corner in itertools.product((0.0, 1.0), repeat=len(box))]
+        for name, box in boxes.items():
+            cases += [(cfg.search_fidelity, [v.override(v.physical(u)) for v, u in zip(part, corner)], [name])
+                      for part, corner in _box_corners(box)]
         for fidelity, sets, check in cases:
             base = self.base(fidelity)
             run = copy.deepcopy({name: base.get(name, {}) for name in check})     # a section reads only its table

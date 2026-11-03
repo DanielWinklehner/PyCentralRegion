@@ -110,12 +110,13 @@ def _half_width_mm(cav, pts_mm, side: float):
     return side * 0.5 * np.asarray(cav.gap_width_at(np.hypot(pts[:, 0], pts[:, 1]) / MM), dtype=float) * MM
 
 
-def load_gap_lines(pkl_path):
+def load_gap_lines(pkl_path, note_opening: bool = True):
     """The RF gap centre lines of the seed optimization's geometry: (DeeSystem, geometry dict, result).
 
     Each gap is an RFCavity whose ``segments`` are the straight pieces of its centre line ('p1' / 'p2' in metres).
     The gap-width LAW is [machine]'s: results carry no record of the law they were optimized under, and a geometry
-    optimized under another one rebuilds with different boundaries."""
+    optimized under another one rebuilds with different boundaries. ``note_opening``: note when the seed's opening
+    replaces [machine]'s (the connected layout uses [machine]'s and only the seed's orbit: it passes False)."""
     import pickle
     with open(pkl_path, 'rb') as fh:
         result = pickle.load(fh)
@@ -134,7 +135,7 @@ def load_gap_lines(pkl_path):
                              segment_angles=list(geom['segment_angles_per_gap'][0]),
                              segment_radii=list(geom['segment_radii_per_gap'][0]))
     op = geom.get('opening_angle_deg')
-    if op is not None and abs(float(op) - m.dee_opening_deg) > 1e-9:
+    if note_opening and op is not None and abs(float(op) - m.dee_opening_deg) > 1e-9:
         print(f"  NOTE: the seed's dee opening {float(op):.6f} deg is used, not [machine] dee_opening_deg "
               f"{m.dee_opening_deg:.6f}")
     apply_seed_geometry(dees, geom)
@@ -473,10 +474,13 @@ def gap_centre_line(cav, junction_tol: float = None, r_max: float = None):
     """
     junction_tol = OPT.junction_tol_deg if junction_tol is None else junction_tol
     j = junction(cav)
+    if getattr(cav, 'vertices', None) is not None:     # a connected line (set_vertices): no junction to close
+        chain = _dedupe(np.vstack([np.asarray(cav.vertices, dtype=float) * MM, j['fix_end']]))
+        return (_clip_outer(chain, r_max) if r_max else chain), j, True
     var = [s for s in cav.segments if s['type'] == 'variable']
     pts = [np.asarray(var[0]['p1'][:2], dtype=float) * MM]
-    for s in var[:-1]:
-        pts += [np.asarray(s['p2'][:2], dtype=float) * MM, np.asarray(s['p1'][:2], dtype=float) * MM]
+    for s, nxt in zip(var[:-1], var[1:]):            # each joint: this segment's end, then the next one's start
+        pts += [np.asarray(s['p2'][:2], dtype=float) * MM, np.asarray(nxt['p1'][:2], dtype=float) * MM]
     pts.append(np.asarray(var[-1]['p1'][:2], dtype=float) * MM)
     close = abs(j['step_deg']) <= junction_tol and j['meet'] is not None and np.isfinite(j['r_meet'])
     chain = np.array(pts + ([j['meet'], j['fix_end']] if close else [j['var_end'], j['fix_start'], j['fix_end']]))
@@ -560,8 +564,9 @@ def si_rotation_deg(dees: DeeSystem) -> float:
     campaign that varies the rotation uses this mode). 'corner': gap 0's base angle minus the exit spec's gap azimuth.
     The export placed the inflector for its own dee opening by a rule (the exit plate's outer corner a fixed distance
     off gap 0's ray); another opening moves gap 0's ray, and turning the whole inflector by this angle keeps the rule
-    exactly, since it is rotation-equivariant. Either way the model records the angle (params['si_rotation_deg']) and
-    the tracker refuses an inflector.rotation_deg that differs from it.
+    exactly, since it is rotation-equivariant. Either way the model records the angle (params['si_rotation_deg']);
+    with 'fixed' the tracker refuses an inflector.rotation_deg that differs from it, with 'corner' it follows it
+    (simulate3d.follow_model_si_rotation), so a campaign may vary the dee opening alone.
     """
     if OPT.si_rotation == 'corner':
         return float(dees.gaps[0].base_angle) - float(exit_spec()['gap_azimuth_deg'])
@@ -669,6 +674,166 @@ def refit_gap0_on_plate(dees: DeeSystem, verbose: bool = True) -> dict:
               f"{fit['inner_r_mm']:.1f} .. {fit['outer_r_mm']:.1f} mm, off the line "
               f"{fit['max_offset_from_line_mm']:.1e} mm, jog to the radial part {fit['jog_to_fixed_segment_mm']:.2f} mm")
     return fit
+
+
+# =====================================================================================================================
+# 5b. connected gap lines (geometry.gap_lines = 'connected')
+# =====================================================================================================================
+def _bend_deg(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    """The bend at b of the polyline a -> b -> c [deg, unsigned]."""
+    u, v = np.asarray(b, dtype=float) - a, np.asarray(c, dtype=float) - b
+    return float(np.degrees(abs(np.arctan2(u[0] * v[1] - u[1] * v[0], u @ v))))
+
+
+def _to_machine(theta_deg: float, xy) -> np.ndarray:
+    """A point of a gap's own frame (x along its ray at theta_deg, y across it, + counterclockwise) in the machine's."""
+    t = np.radians(float(theta_deg))
+    return float(xy[0]) * np.array([np.cos(t), np.sin(t)]) + float(xy[1]) * np.array([-np.sin(t), np.cos(t)])
+
+
+def connected_line(r1: float, f1: float, r2: float, f0: float = 0.0, x0: float = None, r0: float = None,
+                   d_max_deg: float = None, bend_max_deg: float = None) -> dict:
+    """One connected gap line in its gap's own frame [mm] (x along the ray, y across it, + counterclockwise): P0, P1
+    and P2 = (r2, 0), from the fractions of an options.GapLine item.
+
+    P0 is (r0, y0) with y0 from f0 (r0: geometry.gap_line_r0_mm); with ``x0`` (gap 0) it is the fixed point (x0, 0)
+    where the exit-plate line meets the ray, the bend there free and f0 unused. y1 = f1 x the largest |y1| with
+    |y1| <= r1 tan(d_max), the bend at P2 <= bend_max and some P0 within the limits (with x0: the bend at P1
+    <= bend_max); y0 = f0 mapped linearly from [-1, 1] onto the y0 with |y0| <= r0 tan(d_max) and the bend at P1
+    <= bend_max. Returns {'P0', 'P1', 'P2' ((x, y) mm), 'bends_deg' (at P1, at P2), 'd0_deg', 'd1_deg' (P0's and P1's
+    azimuths off the ray), 'y1_max', 'y0_range'}."""
+    d_max = np.radians(OPT.gap_line_d_max_deg if d_max_deg is None else d_max_deg)
+    lim = float(OPT.bend_max_deg if bend_max_deg is None else bend_max_deg)
+    fixed0 = x0 is not None
+    x0 = float(x0) if fixed0 else float(OPT.gap_line_r0_mm if r0 is None else r0)
+    r1, r2 = float(r1), float(r2)
+    if not x0 < r1 < r2:
+        raise ConfigError(f"a connected gap line needs P0 < r1 < r2 along its ray, got {x0:.3f} / {r1:.3f} / "
+                          f"{r2:.3f} mm")
+
+    def bends(y0, y1):
+        p0, p1, p2 = np.array([x0, y0]), np.array([r1, y1]), np.array([r2, 0.0])
+        return _bend_deg(p0, p1, p2), _bend_deg(p1, p2, p2 + np.array([1.0, 0.0]))
+
+    def p0_range(y1):                  # the y0 whose direction P0 -> P1 is within bend_max of P1 -> P2's
+        a_b, run, cap = np.arctan2(-y1, r2 - r1), r1 - x0, np.radians(89.0)
+        return (max(y1 - run * np.tan(min(a_b + np.radians(lim), cap)), -x0 * np.tan(d_max)),
+                min(y1 - run * np.tan(max(a_b - np.radians(lim), -cap)), x0 * np.tan(d_max)))
+
+    def within(y):                     # each limit, once broken, stays broken as |y1| grows; all are even in y1
+        b1, b2 = bends(0.0, y)
+        if b2 > lim:
+            return False
+        if fixed0:
+            return b1 <= lim
+        lo0, hi0 = p0_range(y)
+        return lo0 <= hi0
+
+    lo, hi = 0.0, r1 * np.tan(d_max)
+    if within(hi):
+        lo = hi
+    else:
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if within(mid) else (lo, mid)
+    y1_max = lo
+    y1 = float(f1) * y1_max
+    if fixed0:
+        y0, y0_range = 0.0, (0.0, 0.0)
+    else:
+        lo, hi = p0_range(y1)
+        if lo > hi:
+            raise ConfigError(f"a connected gap line: no P0 within {np.degrees(d_max):g} deg of the ray bends by at "
+                              f"most {lim:g} deg at P1 = ({r1:.2f}, {y1:+.3f}) mm")
+        y0_range = (float(lo), float(hi))
+        y0 = float(lo + 0.5 * (float(f0) + 1.0) * (hi - lo))
+    b1, b2 = bends(y0, y1)
+    return {'P0': (x0, y0), 'P1': (r1, y1), 'P2': (r2, 0.0), 'bends_deg': (b1, b2),
+            'd0_deg': float(np.degrees(np.arctan2(y0, x0))), 'd1_deg': float(np.degrees(np.arctan2(y1, r1))),
+            'y1_max': float(y1_max), 'y0_range': y0_range}
+
+
+def plate_ray_point(dees: DeeSystem) -> dict:
+    """Where gap 0's exit-plate line (the plate face shifted by half the local gap, turned with the inflector) meets
+    gap 0's ray [mm]: {'point', 'r' (its radius), 'direction' (the plate line's, outward), 'corner' (the plate's outer
+    corner, turned), 'corner_off_ray_mm'}."""
+    sp = exit_spec()
+    cav = dees.gaps[0]
+    R = rotation_z(si_rotation_deg(dees), 2)
+    point, d, _ = plate_line(sp, half_gap_m=0.5 * float(cav.gap_width_at(float(sp['baseline']['r_mm']) * 1e-3)))
+    p, d = R @ point * MM, R @ d
+    b = np.radians(float(cav.base_angle))
+    e = np.array([np.cos(b), np.sin(b)])
+    det = d[0] * (-e[1]) - d[1] * (-e[0])
+    if abs(det) < 1e-9:
+        raise ConfigError("gap 0: the exit-plate line runs parallel to the gap's ray and never meets it")
+    s = (-p[0] * (-e[1]) + p[1] * (-e[0])) / det         # p + s d = t e
+    x = p + s * d
+    t = float(x @ e)
+    if t <= 0.0:
+        raise ConfigError(f"gap 0: the exit-plate line meets the gap's ray behind the machine axis (t = {t:.2f} mm)")
+    corner = R @ np.asarray(sp['corner']['rotated_mm'][:2], dtype=float)
+    return {'point': x, 'r': t, 'direction': d, 'corner': corner,
+            'corner_off_ray_mm': float(e[0] * corner[1] - e[1] * corner[0])}
+
+
+def connected_dee_system() -> DeeSystem:
+    """The dee system of [machine] for connected gap lines: its own dee_opening_deg places the gaps' rays (the seed's
+    opening is not read); ``lay_connected_gap_lines`` lays the lines."""
+    m = MACHINE
+    return create_dee_system(m.r_min_m, m.r_max_cavity_m, list(m.dee_center_angles_deg), m.dee_opening_deg,
+                             voltage=m.dee_voltage_kv * 1e3, harmonic=m.harmonic, gap_width=m.gap_width_m,
+                             gap_angle_deg=m.gap_angle_deg, gap_width_min=m.gap_width_min_m)
+
+
+def lay_connected_gap_lines(dees: DeeSystem, verbose: bool = True) -> list:
+    """Every gap's centre line from its geometry.gap_line item (``connected_line``), in place (RFCavity.set_vertices).
+
+    Gaps 1 .. n: P0 -> P1 -> P2, run on straight inward from P0 to [machine] r_min (or to its closest approach to the
+    axis), so P0 is no bend. Gap 0: the exit-plate line from as far inside as the point it meets the ray lies outside,
+    up to that point (the plate corner, its bend free), then P1 and P2. Each gap then runs radially out from P2.
+    Returns one report per gap."""
+    if len(OPT.gap_line) != len(dees.gaps):
+        raise ConfigError(f"geometry.gap_line has {len(OPT.gap_line)} items, the machine {len(dees.gaps)} gaps")
+    r_min = float(MACHINE.r_min_m) * MM
+    out = []
+    for g, (cav, item) in enumerate(zip(dees.gaps, OPT.gap_line)):
+        th = float(cav.base_angle)
+        if g == 0:
+            pl = plate_ray_point(dees)
+            ln = connected_line(item.r1_mm, item.f1, item.r2_mm, x0=pl['r'])
+            P1, P2 = _to_machine(th, ln['P1']), _to_machine(th, ln['P2'])
+            pts = [pl['point'] - pl['r'] * pl['direction'], pl['point'], P1, P2]
+            ln.update(plate=pl, corner_bend_deg=_bend_deg(pts[0], pts[1], P1))
+        else:
+            ln = connected_line(item.r1_mm, item.f1, item.r2_mm, f0=item.f0)
+            P0, P1, P2 = (_to_machine(th, ln[k]) for k in ('P0', 'P1', 'P2'))
+            u = (P0 - P1) / np.linalg.norm(P0 - P1)
+            pu = float(P0 @ u)
+            disc = pu * pu - float(P0 @ P0) + r_min * r_min
+            t = -pu - np.sqrt(disc) if disc >= 0.0 else -pu
+            pts = [P0 + t * u, P1, P2] if t > 0.0 else [P0, P1, P2]
+        cav.set_vertices(np.array(pts) / MM)
+        ln.update(gap=g, ray_deg=th)
+        out.append(ln)
+    if verbose:
+        print(f"  bends at P1 and P2 <= {OPT.bend_max_deg:g} deg, P0 and P1 within {OPT.gap_line_d_max_deg:g} deg of the "
+              f"ray; P0 of gaps 1 .. {len(dees.gaps) - 1} at {OPT.gap_line_r0_mm:g} mm along it")
+        pl = out[0]['plate']
+        print(f"  gap 0 leaves the exit plate where its line meets the ray, r = {pl['r']:.3f} mm (the plate corner "
+              f"{pl['corner_off_ray_mm']:+.3f} mm off the ray), with a free bend of {out[0]['corner_bend_deg']:.2f} deg")
+        print()
+        print(f"  {'gap':>4} {'ray':>8} {'f0':>6} {'P0 r':>7} {'d0':>7} {'f1':>6} {'P1 r':>7} {'d1':>7} {'P2 r':>7} "
+              f"{'bend P1':>8} {'bend P2':>8} {'|y1| max':>9}")
+        print(f"  {'':>4} {'[deg]':>8} {'':>6} {'[mm]':>7} {'[deg]':>7} {'':>6} {'[mm]':>7} {'[deg]':>7} {'[mm]':>7} "
+              f"{'[deg]':>8} {'[deg]':>8} {'[mm]':>9}")
+        print("  " + "-" * 92)
+        for ln, item in zip(out, OPT.gap_line):
+            f0 = '     -' if ln['gap'] == 0 else f"{item.f0:+6.3f}"
+            print(f"  {ln['gap']:>4} {ln['ray_deg']:8.3f} {f0} {ln['P0'][0]:7.2f} {ln['d0_deg']:+7.3f} {item.f1:+6.3f} "
+                  f"{ln['P1'][0]:7.2f} {ln['d1_deg']:+7.3f} {ln['P2'][0]:7.2f} {ln['bends_deg'][0]:8.2f} "
+                  f"{ln['bends_deg'][1]:8.2f} {ln['y1_max']:9.3f}")
+    return out
 
 
 # =====================================================================================================================

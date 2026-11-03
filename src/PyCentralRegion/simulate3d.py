@@ -251,6 +251,21 @@ def check_si_rotation(model3d, rotation_deg, where=''):
                           f"the inflector turned by {float(built):g} deg: track with that value or rebuild")
 
 
+def follow_model_si_rotation(cfg, model3d):
+    """With geometry.si_rotation = 'corner' the electrode build turns the inflector with gap 0's ray, so with the dee
+    opening; the run then turns it by the angle its model was built around (params['si_rotation_deg']), whatever
+    inflector.rotation_deg says: that key is set in cfg (in place: the inflector, the reference particle, the bunch and
+    the resolved configuration all read it). Other modes and models without the record leave cfg as it is."""
+    built = model3d.params.get('si_rotation_deg')
+    if section(cfg, 'geometry').si_rotation != 'corner' or built is None:
+        return
+    rot = float(section(cfg, 'inflector').rotation_deg)
+    if abs(float(built) - rot) > 1e-12:
+        say(f"[track] geometry.si_rotation = 'corner': the inflector turned {float(built):+.6f} deg as its electrode "
+            f"model was built (inflector.rotation_deg = {rot:+.6f} is not used)")
+    cfg.setdefault('inflector', {})['rotation_deg'] = float(built)
+
+
 def install(finder, fields, cav0, volt_scale):
     """Put the BEM field (x volt_scale, idempotent: always from the cached value) and the metal test on the finder."""
     from PyPATools.field import TimedField
@@ -316,8 +331,10 @@ class BunchTracker:
         self.phase0, self.f_mhz = float(self.seed.bunch_phase_deg), float(self.seed.rf_frequency_mhz)
         self.bfield, bcheck = magnet_field_3d(cfg, verbose=verbose)
         self.design, _ = make_design(cfg, self.seed, bfield=self.bfield)
-        self.inflector = make_inflector(cfg, verbose=verbose)
         tc, mc = self.tc, self.mc
+        self.fields = load_fields(self.pc.fields, tc, section(cfg, 'fields'))
+        follow_model_si_rotation(cfg, self.fields['model3d'])
+        self.inflector = make_inflector(cfg, verbose=verbose)
         # a run (the reference's and the bunch's, which ends with its virtual reference) stops at the turn the
         # reference reaches the target energy, or after tc.turns; without that stop every run tracks tc.turns
         stop_mev = mc.target_energy_mev if tc.stop_at_target_energy else math.inf
@@ -331,7 +348,6 @@ class BunchTracker:
         self.mass_mev = float(self.design.species.mass_mev)
         rot = section(cfg, 'inflector').rotation_deg
         self.ref_beam, self.handoff_meta = reference_beam(self.design.species, self.pc.handoff, rot)
-        self.fields = load_fields(self.pc.fields, tc, section(cfg, 'fields'))
         check_si_rotation(self.fields['model3d'], rot, self.pc.fields)
         self.slit = section(cfg, 'slit')
         sl = self.slit
@@ -578,6 +594,7 @@ def track_stage(cfg, verbose=True):
     save_resolved(cfg, out_dir / 'config.json')
     t0 = time.time()
     bt = BunchTracker(cfg, verbose=verbose)
+    save_resolved(cfg, out_dir / 'config.json')      # again: the tracker may follow the model's inflector turn
     phases = bt.phases()
     say(f"[track] {rc.name}: pusher {tc.pusher}, {tc.steps_per_turn} steps per turn, {tc.turns} turns"
         f"{'' if tc.stop_at_target_energy else ' (no stop at the target energy)'}; seed "

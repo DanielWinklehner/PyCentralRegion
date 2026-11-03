@@ -1,0 +1,81 @@
+# The cold start of the connected gap lines (2026-11-03): design wnop3_rotn3_g0ap's electrodes, but every gap line laid
+# from its [[geometry.gap_line]] item instead of the seed's segments - P0 -> P1 -> P2 -> the gap's radial ray, joined
+# without steps (RF engineering cannot build the seed's jogs), every fraction 0 so P0, P1 and P2 all sit on the ray:
+# radial gap lines, gap 0 along the exit plate up to where its line meets the ray. P1 lies midway between the seed
+# orbit's turn-1 and turn-2 crossings of that gap, P2 midway between turns 2 and 3 (inert at the cold start; they are
+# where an optimizer bends the line). The dee opening is [machine] dee_opening_deg (the seed's 32.548 deg here) and
+# the spiral inflector turns with gap 0's ray (si_rotation = "corner": 4.726 deg at this opening; the tracker follows
+# the model). Gap 0's R 10 mm hole is placed at every build where the hand-off bunch meets dee0's gap-0 edge, 2 mm
+# inward in radius (the base design's rule, which put it at s 46.12 mm); the base's moved junctions do not apply.
+# The dees run at 65 kV (track.volt_scale = 1: the RF group's limit for this machine).
+#   pcr build  configs/examples/hchc1p5/design_connected_cold.toml
+#   pcr fields configs/examples/hchc1p5/design_connected_cold.toml
+#   pcr track  configs/examples/hchc1p5/design_connected_cold.toml
+
+include = ["design_wnop3_rotn3_g0ap.toml"]
+
+[run]
+name = "connected_cold"
+out_dir = "F:/HCHC1.5/Results/CR/pcr/connected_cold"
+
+[paths]
+model3d = "F:/HCHC1.5/Results/CR/cr_model_connected_cold_model3d.pkl"
+fields = "F:/HCHC1.5/Results/CR/bunch_fields3d_connected_cold.pkl"
+
+[track]
+volt_scale = 1.0
+
+[geometry]
+gap_lines = "connected"
+snap_nodes = false
+junctions = []
+holes = []
+gap0_hole_r_mm = 10.0
+gap0_hole_rim_mm = 8.0
+gap0_hole_dr_mm = -2.0
+gap_line_r0_mm = 50.0                  # P0 of gaps 1 .. 7, inside every first crossing (84 .. 131 mm)
+gap_line_d_max_deg = 8.0               # P0 and P1 at most 8 deg off the ray
+bend_max_deg = 35.0                    # bends at P1 and P2 (the plate corner's is free)
+
+# r1 / r2: midway between the seed orbit's crossings of the gap in turns 1 and 2 / 2 and 3 [mm]
+# (gap 0: 73, 136, 183; 1: 84, 133, 179; 2: 90, 131, 176; 3: 90, 134, 178; 4: 95, 146, 190; 5: 103, 158, 201;
+#  6: 121, 176, 216; 7: 131, 183, 221)
+[[geometry.gap_line]]
+gap = 0
+r1_mm = 104.5
+r2_mm = 159.5
+
+[[geometry.gap_line]]
+gap = 1
+r1_mm = 108.5
+r2_mm = 156.0
+
+[[geometry.gap_line]]
+gap = 2
+r1_mm = 110.5
+r2_mm = 153.5
+
+[[geometry.gap_line]]
+gap = 3
+r1_mm = 112.0
+r2_mm = 156.0
+
+[[geometry.gap_line]]
+gap = 4
+r1_mm = 120.5
+r2_mm = 168.0
+
+[[geometry.gap_line]]
+gap = 5
+r1_mm = 130.5
+r2_mm = 179.5
+
+[[geometry.gap_line]]
+gap = 6
+r1_mm = 148.5
+r2_mm = 196.0
+
+[[geometry.gap_line]]
+gap = 7
+r1_mm = 157.0
+r2_mm = 202.0

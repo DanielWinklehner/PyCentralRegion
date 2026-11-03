@@ -1,0 +1,341 @@
+# The MOBO campaign of the connected gap lines (2026-11-03): the dee opening, every gap line's shape and the beam
+# channel (geometry: a new value needs a build and its 3D BEM, about 4-5 min) with the RF phase (cheap: a re-track
+# on that geometry's fields, about 1.6-1.9 min), 37 variables.
+#
+# The gap lines (geometry.gap_lines = "connected", design_connected_cold.toml): each gap runs P0 -> P1 -> P2 -> its
+# radial ray without steps (RF engineering cannot build the seed's jogs). Every gap has 4 variables: P1's and P2's
+# places along the ray (r1 between the seed orbit's turn-1 and turn-2 crossings of that gap, r2 between turns 2 and 3,
+# 15 % of each band kept clear of the crossings) and P0's and P1's offsets across it (f0, f1) as fractions in [-1, 1]
+# of what the limits allow - P0 and P1 at most 8 deg off the ray, bends at P1 and P2 at most 35 deg - so every point of
+# the box is a buildable line and the cold start (every fraction 0) puts the gap on its ray. Gap 0 runs along the exit
+# plate up to where that line meets its ray (r 98.2 mm), its bend there free, so it has no f0: 3 variables.
+#
+# The dee opening is a variable and the spiral inflector turns with it (si_rotation = "corner": gap 0's ray - 24.0 deg,
+# so 21 - opening / 2 = +7.0 .. +2.0 deg over 28 .. 38 deg; the tracker follows the model), and the gap-0 hole is
+# placed at every build where the hand-off bunch meets dee0's gap-0 edge. The dees run at 65 kV (the RF group's limit:
+# track.volt_scale = 1, no voltage variable). No magnetic trim: the design has no trim coils.
+#
+# The warm starts are the cold start (radial gap lines) at the seed's opening 32.548 deg and at 28 and 38 deg, each
+# with 3 cheap followers (other phases): the first preliminary results. Then random designs until n_startup, then the
+# GP. Every evaluation uses the GPU: run the campaign when nothing else does.
+#   pcr optimize        configs/examples/hchc1p5/mobo_connected.toml --dry-run
+#   pcr optimize        configs/examples/hchc1p5/mobo_connected.toml --max-hours 12
+#   pcr optimize-status configs/examples/hchc1p5/mobo_connected.toml
+#
+# What this loop does not see: the RF cavity frequency (the gap lines and the channel change the dee capacitance; the
+# BEM fields are electrostatic at [machine]'s harmonic and frequency) - check a chosen design with the RF model.
+
+[mobo]
+campaign_dir = "F:/HCHC1.5/Results/CR/mobo/campaign_connected"
+base_config_file = "design_connected_cold.toml"
+physics_python = "C:/Users/Daniel/anaconda3/envs/accel-dev-env/python.exe"
+sampler = "gp"                 # constrained 3-objective GP (logCEHVI) over 37 coordinates
+seed = 0
+n_startup = 79                 # 2 x (37 + 2) + 1: the 3 warm starts and random designs (20 geometries with their
+                               # cheap followers) before the GP takes over
+max_evals = 400                # about 100 geometries x (1 + cheap_per_geometry); a night is about 300
+cheap_per_geometry = 3
+failed_as_infeasible = false   # a failed build, BEM or tracking blocks only its own design
+fixed = [
+    "track.volt_scale=1.0",                                   # 65 kV
+    "track.turns=7", "track.stop_at_target_energy=false",    # every design scored at its 7th turn
+]
+warm_start = [{}, { phi = 28.0 }, { phi = 38.0 }]
+
+# --- geometry: the dee opening (the spiral inflector turns with it) -------------------------------------------------
+[[mobo.variables]]
+name = "phi"
+target = "machine.dee_opening_deg"
+low = 28.0
+high = 38.0
+kind = "geometry"
+
+# --- geometry: the beam channel (as in mobo_campaign.toml; its header has the bounds) ------------------------------
+[[mobo.variables]]
+name = "ap_inner"
+target = "geometry.aperture_inner_mm"    # inside the taper [mm]
+low = 22.0
+high = 40.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "ap_outer"
+target = "geometry.aperture_outer_mm"    # beyond it [mm]
+low = 26.0
+high = 40.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "ap_center"
+target = "geometry.aperture_taper_center_mm"   # [mm]
+low = 90.0
+high = 220.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "ap_length"
+target = "geometry.aperture_taper_length_mm"   # [mm]
+low = 10.0
+high = 160.0
+kind = "geometry"
+
+# --- geometry: the gap lines (r [mm] along the ray; f fractions across it) ------------------------------------------
+# gap 0: leaves the exit plate at r 98.2 mm (its bend there free), so no f0
+[[mobo.variables]]
+name = "g0_r1"
+target = "geometry.gap_line.0.r1_mm"   # P1 along the ray, between turns 1 and 2
+low = 103.0
+high = 126.5
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g0_f1"
+target = "geometry.gap_line.0.f1"   # P1 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g0_r2"
+target = "geometry.gap_line.0.r2_mm"   # P2 on the ray, between turns 2 and 3
+low = 143.0
+high = 176.0
+kind = "geometry"
+
+# gap 1
+[[mobo.variables]]
+name = "g1_f0"
+target = "geometry.gap_line.1.f0"   # P0 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g1_r1"
+target = "geometry.gap_line.1.r1_mm"   # P1 along the ray, between turns 1 and 2
+low = 91.5
+high = 125.5
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g1_f1"
+target = "geometry.gap_line.1.f1"   # P1 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g1_r2"
+target = "geometry.gap_line.1.r2_mm"   # P2 on the ray, between turns 2 and 3
+low = 140.0
+high = 172.0
+kind = "geometry"
+
+# gap 2
+[[mobo.variables]]
+name = "g2_f0"
+target = "geometry.gap_line.2.f0"   # P0 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g2_r1"
+target = "geometry.gap_line.2.r1_mm"   # P1 along the ray, between turns 1 and 2
+low = 96.0
+high = 125.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g2_f1"
+target = "geometry.gap_line.2.f1"   # P1 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g2_r2"
+target = "geometry.gap_line.2.r2_mm"   # P2 on the ray, between turns 2 and 3
+low = 137.5
+high = 169.0
+kind = "geometry"
+
+# gap 3
+[[mobo.variables]]
+name = "g3_f0"
+target = "geometry.gap_line.3.f0"   # P0 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g3_r1"
+target = "geometry.gap_line.3.r1_mm"   # P1 along the ray, between turns 1 and 2
+low = 96.5
+high = 127.5
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g3_f1"
+target = "geometry.gap_line.3.f1"   # P1 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g3_r2"
+target = "geometry.gap_line.3.r2_mm"   # P2 on the ray, between turns 2 and 3
+low = 140.5
+high = 171.5
+kind = "geometry"
+
+# gap 4
+[[mobo.variables]]
+name = "g4_f0"
+target = "geometry.gap_line.4.f0"   # P0 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g4_r1"
+target = "geometry.gap_line.4.r1_mm"   # P1 along the ray, between turns 1 and 2
+low = 102.5
+high = 138.5
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g4_f1"
+target = "geometry.gap_line.4.f1"   # P1 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g4_r2"
+target = "geometry.gap_line.4.r2_mm"   # P2 on the ray, between turns 2 and 3
+low = 152.5
+high = 183.5
+kind = "geometry"
+
+# gap 5
+[[mobo.variables]]
+name = "g5_f0"
+target = "geometry.gap_line.5.f0"   # P0 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g5_r1"
+target = "geometry.gap_line.5.r1_mm"   # P1 along the ray, between turns 1 and 2
+low = 111.0
+high = 150.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g5_f1"
+target = "geometry.gap_line.5.f1"   # P1 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g5_r2"
+target = "geometry.gap_line.5.r2_mm"   # P2 on the ray, between turns 2 and 3
+low = 164.5
+high = 194.5
+kind = "geometry"
+
+# gap 6
+[[mobo.variables]]
+name = "g6_f0"
+target = "geometry.gap_line.6.f0"   # P0 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g6_r1"
+target = "geometry.gap_line.6.r1_mm"   # P1 along the ray, between turns 1 and 2
+low = 129.0
+high = 168.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g6_f1"
+target = "geometry.gap_line.6.f1"   # P1 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g6_r2"
+target = "geometry.gap_line.6.r2_mm"   # P2 on the ray, between turns 2 and 3
+low = 182.0
+high = 210.0
+kind = "geometry"
+
+# gap 7
+[[mobo.variables]]
+name = "g7_f0"
+target = "geometry.gap_line.7.f0"   # P0 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g7_r1"
+target = "geometry.gap_line.7.r1_mm"   # P1 along the ray, between turns 1 and 2
+low = 139.0
+high = 175.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g7_f1"
+target = "geometry.gap_line.7.f1"   # P1 across the ray, as a fraction
+low = -1.0
+high = 1.0
+kind = "geometry"
+
+[[mobo.variables]]
+name = "g7_r2"
+target = "geometry.gap_line.7.r2_mm"   # P2 on the ray, between turns 2 and 3
+low = 188.5
+high = 215.5
+kind = "geometry"
+
+# --- cheap: the RF phase ---------------------------------------------------------------------------------------------
+[[mobo.variables]]
+name = "phase"
+target = "track.phases_deg"              # one RF phase per evaluation [deg]
+low = -40.0
+high = 0.0
+as_list = true
+
+# --- objectives and constraints (as in mobo_campaign.toml) -----------------------------------------------------------
+[[mobo.objectives]]
+metric = "I_final"                       # T x injected current [mA]
+direction = "maximize"
+
+[[mobo.objectives]]
+metric = "valley_all"                    # share of probe crossings between the turns, the 8 probes' pooled
+direction = "minimize"
+
+[[mobo.objectives]]
+metric = "ratio"                         # aspect ratio of the bunch core at the last turn
+direction = "minimize"
+
+[[mobo.constraints]]
+metric = "E_med"                         # median final energy [MeV], at the 7th turn
+op = ">="
+value = 2.9
+
+# --- fidelities (as in mobo_campaign.toml) ---------------------------------------------------------------------------
+[mobo.fidelities.search]       # 10k particles (all tracked for the 8 probes' valley share), SC 64^3 every 5 steps
+overrides = ["track.n_final=10000", "track.sc_final_cells=64", "track.sc_final_every=5", "track.n_tracks=10000"]
+timeout_min = 60.0
+
+[mobo.fidelities.verify]       # pcr optimize-verify: every particle, SC 128^3 every step
+overrides = ["track.n_final=0", "track.sc_final_cells=128", "track.sc_final_every=1"]
+timeout_min = 240.0

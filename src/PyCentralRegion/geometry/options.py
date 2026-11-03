@@ -138,6 +138,30 @@ class JunctionMove:
 
 
 @dataclasses.dataclass
+class GapLine:
+    """One gap's centre line for geometry.gap_lines = 'connected': P0 -> P1 -> P2 -> the gap's radial ray, joined
+    without steps. In the gap's own frame (x along its ray from the machine axis, y across it, + counterclockwise)
+    P2 = (r2_mm, 0) lies on the ray, P1 = (r1_mm, y1), P0 = (gap_line_r0_mm, y0); gap 0 starts instead at the point
+    where the exit-plate line meets its ray (the bend there is free), so its f0 is unused. The line runs on straight
+    from P0 inward. The offsets are fractions in [-1, 1] of what the limits allow, so every fraction gives a buildable
+    line: y1 = f1 x the largest |y1| with |y1| <= r1_mm tan(gap_line_d_max_deg) and the bend at P2 (gap 0: and at P1)
+    <= bend_max_deg; y0 = f0 mapped linearly onto the y0 with |y0| <= gap_line_r0_mm tan(gap_line_d_max_deg) and the
+    bend at P1 <= bend_max_deg. All fractions 0 (the cold start) put every point on the ray."""
+    gap: int
+    r1_mm: float
+    r2_mm: float
+    f0: float = 0.0
+    f1: float = 0.0
+
+    def __post_init__(self):
+        if not 0.0 < self.r1_mm < self.r2_mm:
+            raise ConfigError(f"gap line {self.gap}: needs 0 < r1_mm < r2_mm, got {self.r1_mm:g} / {self.r2_mm:g}")
+        for name in ('f0', 'f1'):
+            if not -1.0 <= getattr(self, name) <= 1.0:
+                raise ConfigError(f"gap line {self.gap}: {name} = {getattr(self, name)!r} is outside [-1, 1]")
+
+
+@dataclasses.dataclass
 class DeeRmin:
     """Start dee `dee` (1 .. n-1) at r_mm: both edges cut there and closed by an arc about the machine axis."""
     dee: int
@@ -150,6 +174,12 @@ class GeometryConfig:
     """The [geometry] section: every option of the electrode builder (configs/defaults/geometry.toml documents them
     with their defaults)."""
     # --- gap lines -----------------------------------------------------------------------------------------------
+    gap_lines: str = 'seed'              # 'seed': the seed's gap lines; 'connected': gap_line items, the dee opening
+                                         # [machine] dee_opening_deg (the seed's only gives the reference orbit)
+    gap_line: tuple[GapLine, ...] = ()   # 'connected': one per gap, in gap order
+    gap_line_r0_mm: float = 50.0         # 'connected': P0's place along the ray (gaps 1 .. n)
+    gap_line_d_max_deg: float = 8.0      # 'connected': P0 and P1 at most this far off the ray (as seen from the axis)
+    bend_max_deg: float = 35.0           # 'connected': the largest bend at P1 and P2
     snap_nodes: bool = True              # zero inert variable segments, then put the node radii midway between turns
     junctions: tuple[JunctionMove, ...] = ()   # after the snap: junctions moved to radii between the 3D beam's passes
     junction_tol_deg: float = 1.0        # close a variable -> fixed junction whose net angular step is below this
@@ -199,6 +229,10 @@ class GeometryConfig:
     gap0_posts_mm: tuple = ()            # (s_inner, s_outer): a post pair on dee0's gap-0 edge
     windows: tuple[WindowSpec, ...] = ()
     holes: tuple[HoleSpec, ...] = ()
+    gap0_hole_r_mm: float = 0.0          # > 0: a round hole of this radius on dee0's gap-0 edge, placed at every build
+                                         # where the hand-off bunch meets that edge (build.gap0_hole); 0 = none
+    gap0_hole_rim_mm: float = 8.0        # ... its plate reaching this far beyond it along the edge, each side
+    gap0_hole_dr_mm: float = 0.0         # ... its centre moved by this change in radius along the edge
     boxes: tuple[BoxSpec, ...] = ()
     post_size_mm: float = 10.0           # post width and depth; window / hole plate depth
     post_offset_mm: float = 5.0          # post centre from its edge (half the size: face flush)
@@ -221,7 +255,8 @@ class GeometryConfig:
     plot_dees: bool = True               # write <model>_dees.png (the 2D layout) next to the model
 
     def __post_init__(self):
-        for name, value, allowed in (('si_rotation', self.si_rotation, ('fixed', 'corner')),
+        for name, value, allowed in (('gap_lines', self.gap_lines, ('seed', 'connected')),
+                                     ('si_rotation', self.si_rotation, ('fixed', 'corner')),
                                      ('dee_inner', self.dee_inner, ('arc', 'hug')),
                                      ('ground', self.ground, ('dummies', 'star')),
                                      ('post_shape', self.post_shape, ('square', 'cylinder'))):
@@ -257,6 +292,25 @@ class GeometryConfig:
         if self.dee0_clearance_mm > 0.0 and self.dee0_trim_mm > 0.0:
             raise ConfigError("geometry.dee0_clearance_mm and dee0_trim_mm both cut dee0's tip back: set one of them "
                               "(with both, the clearance rule applies and the trim is unused)")
+        if self.gap_lines == 'connected':
+            if self.junctions or self.snap_nodes or not self.gap0_on_plate:
+                raise ConfigError("geometry.gap_lines = 'connected' lays every gap line from its gap_line item: it "
+                                  "needs snap_nodes = false and no junctions (both move the seed's nodes), and "
+                                  "gap0_on_plate = true (gap 0 starts on the exit plate)")
+            if [item.gap for item in self.gap_line] != list(range(len(self.gap_line))) or not self.gap_line:
+                raise ConfigError(f"geometry.gap_line: one item per gap, in gap order 0, 1, ...; got gaps "
+                                  f"{[item.gap for item in self.gap_line]}")
+            if not (0.0 < self.bend_max_deg < 90.0 and 0.0 < self.gap_line_d_max_deg < 45.0
+                    and self.gap_line_r0_mm > 0.0):
+                raise ConfigError("geometry: 'connected' gap lines need 0 < bend_max_deg < 90, 0 < gap_line_d_max_deg "
+                                  "< 45 and gap_line_r0_mm > 0")
+        elif self.gap_line:
+            raise ConfigError("geometry.gap_line items are read only with gap_lines = 'connected'")
+        if self.gap0_hole_r_mm < 0.0:
+            raise ConfigError(f"geometry.gap0_hole_r_mm must be >= 0, got {self.gap0_hole_r_mm!r}")
+        if self.gap0_hole_r_mm > 0.0 and any(h.gap == 0 and h.side == 'dee' for h in self.holes):
+            raise ConfigError("geometry.gap0_hole_r_mm places dee0's gap-0 hole at every build, and geometry.holes "
+                              "has one there too: keep one of them")
 
     # the channel, as the builder reads it
     def aperture_heights(self) -> tuple:
