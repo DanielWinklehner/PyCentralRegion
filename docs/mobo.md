@@ -80,7 +80,8 @@ Worked examples:
   two components), on the worked example's existing fields, 20 evaluations;
 - `configs/examples/hchc1p5/mobo_campaign.toml`: the full campaign: the beam channel's aperture and the
   spiral-inflector rotation (geometry) with the RF phase, the dee voltage and the trim (cheap); 9 variables, 120
-  evaluations, about 5.5 h. Its header lists what the first pilot changed and what the loop does not see;
+  evaluations, about 4.5-5 h (see Costs). Its header lists what the first pilot changed and what the loop does
+  not see;
 - `configs/examples/hchc1p5/mobo_slit.toml`: a radial slit for the chosen design, a campaign of its own (cheap: the
   slit's opening, azimuth and offset at one fixed pass), 20 evaluations.
 
@@ -219,13 +220,18 @@ turn.
 
 | fidelity | particles | SC | one evaluation on known fields |
 |---|---|---|---|
-| search | 10 000 | 64³ every 5 steps | about 1.6 min (see Costs) |
+| search | 10 000 | 64³ every 5 steps | about 1.6-1.9 min (see Costs) |
 | verify | all (~98 000) | 128³ every step | about 7 min |
 
-On the worked example (-15°) the search fidelity gives T = 50.40 % = 4.049 mA (the pilot's warm start), the verify
-fidelity 50.09 % = 4.024 mA, both with the deck's slice test (`track.obstacles = "raster"`). The default column test
-stops other particles on the channel's faces, but in a 4000-particle check with space charge as many (T 49.43 %
-either way, `docs/pipeline.md`); it has not been run at these two fidelities. Every search evaluation tracks the same
+On the worked example (-15°) the search fidelity gives T = 50.79 % = 4.080 mA (the warm start), the verify fidelity
+50.57 % = 4.063 mA, with the column test, the default. The deck's slice test (`track.obstacles = "raster"`) gave
+50.40 % = 4.049 mA (the first pilot's warm start) and 50.09 % = 4.024 mA: it puts the channel's faces up to half a
+millimetre off (the level ones half a millimetre low), but for slivers of metal or vacuum thinner than a level (146 at
+77 nodes), and so stops, net, 39 and 471 particles more. The deck's slices also lack the ground at z = ±15 mm, which
+puts the ground's faces near those heights off, those on the channel's taper at r = 113-127 mm (|z| = 14-15 mm) at
+±15.5 mm, up to 1.5 mm into the metal, and six at r = 34 and 55 mm; the particles the columns stop on the taper's
+faces (144 and 1511), the slices stop too, a median 19 steps later (`docs/pipeline.md`). Every search evaluation
+tracks the same
 10 000 particles of the hand-off bunch (drawn with `track.seed_final`), so the designs are compared on one sample. A
 sample of 10 000 is worth about ±0.04 mA (±0.5 % in T) by itself, mostly the same for every design.
 
@@ -326,6 +332,15 @@ Measured on the worked example (28 threads, one GPU):
   in the port validation), a verify evaluation on known fields about 7 min in all.
 - **A campaign** of 120 evaluations with `cheap_per_geometry = 3` (30 geometries): 30 × 4 + 90 × 1.6 min, about
   4.5 h.
+- **The column test**, the default since 2026-11-02 (the pilot ran the deck's slices): one search evaluation has been
+  timed with it, the warm start outside a campaign (`pcr_validation\metal_columns_2026-11-02\gpu\warm_search_columns`):
+  114 s, its kernel phase (the compile included) 80 s against the pilot's 66.5-70.6 s (67.4 s for the same warm
+  start). Its verify twin's kernel phase was 12 s longer than the full-chain check's as well (98.5 s against 86.5 s),
+  though the verify runs step about ten times the particles, so the extra is a fixed cost per process, the compile,
+  not the test's stepping. The compile time varies from run to run: the CPU runs of that evening
+  (`metal_columns_2026-11-02\track`) spent 71-96 s in that phase with either test, the code from before the column
+  test 83 s, and repeats differ by up to 9 s. If it stays near 80 s, a cheap evaluation takes about 1.9 min and the
+  campaign about 5 h. Its verify tracking took 396 s, as long as the full-chain check's 397 s.
 
 ## The toy campaign
 

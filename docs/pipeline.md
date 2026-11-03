@@ -106,7 +106,12 @@ anything is written.
 The plane sections (`electrodes3d.loops_from_mesh`) are cut edge by edge since 2026-11-02 and come out closed whatever
 lies in or near the plane. Before, the segment ends were chained on a 1e-6 m merge grid: where a vertex lay 1.7e-8 m
 below z = ±15 mm on the ground's nearly level taper, crossings that were not neighbours fused, and the ground's whole
-section there was dropped: the deck's slices (and the caches written until then) have no ground at those two levels.
+section there was dropped: the deck's slices (and the caches written until then) have no ground at those two levels,
+so they put the ground's faces on the channel's taper, at |z| = 14-15 mm for r = 113-127 mm, at ±15.5 mm, 0.5-1.5 mm
+into the metal (1.5 mm at r = 113 mm), and six more of the ground's faces near z = ±15 mm (at r = 34 and 55 mm) up to
+1.45 mm off. Elsewhere (at |z| < 29.5 mm) a face is at most half a millimetre off, but for 253 faces of slivers (146
+metal or vacuum intervals thinner than a level, at 77 nodes), at r < 100 mm and at the model's edge
+(`metal_columns_2026-11-02\check_taper_faces`).
 A vertex within 1e-12 m of the plane lies in it (`SECTION_Z_TOL_M`), and a face in the plane belongs to the solid
 above it: the model's faces carry rounding of either sign at their nominal heights (up to 1e-17 m), which would
 otherwise decide a cut at a face's own height (the `sections` views at 16 mm, a stack whose levels fall on faces).
@@ -206,22 +211,71 @@ it reproduces the deck particle for particle (records and scripts in `track\`):
 The port's verification run took 429 s, the deck's 510 s.
 
 These runs used the deck's slices, `track.obstacles = "raster"` since the column test became the default
-(2026-11-02); set it to repeat them. With the slices of the deck's cache, the code of 2026-11-02 tracks the runs of
-the commit before it array for array, at 200 and at 2000 particles without space charge, and the 4000-particle CPU
-run of the table above with space charge (`metal_columns_2026-11-02\`). Only the outlines of the model's sections in
-`track_data.pkl` differ: the same lines, their points in another order and with the points back that the merge grid
-had fused (up to 0.34 µm off its lines), and the ground's section at z = 15 mm now present. The column test gives the same run on the Python path and in the
-compiled kernel, bit for bit.
+(2026-11-02); set it to repeat them. With the slices of the deck's cache, the code of 2026-11-02 (commit 5f09492)
+tracks the runs of the commit before it array for array, at 200 and at 2000 particles without space charge, and the
+4000-particle CPU run of the table above with space charge (`metal_columns_2026-11-02\`; the 2000- and
+4000-particle runs tracked again at 5f09492 itself, `check_rerun_5f09492`). Only the wall and space-charge solve
+times, the stored outlines and the records the older code did not write differ. The model's sections in
+`track_data.pkl` are the same lines, their points in another order and with the points back that the merge grid had
+fused (up to 0.34 µm off its lines), and the ground's section at z = 15 mm is now present; the inflector housing's
+outline is the same, traced the other way round. The new records are `fields.metal_test` and, against the run of
+2026-11-01, `fast_path`, `tracks.handoff_ids`, `stop_at_target_energy` and the trim's `amplitude_cos_t` /
+`amplitude_sin_t`.
+The column test gives the same run on the Python path and in the compiled kernel, bit for bit.
 
-The column test against the slices, 7 turns at -15°, on the same cache:
+The column test against the slices, 7 turns at -15°, on the same fields, every column run at 5f09492 (the CPU ones
+tracked again with it, array for array):
 
 | run | slices | columns |
 |---|---|---|
 | no SC, 200 particles | 55.50 % = 4.458 mA | 55.50 % = 4.458 mA |
 | no SC, 2000 particles | 54.55 % = 4.382 mA | 55.25 % = 4.438 mA |
 | SC 64³ / 5 on the CPU, 4000 particles | 49.43 % = 3.970 mA | 49.43 % = 3.970 mA |
+| SC 64³ / 5 on the GPU, 10 000 particles (the MOBO search fidelity) | 50.40 % = 4.049 mA | 50.79 % = 4.080 mA |
+| SC 128³ / 1 on the GPU, every particle (the MOBO verify fidelity) | 50.09 % = 4.024 mA | 50.57 % = 4.063 mA |
 
 The slices put both channel faces half a millimetre low, at -13.5 / +12.5 mm inside r = 100 mm and -16.5 / +15.5 mm
 beyond 140 mm, where the columns see the model's ±13 and ±16 mm. Of the 2000 particles without space charge, 17 are
-stopped only by the slices, 16 of them between z = 15.5 and 16 mm, and 3 only by the columns, at z = -16.0 mm. With
-space charge 22 and 22 are, nearly all at the same two faces: the same transmission, other particles.
+stopped only by the slices, 16 of them between z = 15.5 and 16 mm, and 3 only by the columns, at z = -16.0 mm. In the
+4000-particle CPU run with space charge 22 and 22 are, nearly all at the same two faces: the same transmission in
+that run, other particles; at the rates of the GPU runs below, 27-32 and 11-13 would be expected there.
+
+At the campaign's two fidelities, search and verify, the column runs (`metal_columns_2026-11-02\gpu\`) track the same
+particles over the same steps (7090 and 7138) as the slice runs, the first pilot's warm start and the full-chain check,
+both tracked at commit 18c4695 and stopped at 3 MeV, after those steps (the full-chain check on its rebuilt model and
+fields, equal to the deck's array for array). Up to the first stops that differ (steps 25 and 59) the two runs of a
+pair are the same run: the particles alive in both hold the same records bit for bit through step 28 and 60
+(`check_loss_history`), so the code of the two commits tracks them alike until the tests part them; with the slices,
+the 4000-particle CPU run above is that of 2026-11-01 array for array. The slices stop 67 and 787 particles that the
+columns let through: 64 and 750 at the upper outer face (+16 mm, which they put at +15.5), the rest on faces that are
+not level, which the slices put at the half level between the two levels nearest to them, here 0.13-0.50 mm into the
+vacuum: the channel's taper (these stops at r = 135-140 mm) and faces of dee 0 and the ground near r = 75 mm,
+|z| = 8-10 mm. The columns stop 28 and 316 that the slices let through, all at the lower faces (-16 and -13 mm, which
+the slices put at -16.5 and -13.5) but for one verify stop on the taper (-15.37 mm, which they put at -15.5). The
+survivors differ by the balance, 39 and 471 (5079 against 5040, 49 538 against 49 067), of which the level faces
+account for a net 36 and 435 (64 - 28 and 750 - 315; `check_one_test_stops`, `check_band_faces`).
+
+Every particle that one test alone stops is stopped where the other test reads vacuum, a median 0.004 mm past the
+stopping test's face. The two runs' paths part a little: with space charge every particle feels the others, and the
+runs lose a particle at different steps from step 25 (search) and 59 (verify) on, near the hand-off. Of the particles
+both runs lose, 3091 and 30 524 are lost at different steps, a median 17 steps apart, nearly all of them stopped first
+by one test where the other reads vacuum. Among them are the 87 and 932 that the columns stop nearest the ±15 mm
+level, where the deck's slices lack the ground there (with it they would read metal at those stops), 83 and 907 of
+them on the channel's taper (these stops at r = 117-127 mm), where the slices put the ground's faces 0.5-1.2 mm into
+the metal; the slices stop all of them too, a median 17 steps later. On the same faces the columns stop another 61 and
+604 nearest the ±14 mm level (r = 113-120 mm), where the slices put the faces 1.0-1.5 mm into the metal (1.5 mm at the
+taper's inner end, r = 113 mm; "The metal test", `check_taper_faces`), a millimetre further than they would with the
+ground, and read vacuum there, with the ground or without; the slices stop these a median 25 and 23 steps later, and
+all 144 and 1511 a median 19. By the end of the run the paths are a median 0.04 and 0.05 mm apart. Of the particles
+one test alone stops that both runs track (95 and 233), the other run's particle reaches the stopping test's metal in
+the same half vertical oscillation in 91 and 215 cases (74 and 168 within 4 steps of the stop), a median 0.2 mm deep,
+where its own test reads vacuum. The other 4 and 18 stay short of it, 21 of them by 0.006-0.14 mm and one by
+0.0003 mm, which the records still resolve: interpolated from every other record, that path is 0.00017 mm off next
+to its closest approach, so from all of them about 0.00002 mm (0.00009 mm even if the error only fell as the
+spacing, and on that assumption 0.00014 mm from how far the closest approach itself moves when every other record
+is left out; `check_band_entry_resolution`). For those 4 and 18 the other run's path, parted by the stops that
+differed earlier, decides, not the local difference between the tests (`check_loss_history`, `check_band_entry`).
+The scores move with the stops, `valley_all` and `ratio` about as much as between the two
+fidelities: `valley_all` 0.0695 / 0.0691 (search / verify) with the columns against 0.0698 / 0.0694 with the slices,
+`ratio` 2.459 / 2.471 against 2.446 / 2.458; `E_med` is the same to 0.2 keV (it rises 2.5-2.8 keV from search to
+verify).

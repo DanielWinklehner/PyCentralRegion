@@ -219,6 +219,11 @@ on those two levels; no run has been tracked on them yet. The outlines every dec
 `MiniDAR_bunch_simulation_3d.py` on the same cached fields (particle for particle), and `pcr score` against
 `score_runs.py` (`docs/pipeline.md`, "Validation of the port"). The numbers are the regression baseline for later
 changes. The tracking comparisons used the deck's slice test, which `pcr track` now runs with
-`track.obstacles = "raster"`. Its default column test puts the faces at their true heights; on the worked example it
-stops other particles on the channel's faces, about as many (`docs/pipeline.md`, "The metal test" and "Validation of
-the port").
+`track.obstacles = "raster"`. Its default column test puts the faces at their true heights. On the worked example the
+deck's slices, which put the channel's faces up to half a millimetre off, but for slivers thinner than a level and the
+ground's faces near z = ±15 mm (on the channel's taper up to 1.5 mm, into the metal, as they lack the ground at
+z = ±15 mm), stop 39 and 471 particles more at the MOBO search and
+verify fidelities: T = 50.40 % = 4.049 mA against 50.79 % = 4.080 mA with the columns, and 50.09 % = 4.024 mA
+against 50.57 % = 4.063 mA. A 4000-particle CPU check with space charge happened to lose as many with either test
+(22 and 22 particles that only one test stops, where the GPU runs' rates would give 27-32 and 11-13;
+`docs/pipeline.md`, "The metal test" and "Validation of the port").

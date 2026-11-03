@@ -1,8 +1,9 @@
 # A radial slit for a chosen design: a cheap-only MOBO campaign over the slit's opening, azimuth and radial offset at
-# one pass, on one geometry's model and fields (the slit is an obstacle only: no new build, no new BEM), about 1.6 min
-# per evaluation. It follows the full campaign (mobo_campaign.toml), whose pilot showed why the slit is not one of its
-# variables (E:\HCHC1.5\Results\CR\pcr_validation\mobo\pilot_analysis\pilot_report.md): with no slit, the slit's other
-# coordinates do nothing; small openings lose most of the beam; and its pass is an unordered choice, not a scale.
+# one pass, on one geometry's model and fields (the slit is an obstacle only: no new build, no new BEM), about
+# 1.6-1.9 min per evaluation. It follows the full campaign (mobo_campaign.toml), whose pilot showed why the slit is
+# not one of its variables (E:\HCHC1.5\Results\CR\pcr_validation\mobo\pilot_analysis\pilot_report.md): with no slit,
+# the slit's other coordinates do nothing; small openings lose most of the beam; and its pass is an unordered choice,
+# not a scale.
 #   pcr optimize        configs/examples/hchc1p5/mobo_slit.toml --dry-run   (prints the first evaluation's command)
 #   pcr optimize        configs/examples/hchc1p5/mobo_slit.toml             (runs until max_evals; rerun continues)
 #   pcr optimize-status configs/examples/hchc1p5/mobo_slit.toml

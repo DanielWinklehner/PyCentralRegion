@@ -2,7 +2,8 @@
 # geometry with the free dee opening 32.55 deg, the spiral inflector turned +4.726 deg so its exit-plate corner sits on
 # gap 0's ray, dee 0's nose rounded (R 3 mm), junctions of gaps 2 / 3 moved to 124.6 / 208.5 mm, no posts, only gap 0's
 # counter post with the R 10 mm round hole. Its 3D tracking at -15 deg (every particle, SC 128^3 every step) gave
-# T = 50.1 % = 4.02 mA at 3.094 +- 0.070 MeV.
+# T = 50.1 % = 4.02 mA at 3.094 +- 0.070 MeV with the deck's slice test (track.obstacles = "raster"); the column test,
+# the default since 2026-11-02, gives T = 50.6 % = 4.06 mA at 3.095 +- 0.070 MeV.
 #   pcr build  configs/examples/hchc1p5/design_wnop3_rotn3_g0ap.toml     (electrodes -> paths.model3d)
 #   pcr fields configs/examples/hchc1p5/design_wnop3_rotn3_g0ap.toml     (3D BEM -> paths.fields)
 #   pcr track  configs/examples/hchc1p5/design_wnop3_rotn3_g0ap.toml     (bunch tracking -> run.out_dir)

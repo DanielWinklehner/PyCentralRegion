@@ -13,8 +13,8 @@ The stored unit coordinates are what the sampler sees of every evaluation, so th
 the driver refuses to continue a store that they no longer map onto its evaluated values (``Campaign.check_store``).
 
 A variable is one of two kinds. 'geometry' variables change the electrodes, so a new value needs a new build and
-3D BEM (an evaluation of about 6 min); 'cheap' variables (RF phase, dee voltage, a magnetic trim, a slit) reuse the
-fields and only re-track (about 1.6 min). The driver uses the kind to batch cheap evaluations on each new geometry,
+3D BEM (an evaluation of about 4 min); 'cheap' variables (RF phase, dee voltage, a magnetic trim, a slit) reuse the
+fields and only re-track (about 1.6-1.9 min). The driver uses the kind to batch cheap evaluations on each new geometry,
 and the geometry key (a hash of everything the build and the BEM read; for a flat channel less the taper's place,
 which then changes no electrode) to share one model and one field map between the evaluations of a geometry.
 

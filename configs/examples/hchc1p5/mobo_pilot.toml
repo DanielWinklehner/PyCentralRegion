@@ -1,7 +1,8 @@
 # MOBO pilot on the worked example: about 20 evaluations over cheap variables only (RF phase, dee-voltage scale and a
 # first-harmonic magnetic trim), all on the existing electrode model and BEM fields of design_wnop3_rotn3_g0ap (its
 # paths.model3d / paths.fields), so every evaluation is a 3D bunch tracking with space charge plus scoring, about
-# 1.6 min (the 20 evaluations of the first pilot took 33 min).
+# 1.6-1.9 min (the first pilot's 20 evaluations took 33 min with the deck's slice test; the one search evaluation
+# timed with the column test, the default, took 114 s).
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml --dry-run   (prints the first evaluation's command)
 #   pcr optimize        configs/examples/hchc1p5/mobo_pilot.toml             (runs until max_evals; rerun continues)
 #   pcr optimize-status configs/examples/hchc1p5/mobo_pilot.toml
@@ -23,10 +24,12 @@
 #   0.95 at -29 deg, ends its 7th turn near 2.93 MeV: a mean of 2.92 in the first pilot's run, a median of 2.94 in a
 #   200-particle rerun without space charge); 3.0 would ask for the design energy at the 7th turn.
 # The warm start reaches 3 MeV in 7 turns: under the old and the new rule it is the same run array for array at 200
-# particles without space charge (pcr_validation\fixes_2026-11-02\track). The first pilot gave it 4.049 mA at the
-# search fidelity with the deck's slice test; the default column test (2026-11-02) stops other particles on the
-# channel's faces, as many in a 4000-particle check with space charge, so expect about 4.05 mA, not exactly that.
-# 'track.obstacles="raster"' in `fixed` repeats the first pilot's run.
+# particles without space charge (pcr_validation\fixes_2026-11-02\track). At the search fidelity it gives 4.080 mA
+# (T = 50.79 %) with the column test, the default since 2026-11-02; the first pilot gave it 4.049 mA (50.40 %) with
+# the deck's slice test, which puts the channel's faces up to half a millimetre off, but for slivers thinner than a
+# level and the ground's faces near z = +-15 mm (on the channel's taper up to 1.5 mm, into the metal: the deck's
+# slices lack the ground at z = +-15 mm; pcr_validation\metal_columns_2026-11-02). 'track.obstacles="raster"' in
+# `fixed` repeats the first pilot's run.
 
 [mobo]
 campaign_dir = "E:/HCHC1.5/Results/CR/mobo/pilot2_wnop3_rotn3_g0ap"

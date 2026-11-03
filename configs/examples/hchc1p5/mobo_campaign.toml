@@ -1,10 +1,10 @@
 # The full MOBO campaign on the worked example, after the pilot: the beam channel's aperture and the spiral
 # inflector's rotation (geometry: every new value needs an electrode build and its 3D BEM fields, so that evaluation
 # takes about 4 min: build ~20 s, fields ~2 min, then the tracking) together with the RF phase, the dee-voltage
-# scale and a first-harmonic magnetic trim (cheap: they re-track on that geometry's fields, about 1.6 min each), 9
-# variables. After every new geometry the driver runs cheap_per_geometry cheap evaluations on it; every geometry gets
-# its own model and fields under <campaign_dir>/geometries/<key>/. A radial slit is a later campaign of its own, on
-# the design this one chooses (mobo_slit.toml).
+# scale and a first-harmonic magnetic trim (cheap: they re-track on that geometry's fields, about 1.6-1.9 min
+# each), 9 variables. After every new geometry the driver runs cheap_per_geometry cheap evaluations on it; every
+# geometry gets its own model and fields under <campaign_dir>/geometries/<key>/. A radial slit is a later campaign of
+# its own, on the design this one chooses (mobo_slit.toml).
 #   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml --dry-run   (prints the first evaluation's command)
 #   pcr optimize        configs/examples/hchc1p5/mobo_campaign.toml             (runs until max_evals; a rerun
 #                                                                                continues; --max-hours H for a slot)
@@ -60,7 +60,8 @@ sampler = "gp"                 # constrained 3-objective GP (logCEHVI) over 9 co
 seed = 0
 n_startup = 20                 # the warm start and 19 random designs (5 geometries with their cheap followers):
                                # at least 2 x 9 + 1 before the GP takes over
-max_evals = 120                # ~30 geometries x (1 + cheap_per_geometry): 30 x 4 min + 90 x 1.6 min, about 4.5 h
+max_evals = 120                # ~30 geometries x (1 + cheap_per_geometry): 30 x 4 min + 90 x 1.6-1.9 min,
+                               # about 4.5-5 h
 cheap_per_geometry = 3
 failed_as_infeasible = false   # a failed build, BEM or tracking blocks only its own design (a design that loses its
                                # beam is learnt either way: the scorer skips it, and it enters with the worst values)
