@@ -15,6 +15,7 @@ from PyCentralRegion.geometry.options import GeometryConfig
 
 REPO = Path(__file__).resolve().parents[1]
 DESIGN = REPO / 'configs' / 'examples' / 'hchc1p5' / 'design_wnop3_rotn3_g0ap.toml'
+CONNECTED = REPO / 'configs' / 'examples' / 'hchc1p5' / 'design_connected_cold.toml'
 
 # the electrodes of the reference design wnop3_rotn3_g0ap as the original design deck built them (2026-10-31): what
 # differs from the defaults (the worked example's design file sets exactly this)
@@ -175,6 +176,44 @@ def test_design_example_geometry_table():
         'height_max_mm': 40.0, 'inner_min_mm': pytest.approx(21.482), 'exit_r_mm': 84.87}
 
 
+def _connected(**kw):
+    """A [geometry] of connected gap lines with two items (the options check their order; the layout their number)."""
+    lines = (O.GapLine(0, 104.5, 159.5), O.GapLine(1, 108.5, 156.0, f0=-0.25, f1=0.5))
+    return GeometryConfig(**{**dict(gap_lines='connected', snap_nodes=False, gap0_on_plate=True, gap_line=lines), **kw})
+
+
+def test_connected_gap_line_options(tmp_path):
+    g = _connected()
+    for bad in (dict(snap_nodes=True), dict(junctions=(O.JunctionMove(2, 124.6),)), dict(gap0_on_plate=False)):
+        with pytest.raises(ConfigError, match="needs snap_nodes = false and no junctions"):
+            _connected(**bad)
+    for lines in ((), (O.GapLine(1, 108.5, 156.0),), tuple(reversed(g.gap_line))):
+        with pytest.raises(ConfigError, match="one item per gap, in gap order"):
+            _connected(gap_line=lines)
+    for bad in (dict(bend_max_deg=0.0), dict(bend_max_deg=90.0), dict(gap_line_d_max_deg=45.0), dict(gap_line_r0_mm=0.0)):
+        with pytest.raises(ConfigError, match="need 0 < bend_max_deg < 90"):
+            _connected(**bad)
+    with pytest.raises(ConfigError, match="read only with gap_lines = 'connected'"):
+        GeometryConfig(gap_line=g.gap_line)
+    with pytest.raises(ConfigError, match="needs 0 < r1_mm < r2_mm"):
+        O.GapLine(2, 160.0, 150.0)
+    with pytest.raises(ConfigError, match="f1 = 1.5 is outside"):
+        O.GapLine(2, 110.0, 150.0, f1=1.5)
+    # the gap-0 hole by rule takes the place of a hand-placed one on that edge
+    hole = O.HoleSpec(0, 'dee', 10.0, 46.12, 0.0, 28.12, 64.12)
+    with pytest.raises(ConfigError, match="has one there too"):
+        GeometryConfig(gap0_hole_r_mm=10.0, holes=(hole,))
+    GeometryConfig(gap0_hole_r_mm=10.0, holes=(dataclasses.replace(hole, side='dummy'),))
+    with pytest.raises(ConfigError, match="gap0_hole_r_mm must be >= 0"):
+        GeometryConfig(gap0_hole_r_mm=-1.0)
+    # from a run config, with an optimiser's override of one line's fraction
+    cfg = _load(tmp_path, '[geometry]\ngap_lines = "connected"\nsnap_nodes = false\ngap0_on_plate = true\n'
+                          '[[geometry.gap_line]]\ngap = 0\nr1_mm = 104.5\nr2_mm = 159.5\n'
+                          '[[geometry.gap_line]]\ngap = 1\nr1_mm = 108.5\nr2_mm = 156.0\nf0 = -0.25\n',
+                ['geometry.gap_line.1.f1=0.5'])
+    assert C.section(cfg, 'geometry').gap_line == g.gap_line
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # the builder and the build
 def test_builder_refuses_other_machines():
@@ -306,6 +345,85 @@ def test_build_inputs_are_checked(tmp_path):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
+# connected gap lines (geometry.gap_lines = 'connected')
+def test_connected_line_stays_within_its_limits():
+    """Every fraction gives a buildable line: P0 and P1 within gap_line_d_max_deg of the ray, the bends at P1 and P2
+    within bend_max_deg - at the corners of the campaign's boxes too, where the P2 bend at its limit once left no P0
+    for the P1 bend."""
+    B = pytest.importorskip('PyCentralRegion.geometry.builder')
+    import numpy as np
+    B.configure(GeometryConfig(), C.MachineConfig())                    # r0 50 mm, 8 deg off the ray, 35 deg bends
+    cold = B.connected_line(110.5, 0.0, 153.5)
+    assert (cold['P0'], cold['P1'], cold['P2'], cold['bends_deg']) == ((50.0, 0.0), (110.5, 0.0), (153.5, 0.0),
+                                                                       (0.0, 0.0))
+    rng = np.random.default_rng(3)
+    cases = [(r1, r2, f0, f1) for r1, r2 in ((91.5, 140.0), (125.5, 140.0), (168.0, 182.0), (175.0, 215.5))
+             for f0 in (-1.0, 1.0) for f1 in (-1.0, 1.0)]
+    cases += [(r1, r1 + rng.uniform(1.0, 90.0), *rng.uniform(-1.0, 1.0, 2)) for r1 in rng.uniform(55.0, 180.0, 400)]
+    for r1, r2, f0, f1 in cases:
+        ln = B.connected_line(r1, f1, r2, f0=f0)
+        assert max(ln['bends_deg']) <= 35.0 + 1e-9 and max(abs(ln['d0_deg']), abs(ln['d1_deg'])) <= 8.0 + 1e-9
+        assert ln['P1'][1] == f1 * ln['y1_max']
+        assert ln['y0_range'][0] - 1e-12 <= ln['P0'][1] <= ln['y0_range'][1] + 1e-12
+    # gap 0: P0 is where the exit-plate line meets the ray, its bend free; the bend at P1 is held instead
+    for f1 in (-1.0, 1.0):
+        ln = B.connected_line(104.5, f1, 159.5, x0=98.174)
+        assert ln['P0'] == (98.174, 0.0) and max(ln['bends_deg']) <= 35.0 + 1e-9 and ln['y1_max'] > 0.0
+    with pytest.raises(ConfigError, match="needs P0 < r1 < r2"):
+        B.connected_line(45.0, 0.0, 100.0)
+    B.configure()
+
+
+def test_set_vertices_and_the_centre_line():
+    """A connected chain through RFCavity.set_vertices: its segments join without steps, the fixed ray starts at the
+    last vertex, and the centre line is the chain itself. The cavity refuses a chain that does not end on its ray, and
+    the angle / radius parametrization once it has one."""
+    B = pytest.importorskip('PyCentralRegion.geometry.builder')
+    import numpy as np
+    from PyCentralRegion.rf_cavity import create_dee_system
+    cav = create_dee_system(0.005, 0.37, [45.0, 135.0, 225.0, 315.0], 32.548).gaps[1]
+    th = cav.base_angle
+    P = np.array([B._to_machine(th, p) for p in ((50.0, 3.0), (110.0, -5.0), (155.0, 0.0))])
+    cav.set_vertices(P / 1e3)
+    var = [s for s in cav.segments if s['type'] == 'variable']
+    (fix,) = [s for s in cav.segments if s['type'] == 'fixed']
+    assert cav.n_variable_segments == len(var) == 2
+    assert np.allclose([var[0]['p1'][:2], var[0]['p2'][:2], var[1]['p2'][:2]], P / 1e3, rtol=0.0, atol=1e-15)
+    assert np.array_equal(var[0]['p2'], var[1]['p1']) and np.allclose(fix['p1'][:2], P[2] / 1e3, rtol=0.0, atol=1e-15)
+    chain, j, closed = B.gap_centre_line(cav)
+    assert closed and len(chain) == 4 and np.allclose(chain[:3], P, rtol=0.0, atol=1e-12)
+    assert np.hypot(*chain[3]) == pytest.approx(370.0)
+    for bad, match in (([P[0], P[1]], "is not on the base ray"), ([P[0], P[0], P[2]], "coincide"),
+                       ([P[0], B._to_machine(th, (380.0, 0.0))], "not inside r_max")):
+        with pytest.raises(ValueError, match=match):
+            cav.set_vertices(np.array(bad) / 1e3)
+    with pytest.raises(ValueError, match="lay it again"):
+        cav.update_geometry(base_angle=th)
+
+
+def test_centre_line_of_two_variable_segments():
+    """A seed gap of two variable segments runs through both in order (the second's start after the first's end: a
+    jog where a midpoint rotation leaves one) to the junction; a gap of one segment is as it was."""
+    B = pytest.importorskip('PyCentralRegion.geometry.builder')
+    import numpy as np
+    from PyCentralRegion.rf_cavity import create_dee_system
+    centres = [45.0, 135.0, 225.0, 315.0]
+    cav = create_dee_system(0.005, 0.37, centres, 32.548, n_variable_segments=2, segment_angles=[3.0, -4.0],
+                            segment_radii=[0.11, 0.16]).gaps[1]
+    cav.update_geometry(segment_rotations=[0.0, 10.0])
+    var = [s for s in cav.segments if s['type'] == 'variable']
+    chain, j, closed = B.gap_centre_line(cav, junction_tol=-1.0)         # never closed: the chain as laid
+    laid = [np.asarray(p[:2], dtype=float) * 1e3 for p in (var[0]['p1'], var[0]['p2'], var[1]['p1'], var[1]['p2'])]
+    assert not closed and np.allclose(chain, laid + [j['fix_start'], j['fix_end']], rtol=0.0, atol=1e-9)
+    one = create_dee_system(0.005, 0.37, centres, 32.548, n_variable_segments=1, segment_angles=[3.0],
+                            segment_radii=[0.11]).gaps[1]
+    (seg,) = [s for s in one.segments if s['type'] == 'variable']
+    chain, j, _ = B.gap_centre_line(one, junction_tol=-1.0)
+    laid = [np.asarray(p[:2], dtype=float) * 1e3 for p in (seg['p1'], seg['p2'])]
+    assert np.allclose(chain, laid + [j['fix_start'], j['fix_end']], rtol=0.0, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
 # the reference design in 2D (its inputs live on the design machine)
 def _reference_cfg():
     if not DESIGN.exists():
@@ -356,3 +474,40 @@ def test_reference_gap0_hole_and_edge_shift(reference_layout):
     assert sh['s1'] == pytest.approx(46.12, abs=1e-6) and sh['r0'] == pytest.approx(73.582, abs=1e-3)
     (sh,) = GB.edge_shift(cfg, [(0, 'dee', 48.3109, -2.0)], lay=lay, verbose=False)
     assert sh['s1'] == pytest.approx(46.12, abs=1e-3) and sh['r1'] == pytest.approx(sh['r0'] - 2.0)
+
+
+def test_connected_layouts():
+    """The connected campaign's cold start in 2D: gap 0 leaves the exit plate where the plate line meets its ray
+    (r 98.174 mm), every other point lies on its gap's ray, and the gap-0 hole by rule holds 99.46 % of the hand-off
+    bunch. At another opening the inflector turns by half the change (the corner rule), and lines off their rays keep
+    their limits; the seed's opening is not reported as used."""
+    pytest.importorskip('PyCentralRegion.geometry.builder')
+    import numpy as np
+    from PyCentralRegion.geometry import build as GB
+    if not CONNECTED.exists():
+        pytest.skip("the worked example is not in this checkout")
+    cfg = C.load(CONNECTED)
+    pc = C.section(cfg, 'paths')
+    if not all(Path(p).exists() for p in (pc.seed, pc.housing_outline, pc.handoff)):
+        pytest.skip("the design's input files are not on this machine")
+    with contextlib.redirect_stdout(io.StringIO()):
+        lay = GB.layout(cfg, verbose=True)
+        hole = GB.gap0_hole(cfg, r_mm=10.0, rim_mm=8.0, dr_mm=-2.0, lay=lay, verbose=False)
+    lines = lay['gap_lines']
+    assert lines[0]['plate']['r'] == pytest.approx(98.174, abs=1e-3)
+    assert all(ln['P0'][1] == ln['P1'][1] == 0.0 and ln['bends_deg'] == (0.0, 0.0) for ln in lines)
+    for g, cav in enumerate(lay['dees'].gaps):
+        b = np.radians(cav.base_angle)
+        v = cav.vertices[1:] if g == 0 else cav.vertices                 # gap 0 runs along the plate up to its ray
+        assert np.allclose(v[:, 1] * np.cos(b) - v[:, 0] * np.sin(b), 0.0, rtol=0.0, atol=1e-12)
+    assert hole['inside_fraction'] == pytest.approx(0.9946, abs=1e-4) and hole['n_hit'] == 97958
+    opening = C.section(cfg, 'machine').dee_opening_deg
+    turned = C.load(CONNECTED, overrides=['machine.dee_opening_deg=28.0', 'geometry.gap_line.3.f0=-1.0',
+                                          'geometry.gap_line.3.f1=1.0'])
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):
+        lay28 = GB.layout(turned, verbose=True)
+    assert lay28['si_rotation_deg'] - lay['si_rotation_deg'] == pytest.approx(0.5 * (opening - 28.0), abs=1e-9)
+    ln = lay28['gap_lines'][3]
+    assert ln['P1'][1] == ln['y1_max'] > 0.0 and ln['P0'][1] == ln['y0_range'][0]
+    assert max(ln['bends_deg']) <= 35.0 + 1e-9 and "the seed's dee opening" not in log.getvalue()

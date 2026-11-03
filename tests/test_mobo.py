@@ -34,6 +34,7 @@ BASE = TOY.with_name('base.toml')
 PILOT = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_pilot.toml'
 CAMPAIGN = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_campaign.toml'
 SLIT = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_slit.toml'
+CONNECTED = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_connected.toml'
 SRC = Path(PyCentralRegion.__file__).resolve().parents[1]          # subprocesses import what the tests import
 HV_FRONT = (2.0 / 3.0) * (1.0 - (1.0 - toy.I_MAX) ** 1.5)
 # a smaller toy problem for the convergence test: the RF phase, a log-scaled trim and a continuous geometry variable
@@ -725,6 +726,28 @@ def test_campaign_config_dry_run(capsys):
     assert f"geometries/{key}/fields.pkl" in cmd and 'track.n_tracks=10000' in cmd
     assert 'track.turns=7' in cmd and 'track.stop_at_target_energy=false' in cmd
     assert 'btrim.amplitude' not in out                                # no trim
+
+
+def test_connected_campaign_config(tmp_path):
+    """The connected-gap-lines campaign: the dee opening, the channel and every gap line's 4 variables (gap 0: 3, it
+    starts on the exit plate) as geometry, the phase as the cheap one; 65 kV, no trim. Its 35 [geometry] variables are
+    checked at every corner of each table's own (a channel, a gap line) and at RANDOM_CORNERS random corners of their
+    box: 2^35 corners would never end."""
+    cfg = driver.load(CONNECTED)
+    names = [v.name for v in cfg.variables]
+    assert len(names) == 37 and names[0] == 'phi' and names[-1] == 'phase' and 'g0_f0' not in names
+    assert [v.kind for v in cfg.variables] == ['geometry'] * 36 + ['cheap']
+    assert all((v.low, v.high) == (-1.0, 1.0) for v in cfg.variables if v.name[-3:] in ('_f0', '_f1'))
+    assert 'track.volt_scale=1.0' in cfg.fixed and not any('btrim' in v.target for v in cfg.variables)
+    assert cfg.n_startup >= 2 * (len(cfg.variables) + 2) + 1
+    box = [v for v in cfg.variables if v.target.startswith('geometry.')]
+    corners = driver._box_corners(box)
+    assert len(corners) == 2 ** 4 + 2 ** 3 + 7 * 2 ** 4 + driver.RANDOM_CORNERS and corners == driver._box_corners(box)
+    assert len(driver._box_corners(box[:driver.FULL_CORNERS_MAX])) == 2 ** driver.FULL_CORNERS_MAX
+    if not Path(cfg.physics_python).is_file():
+        pytest.skip('the campaign names a physics interpreter of the machine it runs on')
+    camp = driver.Campaign(driver.load(CONNECTED, [f'mobo.campaign_dir={C.toml_value(str(tmp_path))}']))
+    assert camp.warm_point(1)['phi'] == 28.0 and camp.warm_point(2)['phi'] == 38.0      # (checked its overrides)
 
 
 @pytest.mark.parametrize('path', [PILOT, CAMPAIGN], ids=['pilot', 'campaign'])

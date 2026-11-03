@@ -148,6 +148,22 @@ def test_si_rotation_guard():
         S.check_si_rotation(model, 0.0, 'fields.pkl')
 
 
+def test_tracker_follows_the_models_si_rotation():
+    """si_rotation = 'corner' turns the inflector with gap 0's ray (so with the dee opening): the run takes the angle
+    its model was built around. 'fixed' leaves inflector.rotation_deg to the guard; a model without the record too."""
+    model = types.SimpleNamespace(params={'si_rotation_deg': 7.0})
+    cfg = {'geometry': {'si_rotation': 'corner'}, 'inflector': {'rotation_deg': 4.726}}
+    S.follow_model_si_rotation(cfg, model)
+    assert cfg['inflector']['rotation_deg'] == 7.0
+    S.check_si_rotation(model, cfg['inflector']['rotation_deg'])
+    cfg = {'geometry': {'si_rotation': 'fixed'}, 'inflector': {'rotation_deg': 4.726}}
+    S.follow_model_si_rotation(cfg, model)
+    assert cfg['inflector']['rotation_deg'] == 4.726
+    cfg = {'geometry': {'si_rotation': 'corner'}}
+    S.follow_model_si_rotation(cfg, types.SimpleNamespace(params={}))
+    assert cfg == {'geometry': {'si_rotation': 'corner'}}
+
+
 def _handoff(meta):
     """A load_handoff dict: three 62 keV protons (p = 10.787 MeV/c) on a plane, with the given file attributes."""
     p = np.sqrt(0.062 ** 2 + 2 * 0.062 * 938.272) * 1e6
