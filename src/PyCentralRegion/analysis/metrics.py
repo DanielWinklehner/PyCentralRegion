@@ -1024,17 +1024,20 @@ def score_run(run, cfg=None):
                      'share': loss_turn_shares(lost_turn, cfg.loss_turn_edges)}
 
     # --- fixed-azimuth readout; a run whose turn log ended early gets the readout's transmission
+    # The tracker logs a turn at each crossing of the reference particle's launch azimuth. A log shorter than the
+    # run's turns is an energy stop (stop_at_target_energy, the run ended there: its turns are the logged ones) or,
+    # with no energy stop or a run on past its turns, a lost reference (before the fallback clock of
+    # accelerated_orbit_finder.track_with_rf): no further turn logged, the run on to its step budget, its json
+    # transmission the survival at the last logged turn and its final states turns later.
     turns_req = int(run.info.get('turns') or n_steps // spt)
-    res.update(readout_metrics(xyz, alive, steps, surv, sense, k, cfg, N, turns_req, spt, n_steps))
-    guard_notes = []
     n_log = fj.get('n_turns')
+    short_log = n_log is not None and int(n_log) < turns_req
+    energy_stop = short_log and bool(run.info.get('stop_at_target_energy', False)) and n_steps <= (turns_req + 1) * spt
+    turns_run = int(n_log) if energy_stop else turns_req
+    res.update(readout_metrics(xyz, alive, steps, surv, sense, k, cfg, N, turns_run, spt, n_steps))
+    guard_notes = []
     res['turns_logged'] = int(n_log) if n_log is not None else None
-    if (not run.ghost_run and 'transmission' in fj and n_log is not None and int(n_log) < turns_req
-            and (not run.info.get('stop_at_target_energy', False) or n_steps > (turns_req + 1) * spt)):
-        # The tracker logs a turn at each crossing of the reference particle's launch azimuth; a run whose
-        # reference was lost (before the fallback clock of accelerated_orbit_finder.track_with_rf) logged no
-        # further turn and ran on to its step budget: its json transmission is the survival at the last logged
-        # turn, its final states are turns later.
+    if short_log and not energy_stop and not run.ghost_run and 'transmission' in fj:
         T_new = res['T_az'] if res['n_az'] else nS / N
         res.update(T_log=T, T=T_new, I_final=T_new * I0)
         guard_notes.append(

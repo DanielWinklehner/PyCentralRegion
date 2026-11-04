@@ -503,9 +503,15 @@ def test_readout_guards_a_short_turn_log():
     run, _ = _readout_run(n_turns_logged=TURNS)
     sc = M.score_run(run, _cfg())
     assert sc['T'] == pytest.approx(run.info['final']['transmission']) and 'T_log' not in sc
-    run.info['stop_at_target_energy'] = True                    # an energy stop ends the log early by design
-    run.info['final']['n_turns'] = 3
-    assert 'T_log' not in M.score_run(run, _cfg())
+    run.info['stop_at_target_energy'] = True                    # an energy stop ends the log early by design:
+    run.info['final']['n_turns'] = 3                            # no guard, and the readout on the run's last pass
+    sc = M.score_run(run, _cfg())
+    assert 'T_log' not in sc and sc['az_pass'] == 3
+    run.info.update(turns=TURNS + 2)                            # asked for 8, the energy stop ended it at turn 6
+    run.info['final']['n_turns'] = TURNS
+    sc = M.score_run(run, _cfg())
+    assert 'T_log' not in sc and sc['az_pass'] == TURNS and sc['n_az'] == run.n_tracks - 6
+    run.info.update(turns=TURNS)
     run.info['stop_at_target_energy'] = False                   # the tracker's fallback clock: a complete log, a note
     run.info['final'].update(n_turns=TURNS, reference_lost={'step': 2500, 'turns_logged': 2, 'period_steps': 1000.0,
                                                             'clock_steps': [3001, 4001, 5001, 6001]})
