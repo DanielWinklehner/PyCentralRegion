@@ -26,7 +26,9 @@
 # BEM fields are electrostatic at [machine]'s harmonic and frequency) - check a chosen design with the RF model.
 
 [mobo]
-campaign_dir = "F:/HCHC1.5/Results/CR/mobo/campaign_connected"
+# campaign_connected (100 evaluations, 2026-11-03) was built before the checked cuts: its channel tapers ending beyond
+# ~150 mm left dees and the ground whole, so those designs read as bad for a false reason. Do not resume it.
+campaign_dir = "F:/HCHC1.5/Results/CR/mobo/campaign_connected2"
 base_config_file = "design_connected_cold.toml"
 physics_python = "C:/Users/Daniel/anaconda3/envs/accel-dev-env/python.exe"
 sampler = "gp"                 # constrained 3-objective GP (logCEHVI) over 37 coordinates

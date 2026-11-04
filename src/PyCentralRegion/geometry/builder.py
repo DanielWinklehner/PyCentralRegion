@@ -1629,6 +1629,73 @@ def _occ_profile_revolve(occ, ring):
     return v[0]
 
 
+# A fuzzy boolean (geometry.occ_fuzzy_mm) can hand back its object untouched: no error, no warning, the tool simply
+# gone. 2026-11-03: with the channel taper ending beyond ~150 mm the aperture tool left dees and the star ground whole
+# (the beam then ended on the first face it met) in 15 of a campaign's 17 random geometries; 0.02, 0.01 mm or an exact
+# boolean cut them. A cut that must remove metal goes through _cut_removing: one that removed nothing is made again at
+# these smaller tolerances, the largest first (exact booleans can leave micro-faces near the taper's kink circles, so as
+# much of the merging as works is kept), and the build fails when none removes metal. A retry can also go wrong the
+# other way - the jogged design's ground at 0.02 mm lost exactly the tool's volume, a void instead of a channel - so a
+# cut counts only when it removes metal but less than its whole tool: every tool here reaches outside its solid.
+FUZZY_FALLBACK_MM = (0.02, 0.01, 0.005, 0.0)
+
+
+def _occ_mass(occ, dim_tags) -> float:
+    """Volume (area for faces) of OCC entities [mm^3]."""
+    return float(sum(occ.getMass(d, t) for d, t in dim_tags))
+
+
+def _cut_removing(gmsh, obj, make_tool, what: str, say=None):
+    """``occ.cut(obj, make_tool())`` for a cut that must remove metal: obj are OCC dim tags, ``make_tool()`` builds a
+    fresh tool and returns its dim tags (a cut consumes it); the tool must reach outside obj. A cut counts when it
+    removes more than nothing and less than the whole tool. One that left obj untouched is made again on a copy of obj
+    at each tolerance of FUZZY_FALLBACK_MM below the current one until a cut counts (``say`` notes it); any other
+    outcome, or none that counts, raises RuntimeError. Returns the result's dim tags. A cut that counts the first time
+    is the plain occ.cut, so its model is unchanged."""
+    occ = gmsh.model.occ
+    tol0 = float(gmsh.option.getNumber("Geometry.ToleranceBoolean"))
+    m0 = _occ_mass(occ, obj)
+    nothing = 1e-9 * m0
+
+    def cut(o):
+        tool = make_tool()
+        v_tool = _occ_mass(occ, tool)
+        res, _ = occ.cut(o, tool, removeObject=True, removeTool=True)
+        try:
+            removed = m0 - _occ_mass(occ, res)
+        except Exception:                                            # noqa: BLE001 - a broken result counts as none
+            removed = float('nan')
+        return res, removed, v_tool, nothing < removed < (1.0 - 1e-6) * v_tool
+
+    def outcome(tol, removed):
+        return f"{tol:g} mm: " + ("nothing" if abs(removed) <= nothing else f"{removed / 1e3:.1f} cm^3")
+
+    out, removed, v_tool, ok = cut(obj)
+    if ok:
+        return out
+    if not abs(removed) <= nothing:                       # not untouched either: nothing clean to make it again from
+        raise RuntimeError(f"{what}: the cut at boolean tolerance {tol0:g} mm removed {removed / 1e3:.1f} cm^3 of a "
+                           f"{v_tool / 1e3:.1f} cm^3 tool - not a cut through the solid")
+    tried = [outcome(tol0, removed)]
+    for tol in (t for t in FUZZY_FALLBACK_MM if t < tol0):
+        gmsh.option.setNumber("Geometry.ToleranceBoolean", tol)
+        try:
+            trial, removed, v_tool, ok = cut(occ.copy(out))
+        finally:
+            gmsh.option.setNumber("Geometry.ToleranceBoolean", tol0)
+        if ok:
+            occ.remove(out, recursive=True)
+            if say is not None:
+                say(f"{what}: the cut at boolean tolerance {tol0:g} mm removed no metal; at {tol:g} mm it removed "
+                    f"{removed / 1e3:.1f} cm^3 of its {v_tool / 1e3:.1f} cm^3 tool"
+                    + (f" (not counted: {'; '.join(tried[1:])})" if len(tried) > 1 else ""))
+            return trial
+        tried.append(outcome(tol, removed))
+        occ.remove(trial, recursive=True)
+    raise RuntimeError(f"{what}: no cut counted (the {v_tool / 1e3:.1f} cm^3 tool removed at boolean tolerance "
+                       f"{'; '.join(tried)}) - the solid would be left whole")
+
+
 def _strip_orphans(gmsh, occ) -> int:
     """Delete every entity that is not part of some solid.
 
@@ -2129,7 +2196,8 @@ def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: b
     t0 = time.time()
     # near-coincident features (a post end or a dee end within a fraction of a mm of a taper kink circle) leave
     # micro-faces in the booleans; the fuzzy tolerance merges edges closer than this instead. 0.05 mm removes every
-    # edge under 0.1 mm and moves no metal; much larger values fail to mesh or leave a dummy unhollowed.
+    # edge under 0.1 mm and moves no metal; much larger values fail to mesh or leave a dummy unhollowed. 0.05 mm itself
+    # can leave a solid whole (a taper ending beyond ~150 mm): the cuts that must remove metal check it (_cut_removing).
     if OPT.occ_fuzzy_mm > 0.0:
         gmsh.option.setNumber("Geometry.ToleranceBoolean", float(OPT.occ_fuzzy_mm))
         if verbose:
@@ -2148,14 +2216,16 @@ def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: b
     elif brick is not None:
         ch_s = _occ_polygon(occ, brick['near'][:, :2], 0.0)
         occ.remove([(2, ch_s)], recursive=True)
-        # the prism starts `back` mm upstream of the emitting plane (see beam_channel); any polygon (a round exit
-        # opening is a ring of points)
-        p = [occ.addPoint(*q) for q in brick['start']]
-        ls = [occ.addLine(p[i], p[(i + 1) % len(p)]) for i in range(len(p))]
-        face = occ.addPlaneSurface([occ.addCurveLoop(ls)])
-        d = (brick['extend'] + brick['back']) * brick['sweep']
-        chan = [t for dd, t in occ.extrude([(2, face)], *d) if dd == 3][0]
-        out, _ = occ.cut([(3, house)], [(3, chan)], removeObject=True, removeTool=True)
+
+        def recess():
+            # the prism starts `back` mm upstream of the emitting plane (see beam_channel); any polygon (a round exit
+            # opening is a ring of points)
+            p = [occ.addPoint(*q) for q in brick['start']]
+            ls = [occ.addLine(p[i], p[(i + 1) % len(p)]) for i in range(len(p))]
+            face = occ.addPlaneSurface([occ.addCurveLoop(ls)])
+            d = (brick['extend'] + brick['back']) * brick['sweep']
+            return [(3, [t for dd, t in occ.extrude([(2, face)], *d) if dd == 3][0])]
+        out = _cut_removing(gmsh, [(3, house)], recess, "the housing's beam recess", say)
         house = [t for dd, t in out if dd == 3][0]
         say("housing solid with the beam recess")
 
@@ -2198,9 +2268,9 @@ def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: b
     if dummy_ap != aperture:
         say(f"asymmetric gap: dees {aperture} mm, dummy dees {dummy_ap} mm")
     for label, vol in solids.items():
-        tool = _occ_profile_revolve(occ, _aperture_ring(r_tool[label], r_cut + 20.0,
-                                                        h=dummy_ap if label in dummy_labels else aperture))
-        out, _ = occ.cut([(3, vol)], [(3, tool)], removeObject=True, removeTool=True)
+        def tool(r0=r_tool[label], h=dummy_ap if label in dummy_labels else aperture):
+            return [(3, _occ_profile_revolve(occ, _aperture_ring(r0, r_cut + 20.0, h=h)))]
+        out = _cut_removing(gmsh, [(3, vol)], tool, f"{label}'s channel", say)
         pieces[label] = [t for dd, t in out if dd == 3]
         if end_wall.get(label):
             out, _ = occ.fuse([(3, t) for t in pieces[label]], [(3, t) for t in end_wall[label]],
@@ -2215,10 +2285,14 @@ def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: b
     if star:
         gl = star_ground_layout(occ, foot, dees, -half, float(foot[0]['r_max']), verbose=verbose)
         gp = [e for e in occ.extrude(gl, 0, 0, 2.0 * half) if e[0] == 3]
-        tool = _occ_profile_revolve(occ, _aperture_ring(0.0, r_cut + 20.0, h=dummy_ap))
-        out, _ = occ.cut(gp, [(3, tool)], removeObject=True, removeTool=True)
+        out = _cut_removing(gmsh, gp, lambda: [(3, _occ_profile_revolve(occ, _aperture_ring(0.0, r_cut + 20.0,
+                                                                                            h=dummy_ap)))],
+                            "the ground's channel", say)
         gnd = [e for e in out if e[0] == 3]
         n_plates = len(gnd)
+        if n_plates < 2:                          # a full revolution through the ground leaves an upper and a lower plate
+            raise RuntimeError(f"the ground's channel cut left {n_plates} solid(s); it must split the ground into its "
+                               f"upper and lower plates")
         out, _ = occ.fuse(gnd, [(3, house)], removeObject=True, removeTool=True)
         gnd = [e for e in out if e[0] == 3]
         if OPT.gap0_face_mm > 0.0:                # the gap-0 ground face, before the exit opening is cut through it
@@ -2249,16 +2323,19 @@ def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: b
             fit = _circle_fit(brick['start'])
             if fit is not None and fit[2] < 0.01:
                 c, r_ap, _ = fit
-                cut_tool = occ.addCylinder(float(c[0]), float(c[1]), float(c[2]), float(d[0]), float(d[1]),
-                                           float(d[2]), r_ap)
+
+                def opening():
+                    return [(3, occ.addCylinder(float(c[0]), float(c[1]), float(c[2]), float(d[0]), float(d[1]),
+                                                float(d[2]), r_ap))]
                 how = f"exit opening cut as a cylinder R {r_ap:.2f} mm"
             else:
-                p = [occ.addPoint(*q) for q in brick['start']]
-                ls = [occ.addLine(p[i], p[(i + 1) % len(p)]) for i in range(len(p))]
-                face = occ.addPlaneSurface([occ.addCurveLoop(ls)])
-                cut_tool = [t for dd, t in occ.extrude([(2, face)], *d) if dd == 3][0]
-                how = f"exit opening cut as its {len(p)}-point polygon"
-            out, _ = occ.cut(gnd, [(3, cut_tool)], removeObject=True, removeTool=True)
+                def opening():
+                    p = [occ.addPoint(*q) for q in brick['start']]
+                    ls = [occ.addLine(p[i], p[(i + 1) % len(p)]) for i in range(len(p))]
+                    face = occ.addPlaneSurface([occ.addCurveLoop(ls)])
+                    return [(3, [t for dd, t in occ.extrude([(2, face)], *d) if dd == 3][0])]
+                how = f"exit opening cut as its {len(brick['start'])}-point polygon"
+            out = _cut_removing(gmsh, gnd, opening, "the inflector's exit opening", say)
             gnd = [e for e in out if e[0] == 3]
         pieces['ground'] = [t for _, t in gnd]
         say(f"star ground: layout extruded, channel cut -> {n_plates} solid(s), SI housing merged in, {how} -> "
@@ -2290,9 +2367,11 @@ def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: b
                     # the round hole: a cylinder along the edge normal, 1 mm proud of both plate faces
                     hc, nn, dep = q['hole_centre'], q['hole_axis'], q['depth']
                     base = hc - np.array([nn[0], nn[1], 0.0]) * 1.0
-                    cyl = occ.addCylinder(float(base[0]), float(base[1]), float(base[2]), float(nn[0] * (dep + 2.0)),
-                                          float(nn[1] * (dep + 2.0)), 0.0, float(q['hole_r']))
-                    cut, _ = occ.cut([(3, v[0])], [(3, cyl)], removeObject=True, removeTool=True)
+
+                    def hole(base=base, nn=nn, dep=dep, r=float(q['hole_r'])):
+                        return [(3, occ.addCylinder(float(base[0]), float(base[1]), float(base[2]),
+                                                    float(nn[0] * (dep + 2.0)), float(nn[1] * (dep + 2.0)), 0.0, r))]
+                    cut = _cut_removing(gmsh, [(3, v[0])], hole, f"{q['name']}: the hole", say)
                     v = [t for d, t in cut if d == 3]
                     if len(v) != 1:
                         raise RuntimeError(f"{q['name']}: the hole cut gave {len(v)} volumes")
