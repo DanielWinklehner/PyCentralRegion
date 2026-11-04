@@ -389,6 +389,160 @@ def test_score_run_on_a_synthetic_bunch():
     assert json_clean(sc) == json_clean(json_clean(sc))                 # JSON-clean
 
 
+F_REV = 8e6             # [Hz] of the readout run
+MASS = 1876.0           # [MeV] of its ions (from the hand-off meta: no PyPATools needed)
+
+
+SPT_RO = 1000           # steps per turn of the readout run: records every EVERY = 4 steps as in the campaigns
+
+
+def _readout_run(n=400, seed=11, n_turns_logged=None):
+    """A field-free accelerated bunch with known answers at any azimuth: every particle on its own spiral
+    R = 60 + 24 tau + g mm (tau in turns, one revolution per SPT_RO steps, launch azimuth 0.30-0.40 rad: past 0 deg),
+    a vertical oscillation z = a cos(2 pi nu tau + psi); 6 lost on metal in turn 2, one leaving at the radius limit at
+    the end (after every readout). Returns the run and expected(angle_deg, pass) -> (ids, E [MeV], z [m], z')."""
+    rng = np.random.default_rng(seed)
+    n_steps = SPT_RO * TURNS
+    steps = np.arange(0, n_steps, EVERY)
+    th0 = rng.uniform(0.30, 0.40, n)
+    g = rng.normal(0.0, 1.5, n)
+    a, nu, psi = rng.uniform(0.5e-3, 2e-3, n), rng.uniform(0.15, 0.25, n), rng.uniform(0, 2 * np.pi, n)
+    tau = (steps[:, None] + 1) / SPT_RO                      # the record of step s: the state after it
+    r = 1e-3 * (60.0 + 24.0 * tau + g)
+    th = th0 + 2 * np.pi * tau
+    xyz = np.stack([r * np.cos(th), r * np.sin(th), a * np.cos(2 * np.pi * nu * tau + psi)], axis=2)
+    stop = np.full(n, n_steps + 1)
+    lost = np.arange(6)
+    stop[lost] = SPT_RO + 100 * lost
+    for i in lost:
+        xyz[steps >= stop[i], i] = xyz[np.searchsorted(steps, stop[i]) - 1, i]      # frozen at the hit
+    xyz[-1, n - 1, :2] *= 0.40 / np.hypot(*xyz[-1, n - 1, :2])                    # out at the radius limit
+    fin = {'transmission': float((n - 7) / n), 'phase': 0.0, 'sc': False}
+    if n_turns_logged is not None:
+        fin['n_turns'] = n_turns_logged
+    info = {'rf_mhz': 4 * F_REV / 1e6, 'f_rev_mhz': F_REV / 1e6, 'harmonic': H, 'turns': TURNS,
+            'limits': {'r_max_m': 0.38, 'z_max_m': 0.03}, 'final': fin, 'space_charge': {'current_ma': 5.0}}
+    run = R.RunData(tag='ro', ids=np.arange(n), steps=steps, xyz=xyz, stop_step=stop, birth_step=np.zeros(n, int),
+                    n_steps=n_steps, steps_per_turn=SPT_RO, E_mev=3.0 + 0.03 * rng.standard_normal(n), info=info,
+                    handoff_meta={'species_mass_mev': MASS, 'species_charge_state': 1.0})
+
+    def expected(angle_deg, p):
+        ids = np.setdiff1d(np.arange(n), lost)
+        tc = (np.deg2rad(angle_deg) + 2 * np.pi * p - th0[ids]) / (2 * np.pi)       # tau at the crossing
+        rc = 1e-3 * (60.0 + 24.0 * tc + g[ids])
+        v = F_REV * np.column_stack([np.full(len(ids), 24e-3), 2 * np.pi * rc,
+                                     -a[ids] * 2 * np.pi * nu[ids] * np.sin(2 * np.pi * nu[ids] * tc + psi[ids])])
+        beta2 = np.sum(v * v, axis=1) / M.CLIGHT ** 2
+        E = (1.0 / np.sqrt(1.0 - beta2) - 1.0) * MASS
+        zc = a[ids] * np.cos(2 * np.pi * nu[ids] * tc + psi[ids])
+        return ids, E, zc, v
+
+    return run, expected
+
+
+def test_readout_known_answers():
+    """At 0 deg on the auto pass (6 = turns: the bunch starts past 0 deg) the readout sees every particle not lost
+    on metal - the one lost at the radius limit after it too - with its energy to 1e-6 (cubic velocity through four
+    records; here the speed grows along the spiral, so the linearly interpolated crossing time costs a few 1e-7 as
+    well: in a field-free gap the speed is constant), and the vertical phase space of exactly those particles; the
+    windows match the energies' own."""
+    run, expected = _readout_run()
+    sc = M.score_run(run, _cfg())
+    ids, E, zc, v = expected(0.0, TURNS)
+    assert sc['az_pass'] == TURNS and sc['az_deg'] == 0.0 and sc['n_az'] == len(ids) == run.n_tracks - 6
+    assert sc['T_az'] == pytest.approx(len(ids) / run.n_tracks) and sc['I_final_az'] == pytest.approx(5.0 * sc['T_az'])
+    assert sc['az_cover'] == 1.0 and sc['az_margin_steps'] > 0 and sc['turns_logged'] is None
+    assert sc['E_med_az'] == pytest.approx(np.median(E), rel=1e-6)
+    assert sc['dE_E_robust_az'] == pytest.approx(M.robust_sigma(E) / np.median(E), rel=1e-4)   # a 1e-7 MeV error / MAD
+    for w in (0.05, 0.02, 0.01):
+        p = f"{100 * w:g}"
+        nb, cb = M.energy_window_best(E, w)
+        assert abs(sc[f'I_{p}pct_best_az'] - 5.0 * nb / run.n_tracks) <= 5.0 / run.n_tracks + 1e-12
+        assert sc[f'E_{p}pct_best_az'] == pytest.approx(cb, rel=1e-6)
+    vp = M.vertical_phase_space(zc, v)
+    for key in ('sig_z', 'sig_zp', 'eps_z', 'eps_z_n', 'beta_z', 'alpha_z'):
+        assert sc[f'{key}_az'] == pytest.approx(vp[key], rel=1e-4, abs=1e-9), key
+    win, _ = M.energy_window_best_members(E, 0.02)
+    assert sc['eps_z_n_2pct_az'] == pytest.approx(M.vertical_phase_space(zc[win], v[win])['eps_z_n'], rel=1e-4)
+    assert sc['T'] == pytest.approx(run.info['final']['transmission']) and 'T_log' not in sc   # no turn log: unchanged
+    # a probe ahead of the start: the auto pass is turns - 1; an explicit pass is taken as given
+    sc45 = M.score_run(run, _cfg(readout_azimuth_deg=45.0))
+    ids45, E45, _, _ = expected(45.0, TURNS - 1)
+    assert sc45['az_pass'] == TURNS - 1 and sc45['n_az'] == len(ids45)
+    assert sc45['E_med_az'] == pytest.approx(np.median(E45), rel=1e-6)
+    sc3 = M.score_run(run, _cfg(readout_pass=3))
+    assert sc3['az_pass'] == 3 and sc3['E_med_az'] == pytest.approx(np.median(expected(0.0, 3)[1]), rel=1e-6)
+
+
+def test_vertical_phase_space_of_a_known_ellipse():
+    """An upright Gaussian ellipse in (z, z') of sigmas 2 mm and 3 mrad, rotated by alpha: the rms emittance is
+    their product, the normalised one beta gamma times it; Twiss beta and alpha come back."""
+    rng = np.random.default_rng(1)
+    z0, zp0 = rng.normal(0, 2e-3, 200_000), rng.normal(0, 3e-3, 200_000)
+    zp = zp0 - 0.5 * z0 / 2.0                                   # a shear: alpha > 0 (converging)
+    vxy = 2e7
+    v = np.column_stack([np.full(z0.size, vxy), np.zeros(z0.size), zp * vxy])
+    vp = M.vertical_phase_space(z0, v)
+    eps = np.sqrt(np.var(z0 * 1e3) * np.var(zp * 1e3) - np.cov(z0 * 1e3, zp * 1e3, bias=True)[0, 1] ** 2)
+    assert vp['eps_z'] == pytest.approx(eps, rel=1e-9) and eps == pytest.approx(6.0, rel=0.01)
+    b2 = np.sum(v * v, axis=1) / M.CLIGHT ** 2
+    assert vp['eps_z_n'] == pytest.approx(eps * np.mean(np.sqrt(b2 / (1 - b2))), rel=1e-3)
+    assert vp['beta_z'] == pytest.approx(vp['sig_z'] ** 2 / vp['eps_z']) and vp['alpha_z'] > 0
+    assert np.isnan(M.vertical_phase_space(z0[:2], v[:2])['eps_z'])
+
+
+def test_readout_guards_a_short_turn_log():
+    """A run whose turn log ended before its turns (a lost reference, the run on to its step budget) gets the
+    readout's transmission as T and I_final, the json's as T_log, and a note; a complete log changes nothing."""
+    run, _ = _readout_run(n_turns_logged=1)
+    sc = M.score_run(run, _cfg())
+    assert sc['turns_logged'] == 1 and sc['T_log'] == pytest.approx(run.info['final']['transmission'])
+    assert sc['T'] == sc['T_az'] and sc['I_final'] == pytest.approx(5.0 * sc['T_az'])
+    assert any('turn log ended' in s for s in sc['notes'])
+    assert sc['I_rad20'] <= sc['I_final'] + 1e-12
+    run, _ = _readout_run(n_turns_logged=TURNS)
+    sc = M.score_run(run, _cfg())
+    assert sc['T'] == pytest.approx(run.info['final']['transmission']) and 'T_log' not in sc
+    run.info['stop_at_target_energy'] = True                    # an energy stop ends the log early by design
+    run.info['final']['n_turns'] = 3
+    assert 'T_log' not in M.score_run(run, _cfg())
+    run.info['stop_at_target_energy'] = False                   # the tracker's fallback clock: a complete log, a note
+    run.info['final'].update(n_turns=TURNS, reference_lost={'step': 2500, 'turns_logged': 2, 'period_steps': 1000.0,
+                                                            'clock_steps': [3001, 4001, 5001, 6001]})
+    sc = M.score_run(run, _cfg())
+    assert 'T_log' not in sc and any('fallback clock' in s for s in sc['notes'])
+
+
+def test_crossing_velocity_cubic_and_chord():
+    """On a circle of 2 pi 4 / 1000 per record (the campaigns' records) the cubic through four records gives |v| to
+    < 1e-8, the chord is low by (omega dt)^2 / 24; at the ends of a track (no k - 1 or k + 2) and next to a dead
+    record it falls back to the chord."""
+    S, w, rr = 60, 2 * np.pi * 4 / 1000, 0.2
+    ang = w * np.arange(S) + 0.05
+    xyz = np.stack([rr * np.cos(ang), rr * np.sin(ang), np.zeros(S)], axis=1)[:, None, :].repeat(2, axis=1)
+    alive = np.ones((S, 2), bool)
+    alive[32, 1] = False                                       # record k + 2 of the second crossing
+    k, j, f = np.array([10, 30, 0, 58]), np.array([0, 1, 0, 0]), np.array([0.3, 0.5, 0.5, 0.5])
+    v = M.crossing_velocity(xyz, alive, np.arange(S), 1.0, k, j, f)
+    speed = np.linalg.norm(v, axis=1) / (rr * w)
+    chord = np.sin(w / 2) / (w / 2)
+    assert abs(speed[0] - 1) < 1e-8
+    np.testing.assert_allclose(speed[1:], chord, rtol=1e-12)
+    assert 1 - chord == pytest.approx(w ** 2 / 24, rel=1e-3)
+
+
+def test_energy_window_best_members_match_the_count():
+    rng = np.random.default_rng(4)
+    for _ in range(20):
+        e = np.concatenate([rng.normal(3.0, 0.03, rng.integers(5, 400)), rng.normal(2.9, 0.02, rng.integers(0, 300))])
+        for rel in (0.01, 0.02):
+            m, c = M.energy_window_best_members(e, rel)
+            nb, cb = M.energy_window_best(e, rel)
+            assert m.sum() == nb and c == cb
+            assert np.all(np.abs(e[m] - c) <= rel * c * (1 + 1e-12))
+    assert M.energy_window_best_members(np.zeros(0), 0.02)[0].size == 0
+
+
 def test_score_without_handoff_and_saving(tmp_path):
     """No hand-off mapping: the release-phase block is left out, the rest is scored; scores save as plain JSON."""
     run = _spiral_run(n=300, halo=0.1)

@@ -26,7 +26,7 @@ from collections import namedtuple
 import numpy as np
 
 from ..config import MachineConfig, get_dotted
-from ..kinematics import CLIGHT
+from ..kinematics import CLIGHT, kinetic_energy_mev
 from ..probes import beam_sense, crossing_direction, crossing_fraction, interpolate, start_pass
 from .objectives import METRICS, ScoreConfig
 
@@ -143,6 +143,22 @@ def energy_window_best(e, rel):
     k = int(np.argmax(hi - lo))
     c = 0.5 * (e[hi[k] - 1] / (1 + rel) + e[lo[k]] / (1 - rel))      # middle of the centres that hold these particles
     return int(hi[k] - lo[k]), float(c)
+
+
+def energy_window_best_members(e, rel):
+    """Which particles the best-placed +-rel window of ``energy_window_best`` holds: a mask (n,) of the energies e
+    (the same count, the same window) and the window's centre."""
+    e = np.asarray(e, dtype=float)
+    mask = np.zeros(e.size, dtype=bool)
+    if e.size == 0:
+        return mask, float('nan')
+    order = np.argsort(e, kind='stable')
+    es = e[order]
+    lo = np.searchsorted(es, es, 'left')
+    hi = np.searchsorted(es, es * (1 + rel) / (1 - rel), 'right')
+    k = int(np.argmax(hi - lo))
+    mask[order[lo[k]:hi[k]]] = True
+    return mask, float(0.5 * (es[hi[k] - 1] / (1 + rel) + es[lo[k]] / (1 - rel)))
 
 
 def energy_metrics(e, n_tracks, i0, last_xyz, windows):
@@ -500,7 +516,8 @@ def probe_crossings(xyz, alive, steps, dt_step, sense, angle_deg, forward_only=T
     linearly interpolated; the pass number counts from the particle's own start (pass 1 when it starts already past the
     probe) and every crossing, forward or back, increments it. Returns j (track index), pass, R, z [mm], t [s] (t0 +
     the time since step 0) of the forward crossings; with forward_only False of all crossings, plus direction (+1 /
-    -1), xyz [m], v [m/s] (chord over the record interval) and step (the record after the crossing)."""
+    -1), xyz [m], v [m/s] (chord over the record interval), step (the record after the crossing), k (the index of
+    the record before it) and f (its fraction of the record interval; ``crossing_velocity`` takes k, j and f)."""
     th = np.deg2rad(angle_deg)
     nrm, along = np.array([-np.sin(th), np.cos(th)]), np.array([np.cos(th), np.sin(th)])
     s = xyz[..., 0] * nrm[0] + xyz[..., 1] * nrm[1]
@@ -525,7 +542,120 @@ def probe_crossings(xyz, alive, steps, dt_step, sense, angle_deg, forward_only=T
         fw = direction > 0
         return {key: v[fw] for key, v in out.items()}
     out.update(direction=direction, xyz=rc, v=(xyz[k + 1, j] - xyz[k, j]) / (ds * dt_step)[:, None],
-               step=np.asarray(steps)[k + 1])
+               step=np.asarray(steps)[k + 1], k=k, f=f)
+    return out
+
+
+def crossing_velocity(xyz, alive, steps, dt_step, k, j, f, r_max=np.inf, z_max=np.inf):
+    """Velocities (m, 3) [m/s] of tracks j at crossings the fractions f into the record intervals [k, k + 1]
+    (``probe_crossings``): the derivative of the cubic through the records k - 1 .. k + 2 where all four are live,
+    inside r < r_max and |z| < z_max (a particle lost at the wall is frozen where it left) and equally spaced -
+    on a circle of omega dt per record interval its |v| is good to ~(omega dt)^4, 1e-8 at 4 of 1000 steps per turn -
+    else the chord over the record interval, the mean velocity between the two records, whose |v| is low by
+    (omega dt)^2 / 24 (3e-5 there; 5e-5 in the energy)."""
+    k, j, u = np.asarray(k), np.asarray(j), np.asarray(f, dtype=float)
+    steps = np.asarray(steps)
+    S = len(steps)
+    h = (steps[k + 1] - steps[k]).astype(float)
+    v = (xyz[k + 1, j] - xyz[k, j]) / (h * dt_step)[:, None]
+    km, kp = np.clip(k - 1, 0, S - 1), np.clip(k + 2, 0, S - 1)
+    ok = (k >= 1) & (k + 2 <= S - 1) & alive[km, j] & alive[kp, j]
+    ok &= (steps[k] - steps[km] == h) & (steps[kp] - steps[k + 1] == h)
+    for kk in (km, k, k + 1, kp):
+        p = xyz[kk, j]
+        ok &= (np.hypot(p[:, 0], p[:, 1]) < r_max) & (np.abs(p[:, 2]) < z_max)
+    if np.any(ok):
+        uo = u[ok][:, None]
+        w = (-(3 * uo ** 2 - 6 * uo + 2) / 6, (3 * uo ** 2 - 4 * uo - 1) / 2,     # Lagrange cubic on nodes -1, 0, 1, 2:
+             -(3 * uo ** 2 - 2 * uo - 2) / 2, (3 * uo ** 2 - 1) / 6)            # d/du of its weights at u
+        jo = j[ok]
+        d = sum(wi * xyz[kk[ok], jo] for wi, kk in zip(w, (km, k, k + 1, kp)))
+        v[ok] = d / (h[ok] * dt_step)[:, None]
+    return v
+
+
+def vertical_phase_space(z_m, v):
+    """Vertical rms phase space of particles at heights z (n,) [m] with velocities v (n, 3) [m/s], z' = v_z / |v_xy|
+    (the hand-off files' convention): sig_z [mm] and sig_zp [mrad] (rms about the mean), z_p95 [mm] (95 % of |z|,
+    about the median plane: what an aperture sees), eps_z [mm mrad] the rms emittance sqrt(det cov(z, z')), eps_z_n
+    [mm mrad] the normalised one sqrt(det cov(z, beta gamma z')) with each particle's own beta gamma, and the Twiss
+    beta_z [m] and alpha_z of cov(z, z'). NaN for fewer than 3 particles."""
+    keys = ('sig_z', 'sig_zp', 'z_p95', 'eps_z', 'eps_z_n', 'beta_z', 'alpha_z')
+    z = 1e3 * np.asarray(z_m, dtype=float)
+    if z.size < 3:
+        return dict.fromkeys(keys, float('nan'))
+    v = np.asarray(v, dtype=float)
+    zp = 1e3 * v[:, 2] / np.hypot(v[:, 0], v[:, 1])
+    b2 = np.sum(v * v, axis=1) / CLIGHT ** 2
+    bg = np.sqrt(b2 / (1.0 - b2))
+    C = np.cov(np.vstack([z, zp]), bias=True)
+    Cn = np.cov(np.vstack([z, bg * zp]), bias=True)
+    eps = float(np.sqrt(max(C[0, 0] * C[1, 1] - C[0, 1] ** 2, 0.0)))
+    eps_n = float(np.sqrt(max(Cn[0, 0] * Cn[1, 1] - Cn[0, 1] ** 2, 0.0)))
+    return {'sig_z': float(np.sqrt(C[0, 0])), 'sig_zp': float(np.sqrt(C[1, 1])),
+            'z_p95': float(np.quantile(np.abs(z), 0.95)), 'eps_z': eps, 'eps_z_n': eps_n,
+            'beta_z': float(C[0, 0] / eps) if eps > 0 else float('nan'),
+            'alpha_z': float(-C[0, 1] / eps) if eps > 0 else float('nan')}
+
+
+def readout_pass_auto(xyz, alive, sense, angle_deg, turns):
+    """The pass at the probe at angle_deg [deg] that the bunch crosses last before the end of its `turns`
+    revolutions: turns when it starts past the probe (``probes.start_pass`` 1 for most of its particles: the probe's
+    crossings are then at its start azimuth + 360 k minus a little), else turns - 1."""
+    N = alive.shape[1]
+    first = np.argmax(alive, axis=0)
+    r0 = xyz[first, np.arange(N), :2]
+    sp = start_pass(np.arctan2(r0[:, 1], r0[:, 0]), angle_deg, sense)
+    return int(turns) - 1 + int(np.mean(sp) >= 0.5)
+
+
+def readout_metrics(xyz, alive, steps, surv, sense, k, cfg, n_tracks, turns, spt, n_steps):
+    """The beam at one fixed place, whatever step the run stopped at: every forward crossing of the virtual probe at
+    cfg.readout_azimuth_deg on pass cfg.readout_pass (0: ``readout_pass_auto`` of the run's turns; the probes'
+    numbering, the same absolute turn for every particle). Every key ends in _az: az_deg, az_pass, n_az, T_az (the
+    share of the tracked bunch crossing), I_final_az = T_az x I0, az_cover (the share of the run's final survivors
+    among them: 1 when the readout sees the whole surviving beam), az_margin_steps (steps from the latest crossing to
+    the run's end); the energy keys of ``energy_metrics`` of the crossers (E_med_az, dE_E_robust_az, I_2pct_best_az,
+    ...; R_az their mean radius [mm]) with the velocity of ``crossing_velocity``; their vertical phase space
+    (``vertical_phase_space``: sig_z_az, z_p95_az, eps_z_az, eps_z_n_az, ...) and that of the particles in the
+    best-placed +-cfg.readout_window window (sig_z_<p>pct_az, z_p95_<p>pct_az, eps_z_<p>pct_az, eps_z_n_<p>pct_az).
+    The readout azimuth should be free of RF field and behind the bunch's start by more than its phase spread, so
+    that every survivor crosses before the stop (az_cover 1)."""
+    A = float(cfg.readout_azimuth_deg)
+    P = int(cfg.readout_pass) if int(cfg.readout_pass) > 0 else readout_pass_auto(xyz, alive, sense, A, turns)
+    dt_step = 1.0 / k['f_rev'] / spt
+    pr = probe_crossings(xyz, alive, steps, dt_step, sense, A, forward_only=False)
+    sel = np.flatnonzero((pr['direction'] > 0) & (pr['pass'] == P))
+    j = pr['j'][sel]
+    if len(np.unique(j)) != len(j):
+        raise RuntimeError(f"readout at {A:g} deg pass {P}: a particle crosses forward twice on one pass")
+    n = len(j)
+    I0 = k['I0']
+    si = np.flatnonzero(surv)
+    out = {'az_deg': A, 'az_pass': P, 'n_az': int(n), 'T_az': n / n_tracks, 'I_final_az': I0 * n / n_tracks,
+           'az_cover': float(np.mean(np.isin(si, j))) if len(si) else float('nan'),
+           'az_margin_steps': int(n_steps - pr['step'][sel].max()) if n else -1}
+    rel = float(cfg.readout_window)
+    tag = f"{100 * rel:g}pct"
+    vkeys = ('sig_z', 'z_p95', 'eps_z', 'eps_z_n')
+    if n < 3:
+        nan = float('nan')
+        for p in (f"{100 * w:g}" for w in cfg.energy_windows):
+            out.update({f'I_{p}pct_az': 0.0, f'I_{p}pct_best_az': 0.0, f'E_{p}pct_best_az': nan})
+        out.update({f'{key}_az': nan for key in ('E_med', 'E_mean', 'E_min', 'dE_E', 'dE_E_robust', 'R', 'sigR_E')})
+        out.update({f'{key}_az': nan for key in vertical_phase_space(np.zeros(0), np.zeros((0, 3)))})
+        out.update({f'{key}_{tag}_az': nan for key in vkeys})
+        return out
+    v = crossing_velocity(xyz, alive, steps, dt_step, pr['k'][sel], j, pr['f'][sel], k['r_max'], k['z_max'])
+    E = kinetic_energy_mev(v, k['mass_mev'])
+    rc = pr['xyz'][sel]
+    em = energy_metrics(E, n_tracks, I0, rc, cfg.energy_windows)
+    em['R'] = em.pop('R_last')
+    out.update({f'{key}_az': val for key, val in em.items()})
+    out.update({f'{key}_az': val for key, val in vertical_phase_space(rc[:, 2], v).items()})
+    win, _ = energy_window_best_members(E, rel)
+    vw = vertical_phase_space(rc[win, 2], v[win])
+    out.update({f'{key}_{tag}_az': vw[key] for key in vkeys})
     return out
 
 
@@ -831,6 +961,12 @@ def score_run(run, cfg=None):
       energy    E_med, E_mean, E_min, dE_E, dE_E_robust, R_last, sigR_E, I_<p>pct, I_<p>pct_best, E_<p>pct_best
                 (energy_metrics); r_rms_last, r_rms_E, r_rms_rest, dR_dE, corr_r_lag, corr_E_lag (radial_width_split);
                 losses = share of the tracked bunch per loss-turn class
+      readout   (``readout_metrics``) the beam at a fixed azimuth and pass, independent of the stop step: az_deg,
+                az_pass, n_az, T_az, I_final_az, az_cover, az_margin_steps, the energy keys with the suffix _az,
+                the vertical phase space (sig_z_az, z_p95_az, eps_z_az, eps_z_n_az, ...) of all crossers and of the
+                best-placed readout_window (eps_z_n_2pct_az, ...); turns_logged (the json's turn count). When the
+                turn log ended before the run's turns (a lost reference before the tracker's fallback clock), T and
+                I_final are the readout's, the json's transmission is T_log, and a note says so
       release   (with the hand-off phases) acc<L>_width/_lo/_hi/_ceiling, W_eff, survival_curve, S30, S30_40
                 (acceptance); slope, lag_rms, release_rms_surv (compression from the final lag); release_bins,
                 E_peak_phase, E_peak (release_budget); band<q>_*, surv_vs_z, surv_vs_zp (handoff_survival)
@@ -886,6 +1022,38 @@ def score_run(run, cfg=None):
     lost_turn = np.where(surv, np.nan, (loss - run.birth_step) / spt)
     res['losses'] = {'turn_edges': [float(x) for x in cfg.loss_turn_edges],
                      'share': loss_turn_shares(lost_turn, cfg.loss_turn_edges)}
+
+    # --- fixed-azimuth readout; a run whose turn log ended early gets the readout's transmission
+    turns_req = int(run.info.get('turns') or n_steps // spt)
+    res.update(readout_metrics(xyz, alive, steps, surv, sense, k, cfg, N, turns_req, spt, n_steps))
+    guard_notes = []
+    n_log = fj.get('n_turns')
+    res['turns_logged'] = int(n_log) if n_log is not None else None
+    if (not run.ghost_run and 'transmission' in fj and n_log is not None and int(n_log) < turns_req
+            and (not run.info.get('stop_at_target_energy', False) or n_steps > (turns_req + 1) * spt)):
+        # The tracker logs a turn at each crossing of the reference particle's launch azimuth; a run whose
+        # reference was lost (before the fallback clock of accelerated_orbit_finder.track_with_rf) logged no
+        # further turn and ran on to its step budget: its json transmission is the survival at the last logged
+        # turn, its final states are turns later.
+        T_new = res['T_az'] if res['n_az'] else nS / N
+        res.update(T_log=T, T=T_new, I_final=T_new * I0)
+        guard_notes.append(
+            f"the turn log ended at turn {int(n_log)} of {turns_req} (reference lost, the run went on to step "
+            f"{n_steps}, {n_steps / spt:.2f} turns): T is the readout's T_az ({res['az_deg']:g} deg pass "
+            f"{res['az_pass']}), the json's {T:.4f} is T_log; the end-of-run keys (E_*, I_<p>pct*, ratio, valley_*, "
+            f"turns, ...) are at step {n_steps}, the *_az keys at the readout")
+    rl = fj.get('reference_lost')
+    if rl:
+        guard_notes.append(f"the reference left the boundary at step {rl.get('step')} after {rl.get('turns_logged')} "
+                           f"turns; the tracker counted the rest every {rl.get('period_steps')} steps (fallback "
+                           f"clock, steps {rl.get('clock_steps')})")
+    if res['n_az'] and res['az_cover'] < 1.0:
+        guard_notes.append(f"{100 * (1 - res['az_cover']):.2f} % of the final survivors did not cross the readout "
+                           f"({res['az_deg']:g} deg pass {res['az_pass']}, {res['az_margin_steps']} steps before "
+                           f"the end): the *_az keys miss them")
+    elif not res['n_az']:
+        guard_notes.append(f"no crossing of the readout ({res['az_deg']:g} deg pass {res['az_pass']}): the *_az keys "
+                           f"are empty")
 
     # --- acceptance and compression in release phase
     ph = run.of_tracks(run.release_phase_deg)
@@ -1014,7 +1182,7 @@ def score_run(run, cfg=None):
             seed = slit_settings(sl['radial'], refx.get(sl['radial'].get('az'), {}).get(sl['radial'].get('pass')))
             if seed is not None:
                 res['best_slit'][tb] = seed | {'valley': sl['radial']['valley'], 'I_final': res[f'I_rad{tb}']}
-    notes = list(run.notes)
+    notes = list(run.notes) + guard_notes
     if k['I0_from'] == 'handoff':
         notes.append("I0 is the hand-off file's transmitted current (the run records no space-charge current of its "
                      "own)" if np.isfinite(I0) else "the injected current is unknown (no space-charge current in the "

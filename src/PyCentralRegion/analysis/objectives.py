@@ -35,6 +35,14 @@ class ScoreConfig:
     min_survivors: int = 200             # fewer tracked survivors: the run is skipped
     # energy
     energy_windows: tuple = (0.05, 0.02, 0.01)     # +-rel windows: I_<p>pct (median-centred), I_<p>pct_best (best)
+    # fixed-azimuth readout (metrics.readout_metrics: the *_az keys), whatever step the run stopped at
+    readout_azimuth_deg: float = 0.0     # the virtual probe [deg]: free of RF field, after the last gap of the final
+    #                                      turn and behind the bunch's start by more than its phase spread (0: between
+    #                                      the dees of a 4-dee machine with dees at 45 + 90 k deg)
+    readout_pass: int = 0                # its pass (the probes' numbering); 0 = the last one before the run's turns
+    #                                      end: turns, or turns - 1 when the bunch starts behind the probe
+    readout_window: float = 0.02         # the best-placed +-window whose particles also get the vertical keys
+    #                                      (*_<p>pct_az): the extraction energy acceptance
     # acceptance in hand-off release phase
     phase_bin_deg: float = 5.0           # release-phase bins of the survival curve
     phase_range_deg: float = 120.0       # bins span +-range (beyond: the survival curve's end bins, not release_bins)
@@ -122,6 +130,24 @@ METRICS = {
     'S30': Metric('max', '1', "survival of the particles released within +-30 RF deg of the bunch centre"),
     'I_2pct': Metric('max', 'mA', "current within +-2 % of the median final energy"),
     'I_2pct_best': Metric('max', 'mA', "current in the best-placed +-2 % energy window (robust to a split spectrum)"),
+    # the fixed-azimuth readout (metrics.readout_metrics, ScoreConfig.readout_*): the beam at one virtual probe on
+    # the last pass of the run's turns. The end-of-run keys above take the last record, which depends on where the
+    # run stopped: there (2026-11-04) inside the next gap's field, so its energies are a mid-gap snapshot
+    'I_2pct_best_az': Metric('max', 'mA', "current in the best-placed +-2 % energy window at the readout (the "
+                                          "extraction energy acceptance)"),
+    'I_final_az': Metric('max', 'mA', "current crossing the readout: T_az x I0"),
+    'T_az': Metric('max', '1', "share of the tracked bunch crossing the readout"),
+    'I_2pct_az': Metric('max', 'mA', "current within +-2 % of the median energy at the readout"),
+    'I_1pct_best_az': Metric('max', 'mA', "current in the best-placed +-1 % energy window at the readout"),
+    'E_med_az': Metric('target', 'MeV', "median energy at the readout: reach the design energy"),
+    'E_2pct_best_az': Metric('target', 'MeV', "centre of the best-placed +-2 % window at the readout"),
+    'dE_E_robust_az': Metric('min', '1', "robust (MAD) relative energy spread at the readout"),
+    'eps_z_n_az': Metric('min', 'mm mrad', "normalised rms vertical emittance of the beam at the readout"),
+    'eps_z_n_2pct_az': Metric('min', 'mm mrad', "normalised rms vertical emittance of the particles in the "
+                                                "best-placed +-2 % window at the readout: the beam to extract"),
+    'sig_z_2pct_az': Metric('min', 'mm', "rms height of the particles in that window"),
+    'z_p95_az': Metric('min', 'mm', "95 % of |z| of the beam at the readout: what a vertical aperture sees"),
+    'az_cover': Metric('info', '1', "share of the final survivors that crossed the readout (1: it sees them all)"),
     # beam quality diagnostics
     'turn_valley_max': Metric('min', '1', "valley share at the worst probe"),
     'turn_sep': Metric('max', 'sigma', "turn separation over the mean turn width, mean over the probes"),

@@ -296,6 +296,15 @@ def space_charge_kick(tc, cells, every, current_ma, f_rf):
                            kick_z=True, verbose=True)
 
 
+def final_transmission(alive, stop, n):
+    """A bunch run's transmission: the alive count of its last logged turn over the n particles (alive: one count
+    per logged turn), 0 when it ended because no real particle was left (stop 'beam_lost' / 'all_lost',
+    accelerated_orbit_finder.track_with_rf's last_stop): the turns the beam did not reach would have counted 0."""
+    if not alive or stop in ('beam_lost', 'all_lost'):
+        return 0.0
+    return alive[-1] / n
+
+
 def _summary_of(run):
     if run is None:
         return None
@@ -487,6 +496,8 @@ class BunchTracker:
             slit_rec['n_start_inside'] = int(np.count_nonzero(slit(r0)))
         ts = res.turn_statistics
         alive = [int(t.n_active) for t in ts]
+        stop = res.metadata.get('stop')
+        transmission = final_transmission(alive, stop, bunch.numpart)
         out = {'phase': ph, 'n': int(bunch.numpart), 'n_turns': int(res.n_turns), 'sc': sc_kick is not None,
                'current_ma': i_ma, 'alive': alive, 'e_mean': [float(t.mean_energy_mev) for t in ts],
                'e_std': [float(t.std_energy_mev) for t in ts], 'std_r': [float(t.std_r) for t in ts],
@@ -497,7 +508,12 @@ class BunchTracker:
                'n_lost_metal': int(len(hits)), 'n_start_in_metal': n_start_metal,
                'hits': hits, 'hits_z': hits_z, 'time_s': time.time() - t1,
                'final_energy_mev': float(res.final_energy_mev),
-               'transmission': alive[-1] / bunch.numpart if alive else 0.0,
+               'transmission': transmission,
+               # why the run ended ('turns', 'energy', 'beam_lost', 'all_lost', 'budget'), whether its step budget
+               # ran out, and - when the virtual reference left the boundary - where, after how many logged turns
+               # and with what period the fallback clock counted the rest (accelerated_orbit_finder.track_with_rf)
+               'stop': stop, 'budget_exhausted': bool(res.metadata.get('budget_exhausted', False)),
+               'reference_lost': res.metadata.get('reference_lost'),
                'space_charge': res.metadata.get('space_charge'),
                'fast_path': res.metadata.get('fast_path')}          # whether the compiled kernel ran, else why not
         if out['space_charge'] is not None:

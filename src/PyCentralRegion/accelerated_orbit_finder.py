@@ -604,6 +604,10 @@ class AcceleratedOrbitFinder:
         # TURN_BUDGET_MARGIN), and the per-block sums of squares of the
         # least-squares residual, so weight tuning can be observational.
         self.last_budget_exhausted = False
+        # set by track_with_rf when the virtual reference was lost and its
+        # fallback turn clock took over (None: the reference survived)
+        self.last_reference_lost = None
+        self.last_stop = None
         self.last_resid_blocks = {}
         self.best_resid_blocks = {}
         self._checkpoint_inited = False
@@ -1032,6 +1036,7 @@ class AcceleratedOrbitFinder:
         """
         n_ref = self._n_ref
         self.last_budget_exhausted = False
+        self.last_reference_lost = None
 
         if section_angle is None:
             x0 = pd_init.x_vec[0]
@@ -1054,6 +1059,21 @@ class AcceleratedOrbitFinder:
         turn_counter = [0]
         energy_reached = [False]
         n_recorded = [0]
+        stop_reason = [None]           # 'turns' | 'energy' | 'beam_lost' (callback); see last_stop
+        # Fallback turn clock for a LOST virtual reference. The reference is
+        # exempt from the metal test but not from the r_max / z_max boundary;
+        # without it no crossing is ever logged again: the per-turn record
+        # (and the run's 'transmission') ends at its last logged crossing
+        # while the run spends its whole step budget (max_turns +
+        # TURN_BUDGET_MARGIN turns), so the final states are turns later than
+        # the "final" turn. Once the reference is gone, a turn
+        # is counted every `period` steps after its last logged crossing (its
+        # launch when none was logged): period = the mean of its completed
+        # turns, the nominal steps_per_turn when it completed none. A
+        # reference that is merely not yet born (timed release) never starts
+        # the clock. Runs whose reference survives are not changed.
+        ref_clock = {'launch': None, 'lost': None, 'next': None, 'period': None,
+                     'turns_logged': 0, 'steps': []}
 
         # See TURN_BUDGET_MARGIN: the abort below fires the moment the last turn
         # is logged, so the margin is only ever consumed when actually needed.
@@ -1115,6 +1135,7 @@ class AcceleratedOrbitFinder:
                     # Physical beam gone (none alive, none still to be born);
                     # the virtual reference alone would keep logging turns
                     # over an empty bunch.
+                    stop_reason[0] = 'beam_lost'
                     return True
             else:
                 real = active
@@ -1148,6 +1169,11 @@ class AcceleratedOrbitFinder:
             n_recorded[0] = step + 1
 
             if active[0]:
+                if ref_clock['launch'] is None:
+                    # the state before its first active step is its launch,
+                    # on the section: a crossing logged at step s happened
+                    # during step s, so turn k spans turn_ids[k] - launch
+                    ref_clock['launch'] = step - 1
                 # step 0 compares the post-step position with itself, so no
                 # crossing can be logged there; that is what keeps a launch
                 # exactly on the section from registering immediately.
@@ -1179,15 +1205,49 @@ class AcceleratedOrbitFinder:
 
                     if poincare.crossings[-1].energy_mev >= self.target_energy_mev:
                         energy_reached[0] = True
+                        stop_reason[0] = 'energy'
                         if self.verbose:
                             print(f"    Reached target energy at turn {turn_counter[0]}")
                         return True
                     if turn_counter[0] >= max_turns:
+                        stop_reason[0] = 'turns'
                         if self.verbose:
                             print(f"    Reached max turns: {turn_counter[0]}")
                         return True
 
                 callback.r_prev = r_array[0].copy()
+            elif n_ref and ref_clock['launch'] is not None:
+                # The virtual reference was born and is now gone: the fallback
+                # clock counts the remaining turns (see ref_clock above).
+                if ref_clock['next'] is None:
+                    k = len(turn_ids)
+                    period = ((turn_ids[-1] - ref_clock['launch']) / k if k
+                              else float(self.steps_per_turn))
+                    ref_clock.update(lost=step, period=period, turns_logged=k,
+                                     next=(turn_ids[-1] if k else ref_clock['launch']) + period)
+                    if self.verbose:
+                        print(f"    Reference lost at step {step} after {k} turns: "
+                              f"turns now counted every {period:.1f} steps")
+                if step >= ref_clock['next']:
+                    beam_stats_collector.record(step, r_array[real], v_array[real], t)
+                    beam_stats_collector.increment_turn()
+                    if self.is_multiparticle:
+                        last_turn_v[0] = np.array(v_array[real], dtype=float, copy=True)
+                    ref_clock['steps'].append(step)
+                    ref_clock['next'] += ref_clock['period']
+                    turn_counter[0] += 1
+                    # no reference energy any more: the bunch mean stands in
+                    if beam_stats_collector.turn_stats[-1].mean_energy_mev >= self.target_energy_mev:
+                        energy_reached[0] = True
+                        stop_reason[0] = 'energy'
+                        if self.verbose:
+                            print(f"    Bunch mean reached the target energy at turn {turn_counter[0]}")
+                        return True
+                    if turn_counter[0] >= max_turns:
+                        stop_reason[0] = 'turns'
+                        if self.verbose:
+                            print(f"    Reached max turns on the fallback clock: {turn_counter[0]}")
+                        return True
             return False
 
         fast = None
@@ -1227,6 +1287,9 @@ class AcceleratedOrbitFinder:
                     last_turn_v[0] = None
                     turn_counter[0] = 0
                     energy_reached[0] = False
+                    ref_clock.update(launch=None, lost=None, next=None, period=None,
+                                     turns_logged=0, steps=[])
+                    stop_reason[0] = None
                     poincare.crossings.clear()
                     poincare._armed = poincare.arm_angle <= 0.0
                     poincare._azimuth_travelled = 0.0
@@ -1260,6 +1323,23 @@ class AcceleratedOrbitFinder:
         # turn survived a 7272-evaluation optimization.
         self.last_budget_exhausted = (result.metadata.get('termination') is None
                                       and turn_counter[0] < max_turns)
+        # why the run ended: 'turns' / 'energy' (logged turn), 'beam_lost' (no
+        # real particle left, none to be born), 'all_lost' (the engine found
+        # nothing active), 'budget' (step budget spent)
+        term = result.metadata.get('termination')
+        self.last_stop = (stop_reason[0] if stop_reason[0] is not None
+                          else 'all_lost' if term == 'all_lost'
+                          else 'budget' if term is None else str(term))
+        if ref_clock['lost'] is not None:
+            self.last_reference_lost = {
+                'step': int(ref_clock['lost']),
+                'launch_step': int(ref_clock['launch']),
+                'turns_logged': int(ref_clock['turns_logged']),
+                'period_steps': float(ref_clock['period']),
+                'clock_steps': [int(s) for s in ref_clock['steps']]}
+            if self.verbose:
+                print(f"    WARNING: reference lost at step {ref_clock['lost']}; "
+                      f"{len(ref_clock['steps'])} turns counted on the fallback clock")
         if self.last_budget_exhausted and self.verbose:
             print(f"    WARNING: step budget exhausted after {turn_counter[0]}/"
                   f"{max_turns} turns ({n_steps} steps) - raise "
@@ -1813,6 +1893,11 @@ class AcceleratedOrbitFinder:
             # trajectory is the centroid orbit rather than a survivor mean.
             'reference_centroid': bool(self._n_ref),
             'budget_exhausted': bool(self.last_budget_exhausted),
+            # the virtual reference left the boundary and the fallback turn
+            # clock ended the run (step, turns it logged, period, clock steps)
+            'reference_lost': (dict(self.last_reference_lost)
+                               if self.last_reference_lost else None),
+            'stop': self.last_stop,
             'resid_blocks_best': dict(self.best_resid_blocks),
             # staggered launch bookkeeping (mode, clock start, reference birth step)
             'launch': dict(self.last_launch) if self.last_launch else None,

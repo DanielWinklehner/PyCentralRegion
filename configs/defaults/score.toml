@@ -21,6 +21,16 @@ min_survivors = 200         # fewer tracked survivors: the run is skipped
 # final energy
 energy_windows = [0.05, 0.02, 0.01]   # +-rel windows: I_<p>pct around the median, I_<p>pct_best best-placed
 
+# fixed-azimuth readout: the beam at one virtual probe and pass, whatever step the run stopped at (the *_az keys;
+# the end-of-run keys take the last record, which can sit inside a gap's field)
+readout_azimuth_deg = 0.0   # the probe [deg]: free of RF field, after the last gap of the final turn and behind the
+                            # bunch's start by more than its phase spread, so every survivor crosses it before the
+                            # stop (az_cover 1); 0: between the dees of a 4-dee machine with dees at 45 + 90 k deg
+readout_pass = 0            # its pass, in the probes' numbering; 0 = the last one before the run's turns end
+                            # (turns, or turns - 1 when the bunch starts behind the probe)
+readout_window = 0.02       # the best-placed +-window whose particles also get the vertical keys (*_2pct_az): the
+                            # extraction energy acceptance
+
 # acceptance in hand-off release phase
 phase_bin_deg = 5.0         # bins of the survival curve
 phase_range_deg = 120.0     # the bins span +-range (phases beyond: in the survival curve's end bins, not in
