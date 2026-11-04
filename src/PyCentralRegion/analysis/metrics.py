@@ -134,7 +134,12 @@ def energy_window_best(e, rel):
     """The best-placed +-rel window: the most particles any window [c (1 - rel), c (1 + rel)] holds, and its centre c.
     An optimal window can be moved up until its lower edge sits on a particle without losing any, so trying every
     energy as the lower edge is exact (the design deck's scan of c on a 4000-point grid finds at most this). Unlike
-    the median-centred window it does not fall into the trough of a two-peaked spectrum."""
+    the median-centred window it does not fall into the trough of a two-peaked spectrum.
+
+    Ties: when several sets of particles fill an optimal window (common: 7 of 12 checked runs, up to 9 sets), the
+    lowest-energy set is taken (the first lower edge). The count does not depend on the choice; the centre, and what
+    is measured on the members (``energy_window_best_members``: the window's vertical emittance moves by up to 1.5 %
+    between tied sets), do."""
     e = np.sort(np.asarray(e, dtype=float))
     if e.size == 0:
         return 0, float('nan')
@@ -147,7 +152,7 @@ def energy_window_best(e, rel):
 
 def energy_window_best_members(e, rel):
     """Which particles the best-placed +-rel window of ``energy_window_best`` holds: a mask (n,) of the energies e
-    (the same count, the same window) and the window's centre."""
+    (the same count, the same window, the same lowest-energy set among tied ones) and the window's centre."""
     e = np.asarray(e, dtype=float)
     mask = np.zeros(e.size, dtype=bool)
     if e.size == 0:
@@ -552,7 +557,8 @@ def crossing_velocity(xyz, alive, steps, dt_step, k, j, f, r_max=np.inf, z_max=n
     inside r < r_max and |z| < z_max (a particle lost at the wall is frozen where it left) and equally spaced -
     on a circle of omega dt per record interval its |v| is good to ~(omega dt)^4, 1e-8 at 4 of 1000 steps per turn -
     else the chord over the record interval, the mean velocity between the two records, whose |v| is low by
-    (omega dt)^2 / 24 (3e-5 there; 5e-5 in the energy)."""
+    (omega dt)^2 / 24 with omega the local bending rate: 3e-5 at the turn's mean curvature, about 7e-5 (1.4e-4 in the
+    energy) at 0 deg in the HCHC-1.5 runs, where the orbit bends 1.6 times harder."""
     k, j, u = np.asarray(k), np.asarray(j), np.asarray(f, dtype=float)
     steps = np.asarray(steps)
     S = len(steps)
