@@ -451,6 +451,8 @@ class TrackConfig:
     #                                  | 'mesh' (the model's triangles, GPU, no fast path)
     extra_posts_mm: tuple = ()       # full-height grounded posts [[x, y, r], ...] mm, obstacle test only
     extra_boxes_mm: tuple = ()       # full-height grounded boxes [[xmin, xmax, ymin, ymax], ...] mm, obstacle test only
+    extra_jaws_mm: tuple = ()        # vertical jaw pairs [[x, y, r, z_half], ...] mm: metal at |z| >= z_half over the disc,
+    #                                  obstacle test only
 
 
 @dataclasses.dataclass

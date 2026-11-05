@@ -178,6 +178,25 @@ def extra_columns(xs, tc, info):
     return mask
 
 
+def extra_jaws(xs, tc, info):
+    """The vertical jaw pairs (x, y, r, z_half) [mm] of [track] on the x-y nodes ``xs`` of a metal test: the (n, n) array
+    of the half apertures [m], inf off the jaws, the smallest where jaws overlap; None without any. The metal test
+    makes those columns metal at |z| >= z_half."""
+    if not tc.extra_jaws_mm:
+        return None
+    z_half = np.full((len(xs), len(xs)), np.inf)
+    for (px, py, pr, zh) in ([v * 1e-3 for v in q] for q in tc.extra_jaws_mm):
+        if zh <= 0.0:
+            raise ConfigError(f"track.extra_jaws_mm: half aperture {zh * 1e3} mm")
+        disc = np.hypot(xs[:, None] - px, xs[None, :] - py) <= pr
+        z_half[disc] = np.minimum(z_half[disc], zh)
+    say(f"[metal] {len(tc.extra_jaws_mm)} vertical jaw discs, half apertures "
+        f"{min(q[3] for q in tc.extra_jaws_mm):.2f}..{max(q[3] for q in tc.extra_jaws_mm):.2f} mm: "
+        f"{int(np.isfinite(z_half).sum())} raster columns")
+    info['extra_jaws'] = [list(q) for q in tc.extra_jaws_mm]
+    return z_half
+
+
 def slit_raster(sl, r_center_m, z_half_m, h=SLIT_H_M):
     """The jaws of the [slit] ``sl`` centred at radius ``r_center_m``: a nearest-node raster of spacing ``h`` over their
     bounding box (``fields3d.Raster3D``), full height (z nodes -z_half_m, 0, +z_half_m). Along the ray (u) the jaws span
@@ -209,8 +228,8 @@ def load_fields(path, tc, fc):
         raise NotImplementedError(f"{path}: a cache with an RF-cavity map (BEM + map blend) is not supported")
     info = dict(d['info'])
     if tc.obstacles == 'mesh':
-        if tc.extra_posts_mm or tc.extra_boxes_mm:
-            raise ConfigError("track.extra_posts_mm / extra_boxes_mm need track.obstacles = 'columns' or 'raster'")
+        if tc.extra_posts_mm or tc.extra_boxes_mm or tc.extra_jaws_mm:
+            raise ConfigError("track.extra_posts_mm / extra_boxes_mm / extra_jaws_mm need track.obstacles = 'columns' or 'raster'")
         from .electrodes3d import MeshObstacles
         stack = MeshObstacles(d['model3d'])
         say(f"[metal] mesh obstacles: BVH over {stack.n_tri:,} triangles")
@@ -223,6 +242,9 @@ def load_fields(path, tc, fc):
         mask = extra_columns(stack.xs, tc, info)
         if mask is not None:
             stack = stack.with_full_height(mask)
+        z_half = extra_jaws(stack.xs, tc, info)
+        if z_half is not None:
+            stack = stack.with_jaws(z_half)
     elif tc.obstacles == 'raster':
         st = d['stack']
         if st.get('kind') != 'raster' or 'grid' not in st:
@@ -235,6 +257,10 @@ def load_fields(path, tc, fc):
         if mask is not None:
             grid = grid.copy()
             grid[mask, :] = True
+        z_half = extra_jaws(st['xs'], tc, info)
+        if z_half is not None:
+            grid = grid.copy()
+            grid |= np.abs(np.asarray(st['zs']))[None, None, :] >= z_half[:, :, None]
         stack = _raster_inside(grid, st['xs'], st['zs'])
     else:
         raise ConfigError(f"track.obstacles = {tc.obstacles!r}: 'columns', 'raster' or 'mesh'")

@@ -324,3 +324,38 @@ class ColumnObstacles:
         dst = starts[col[keep]] + (np.arange(len(self.lo))[keep] - self.starts[col[keep]])
         lo[dst], hi[dst] = self.lo[keep], self.hi[keep]
         return ColumnObstacles(starts, lo, hi, self.xs, name=name or self.name, info=self.info)
+
+    def with_jaws(self, z_half: np.ndarray, name: str = None) -> 'ColumnObstacles':
+        """A copy in which the columns with a finite half aperture in the (n, n) array ``z_half`` [m] are also metal at
+        |z| >= z_half (vertical jaw pairs put into the test); their other metal stays, merged with the jaws."""
+        n = len(self.xs)
+        z_half = np.asarray(z_half, dtype=float)
+        if z_half.shape != (n, n):
+            raise ValueError(f"with_jaws: z_half {z_half.shape} for a {n}x{n} grid")
+        zh = z_half.ravel()
+        cols = np.flatnonzero(np.isfinite(zh))
+        counts = np.diff(self.starts)
+        new_counts = counts.copy()
+        merged = {}
+        for c in cols:
+            s, e = self.starts[c], self.starts[c + 1]
+            iv = sorted(list(zip(self.lo[s:e], self.hi[s:e])) + [(-np.inf, -zh[c]), (zh[c], np.inf)])
+            m = [list(iv[0])]
+            for a, b in iv[1:]:
+                if a <= m[-1][1]:
+                    m[-1][1] = max(m[-1][1], b)
+                else:
+                    m.append([a, b])
+            merged[int(c)] = m
+            new_counts[c] = len(m)
+        starts = np.concatenate([[0], np.cumsum(new_counts)]).astype(np.int64)
+        lo = np.empty(int(starts[-1]))
+        hi = np.empty(int(starts[-1]))
+        col = np.repeat(np.arange(n * n), counts)
+        keep = ~np.isfinite(zh[col])
+        dst = starts[col[keep]] + (np.arange(len(self.lo))[keep] - self.starts[col[keep]])
+        lo[dst], hi[dst] = self.lo[keep], self.hi[keep]
+        for c, m in merged.items():
+            for k, (a, b) in enumerate(m):
+                lo[starts[c] + k], hi[starts[c] + k] = a, b
+        return ColumnObstacles(starts, lo, hi, self.xs, name=name or self.name, info=self.info)
