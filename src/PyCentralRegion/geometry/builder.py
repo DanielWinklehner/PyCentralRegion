@@ -1743,6 +1743,38 @@ def _fuse_keeping(gmsh, owner: str, obj, tools, lost_of, n_apart: int = 0, tol: 
     return out
 
 
+def _block_points(q: dict) -> np.ndarray:
+    """Points a post or window block ``q`` must have filled once it is fused in, (x, y, z) [mm]: the centre of its
+    footprint and the outline pulled in 15 % towards it, at the block's mid-height. Not the centre alone: a block split at
+    a bend of the gap line is two overlapping pieces, and the centre of a piece that was dropped can lie in the piece that
+    stayed (gap 2 of evals 0008 and 0083 built that way; the volume check passes too, the other tools add metal). Of a
+    plate with a round hole, only the points clear of the hole."""
+    from matplotlib.path import Path as MplPath
+    c = np.asarray(q['corners'], dtype=float)
+    m = c.mean(axis=0)
+    p = np.vstack([m, m + 0.85 * (c - m)])
+    p = p[MplPath(c).contains_points(p)]                  # (a footprint that is not convex)
+    z = 0.5 * (float(q.get('z_lo', -q['half_height'])) + float(q.get('z_hi', q['half_height'])))
+    if q.get('kind') == 'aperture':
+        hc, n = np.asarray(q['hole_centre'], dtype=float), np.asarray(q['hole_axis'], dtype=float)
+        off = p - hc[:2]
+        side = off - np.outer(off @ n, n)                 # off the hole's axis in the plan
+        p = p[np.hypot(np.hypot(side[:, 0], side[:, 1]), z - hc[2]) > float(q['hole_r']) + 0.5]
+    return np.column_stack([p, np.full(len(p), z)])
+
+
+def _lost_blocks(gmsh, blocks, solids) -> list:
+    """The blocks with a point of _block_points outside all of ``solids`` (tags, synchronized), for _fuse_keeping's
+    ``lost_of``: each as its name, how many points and the first of them."""
+    lost = []
+    for q in blocks:
+        pts = _block_points(q)
+        out = [p for p in pts if not any(gmsh.model.isInside(3, t, [float(v) for v in p]) for t in solids)]
+        if out:
+            lost.append(f"{q['name']} ({out[0][0]:.2f}, {out[0][1]:.2f}, {out[0][2]:.2f}; {len(out)} of {len(pts)} points)")
+    return lost
+
+
 def _strip_orphans(gmsh, occ) -> int:
     """Delete every entity that is not part of some solid.
 
@@ -2451,22 +2483,9 @@ def _build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: 
                         raise RuntimeError(f"{q['name']}: the hole cut gave {len(v)} volumes")
                 tags.append(v[0])
 
-            def lost_of(solids):
-                """A union that meets near-coincident faces can drop a tool WITHOUT an error (only BOP alerts in the
-                log): every block's footprint centre at its mid-height must be inside the result."""
-                lost = []
-                for q in qs:
-                    if q.get('kind') == 'aperture':     # (its centre is the hole)
-                        continue
-                    c = np.asarray(q['corners'], dtype=float)
-                    xyz = [float(c[:, 0].mean()), float(c[:, 1].mean()),
-                           0.5 * (float(q.get('z_lo', -q['half_height'])) + float(q.get('z_hi', q['half_height'])))]
-                    if not any(gmsh.model.isInside(3, t, xyz) for t in solids):
-                        lost.append(f"{q['name']} ({xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f})")
-                return lost
-
             tol = (fuse_tol or {}).get(owner)
-            out = _fuse_keeping(gmsh, owner, [(3, t) for t in pieces[owner]], [(3, t) for t in tags], lost_of,
+            out = _fuse_keeping(gmsh, owner, [(3, t) for t in pieces[owner]], [(3, t) for t in tags],
+                                lambda solids, qs=qs: _lost_blocks(gmsh, qs, solids),
                                 sum(q.get('kind') == 'box' for q in qs), tol)
             pieces[owner] = [t for dd, t in out if dd == 3]
             say(f"fused {len(tags)} post(s) into {owner} -> {len(pieces[owner])} solid(s)"

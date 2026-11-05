@@ -8,6 +8,7 @@ import io
 import signal
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from PyCentralRegion import config as C
@@ -211,6 +212,69 @@ def test_a_fuse_that_must_keep_its_tools(monkeypatch):
     finally:
         monkeypatch.undo()
         gmsh.option.setNumber("Geometry.ToleranceBoolean", tol0)
+        gmsh.model.remove()
+        if started:
+            gmsh.finalize()
+
+
+def test_a_dropped_piece_is_found_with_its_centre_inside_the_other():
+    """A post split at a bend is two overlapping pieces. A fuse that drops one leaves its centre in metal when that lies in
+    the other piece (gap 2 of evals 0008 and 0083 built that way): the footprint's outline has to be in metal too. A window
+    block is tested at its own mid-height, a plate with a round hole only clear of the hole."""
+    B = pytest.importorskip('PyCentralRegion.geometry.builder')
+    gmsh = pytest.importorskip('gmsh')
+    started = not gmsh.isInitialized()
+    if started:
+        gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    gmsh.model.add("lost_blocks")
+    occ = gmsh.model.occ
+
+    def block(name, x0, x1, **kw):
+        return {'name': name, 'corners': [[x0, 0.0], [x1, 0.0], [x1, 10.0], [x0, 10.0]], 'half_height': 5.0, **kw}
+
+    def solid(x0, x1, z0=-5.0, dz=10.0):
+        return occ.addBox(x0, 0, z0, x1 - x0, 10, dz)
+
+    try:
+        stayed, dropped = block('stayed', 0.0, 20.0), block('dropped', 12.0, 24.0)       # the centre 18 lies in the other
+        assert 0.0 < B._block_points(dropped)[0, 0] - 12.0 < 8.0 and len(B._block_points(dropped)) == 5
+        assert (B._block_points(dropped)[:, 2] == 0.0).all()
+
+        only_one = solid(0.0, 20.0)
+        occ.synchronize()
+        assert B._lost_blocks(gmsh, [stayed], [only_one]) == []
+        assert B._lost_blocks(gmsh, [stayed, dropped], [only_one]) == ['dropped (23.10, 0.75, 0.00; 2 of 5 points)']   # 18 + 0.85 * 6, 5 - 0.85 * 5
+        assert B._lost_blocks(gmsh, [block('all gone', 50.0, 60.0)], [only_one]) == ['all gone (55.00, 5.00, 0.00; 5 of 5 points)']
+
+        both = occ.fuse([(3, solid(100.0, 120.0))], [(3, solid(112.0, 124.0))], removeObject=True, removeTool=True)[0][0][1]
+        occ.synchronize()
+        assert B._lost_blocks(gmsh, [block('a', 100.0, 120.0), block('b', 112.0, 124.0)], [both]) == []
+
+        up = solid(200.0, 210.0, z0=5.0, dz=10.0)                                        # above the opening, z 5 .. 15
+        occ.synchronize()
+        win = block('win', 200.0, 210.0, kind='window', z_lo=5.0, z_hi=15.0)
+        assert (B._block_points(win)[:, 2] == 10.0).all() and B._lost_blocks(gmsh, [win], [up]) == []
+        assert B._lost_blocks(gmsh, [block('win', 200.0, 210.0, kind='window', z_lo=-15.0, z_hi=-5.0)], [up]) == \
+            ['win (205.00, 5.00, -10.00; 5 of 5 points)']
+
+        def plate(half_chord):                                                           # centred on the hole, 10 mm deep
+            return block('plate', 320.0 - half_chord, 320.0 + half_chord, kind='aperture', z_lo=-15.0, z_hi=15.0,
+                         hole_centre=np.array([320.0, 0.0, 0.0]), hole_axis=np.array([0.0, 1.0]), hole_r=10.0)
+
+        holed = occ.cut([(3, occ.addBox(300.0, 0, -15.0, 40, 10, 30))], [(3, occ.addCylinder(320.0, -1.0, 0, 0, 12.0, 0, 10.0))],
+                        removeObject=True, removeTool=True)[0][0][1]
+        occ.synchronize()
+        assert B._block_points(plate(20.0)) == pytest.approx(np.array(
+            [[303.0, 0.75, 0.0], [337.0, 0.75, 0.0], [337.0, 9.25, 0.0], [303.0, 9.25, 0.0]]))  # the centre is the hole
+        assert B._lost_blocks(gmsh, [plate(20.0)], [holed]) == []
+        assert B._lost_blocks(gmsh, [plate(20.0)], [only_one]) == ['plate (303.00, 0.75, 0.00; 4 of 4 points)']
+        assert len(B._block_points(plate(11.0))) == 0 and B._lost_blocks(gmsh, [plate(11.0)], [only_one]) == []  # all hole
+
+        notch ={'name': 'L', 'half_height': 5.0, 'corners': [[0, 0], [10, 0], [10, 1], [1, 1], [1, 10], [0, 10]]}
+        p = B._block_points(notch)                                                       # not convex: only points on it
+        assert len(p) < 7 and all(x <= 10.0 and y <= 10.0 and (x <= 1.0 or y <= 1.0) for x, y, _ in p)
+    finally:
         gmsh.model.remove()
         if started:
             gmsh.finalize()
