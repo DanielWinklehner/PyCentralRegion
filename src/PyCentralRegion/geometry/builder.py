@@ -1696,6 +1696,53 @@ def _cut_removing(gmsh, obj, make_tool, what: str, say=None):
                        f"{'; '.join(tried)}) - the solid would be left whole")
 
 
+# A fuse goes wrong at the same tolerance, three ways (2026-11-05, posts fused into their electrodes; 12 of a batch's 65
+# builds): it drops tools with only BOP alerts in the log (mostly the two pieces of a block split at a bend of the gap
+# line), it throws BOPAlgo_AlertBuilderFailed, or every post's centre is inside and the electrode is broken all the same
+# (a dee in 3 solids, 2.29e6 mm^3 gone). A union that must keep its tools goes through _fuse_keeping; one that does not
+# count makes build_model start the model again from nothing, that owner's fuse at the next smaller tolerance. Unlike a
+# cut that did nothing, a failed fuse has consumed its input, and it cannot keep a copy to try again on: an occ.copy ahead
+# of a fuse changes the mesh of most models that build, even if the copy is removed before the fuse (a few triangles in
+# 32 of 36 models; the getMass calls here change none).
+class _FuseNotCounted(RuntimeError):
+    """A union that did not keep its tools; ``owner``'s fuse has to be made at a smaller boolean tolerance."""
+
+    def __init__(self, owner: str, why: str):
+        super().__init__(f"the fuse into {owner}: {why}")
+        self.owner, self.why = owner, why
+
+
+def _fuse_keeping(gmsh, owner: str, obj, tools, lost_of, n_apart: int = 0, tol: float = None):
+    """``occ.fuse(obj, tools)`` for a union that must keep all its tools, at boolean tolerance ``tol`` (None: as it is
+    set): obj and tools are OCC dim tags, both consumed. Returns the result's dim tags if the fuse counts: ``lost_of(
+    solids)`` (solid tags, after a synchronize) names no tool, it added metal but no more than the tools' whole volume
+    (a part of them may lie inside obj), and it left no more solids than obj had plus ``n_apart``, the tools meant to
+    stand apart from it. Otherwise, or if it throws, raises _FuseNotCounted."""
+    occ = gmsh.model.occ
+    v_obj, v_tool = _occ_mass(occ, obj), _occ_mass(occ, tools)
+    slack = 1e-6 * v_obj                                  # getMass integrates numerically
+    tol0 = float(gmsh.option.getNumber("Geometry.ToleranceBoolean"))
+    if tol is not None:
+        gmsh.option.setNumber("Geometry.ToleranceBoolean", tol)
+    try:
+        out, _ = occ.fuse(obj, tools, removeObject=True, removeTool=True)
+    except Exception as ex:                                           # BOPAlgo_AlertBuilderFailed, as a plain Exception
+        raise _FuseNotCounted(owner, str(ex)) from ex
+    finally:
+        if tol is not None:
+            gmsh.option.setNumber("Geometry.ToleranceBoolean", tol0)
+    solids = [e for e in out if e[0] == 3]
+    occ.synchronize()
+    lost = lost_of([s for _, s in solids])
+    if lost:
+        raise _FuseNotCounted(owner, f"LOST metal - outside every resulting solid: {', '.join(lost)}")
+    added = _occ_mass(occ, solids) - v_obj
+    if not (slack < added <= v_tool + slack and len(solids) <= len(obj) + n_apart):
+        raise _FuseNotCounted(owner, f"{len(solids)} solid(s) from {len(obj)}, {added / 1e3:.1f} cm^3 added by "
+                                     f"{v_tool / 1e3:.1f} cm^3 of tools")
+    return out
+
+
 def _strip_orphans(gmsh, occ) -> int:
     """Delete every entity that is not part of some solid.
 
@@ -2160,11 +2207,38 @@ def join_posts_to_end_walls(posts, rings: dict, polys: dict, verbose: bool = Tru
 # =====================================================================================================================
 # 12. the model in gmsh: footprints -> prisms -> hollowed -> the ground with the housing -> mesh sizes
 # =====================================================================================================================
-def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: bool = True, half: float = None,
-                wall_t: float = None, r_cut: float = None, lc: float = None, aperture=None, dummy_aperture=None,
-                lc_posts: float = None, lc_outer: float = None, r_fine: float = None, r_coarse: float = None):
+def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: bool = True, **kwargs):
+    """``_build_model`` (its arguments and its result), started again from nothing whenever a fuse of hardware into its
+    owner did not count, with that owner's fuse at the next smaller tolerance of FUZZY_FALLBACK_MM; a fuse that counts
+    at none of them raises RuntimeError. Each attempt is a build of its own, and a model whose fuses all count the first
+    time is built once. The second run of join_posts_to_end_walls on the same posts leaves them as they are."""
+    import gmsh
+    fuse_tol, tried = {}, {}
+    while True:
+        try:
+            return _build_model(foot, dummy, sim, brick, dees, posts=posts, verbose=verbose, fuse_tol=fuse_tol, **kwargs)
+        except _FuseNotCounted as ex:
+            if getattr(gmsh, 'isInitialized', lambda: True)():
+                gmsh.finalize()
+            tol = fuse_tol.get(ex.owner, float(OPT.occ_fuzzy_mm))
+            tried.setdefault(ex.owner, []).append(f"{tol:g} mm: {ex.why}")
+            smaller = [t for t in FUZZY_FALLBACK_MM if t < tol]
+            if not smaller:
+                raise RuntimeError(f"the fuse into {ex.owner}: none counted at boolean tolerance "
+                                   f"{'; '.join(tried[ex.owner])}") from ex
+            fuse_tol[ex.owner] = smaller[0]
+            if verbose:
+                print(f"[build] {ex}, at boolean tolerance {tol:g} mm. The whole model again, this fuse at "
+                      f"{smaller[0]:g} mm")
+
+
+def _build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: bool = True, half: float = None,
+                 wall_t: float = None, r_cut: float = None, lc: float = None, aperture=None, dummy_aperture=None,
+                 lc_posts: float = None, lc_outer: float = None, r_fine: float = None, r_coarse: float = None,
+                 fuse_tol: dict = None):
     """The whole central region as OCC solids, hollowed and fused, with the mesh size fields set. Leaves gmsh
-    initialised; returns (gmsh, groups {label: volume tags}, aperture-tool radii, footprints).
+    initialised; returns (gmsh, groups {label: volume tags}, aperture-tool radii, footprints). ``fuse_tol``: per owner,
+    the boolean tolerance of its hardware's fuse where it is not the default (see build_model).
 
     Ground 'star': built from its 2D layout (star_ground_layout) - extruded, hollowed by the channel outside the
     housing, the inflector housing merged in, its exit opening cut (a cylinder when it is round); the dummy footprints
@@ -2376,26 +2450,28 @@ def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: b
                     if len(v) != 1:
                         raise RuntimeError(f"{q['name']}: the hole cut gave {len(v)} volumes")
                 tags.append(v[0])
-            out, _ = occ.fuse([(3, t) for t in pieces[owner]], [(3, t) for t in tags], removeObject=True,
-                              removeTool=True)
+
+            def lost_of(solids):
+                """A union that meets near-coincident faces can drop a tool WITHOUT an error (only BOP alerts in the
+                log): every block's footprint centre at its mid-height must be inside the result."""
+                lost = []
+                for q in qs:
+                    if q.get('kind') == 'aperture':     # (its centre is the hole)
+                        continue
+                    c = np.asarray(q['corners'], dtype=float)
+                    xyz = [float(c[:, 0].mean()), float(c[:, 1].mean()),
+                           0.5 * (float(q.get('z_lo', -q['half_height'])) + float(q.get('z_hi', q['half_height'])))]
+                    if not any(gmsh.model.isInside(3, t, xyz) for t in solids):
+                        lost.append(f"{q['name']} ({xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f})")
+                return lost
+
+            tol = (fuse_tol or {}).get(owner)
+            out = _fuse_keeping(gmsh, owner, [(3, t) for t in pieces[owner]], [(3, t) for t in tags], lost_of,
+                                sum(q.get('kind') == 'box' for q in qs), tol)
             pieces[owner] = [t for dd, t in out if dd == 3]
-            say(f"fused {len(tags)} post(s) into {owner} -> {len(pieces[owner])} solid(s): "
+            say(f"fused {len(tags)} post(s) into {owner} -> {len(pieces[owner])} solid(s)"
+                + ("" if tol is None else f" at boolean tolerance {tol:g} mm") + ": "
                 + ", ".join(q['name'] for q in qs))
-            # a union that meets near-coincident faces can drop a tool WITHOUT an error (only BOP alerts in the log):
-            # every block's footprint centre at its mid-height must be inside the result
-            occ.synchronize()
-            lost = []
-            for q in qs:
-                if q.get('kind') == 'aperture':     # (its centre is the hole)
-                    continue
-                c = np.asarray(q['corners'], dtype=float)
-                xyz = [float(c[:, 0].mean()), float(c[:, 1].mean()),
-                       0.5 * (float(q.get('z_lo', -q['half_height'])) + float(q.get('z_hi', q['half_height'])))]
-                if not any(gmsh.model.isInside(3, t, xyz) for t in pieces[owner]):
-                    lost.append(f"{q['name']} ({xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f})")
-            if lost:
-                raise RuntimeError(f"the fuse into {owner} LOST metal - outside every resulting solid: "
-                                   + ", ".join(lost))
             say(f"  checked: every post / window block of {owner} is inside the result")
             for q in qs:                            # a grounded box must not reach into a dee: that is a short
                 if q.get('kind') != 'box':

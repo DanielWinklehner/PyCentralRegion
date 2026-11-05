@@ -123,3 +123,168 @@ def test_a_long_channel_taper_is_cut(tmp_path, design, overrides):
     txt = log.getvalue()
     notes = [ln for ln in txt.splitlines() if 'removed no metal' in ln]
     assert "channel cut -> 2 solid(s)" in txt and model.exists(), "\n".join(notes)
+
+
+def test_a_fuse_that_must_keep_its_tools(monkeypatch):
+    """A fuse that keeps its tools is the plain occ.fuse on the tools themselves and makes no copy (a copy changes the
+    mesh of a model that builds). One that drops a tool, throws or loses metal does not count, nor one that leaves another
+    solid unless a tool is meant to stand apart, nor one that adds nothing. The tolerance asked for holds for that fuse
+    only."""
+    B = pytest.importorskip('PyCentralRegion.geometry.builder')
+    gmsh = pytest.importorskip('gmsh')
+    started = not gmsh.isInitialized()
+    if started:
+        gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    gmsh.model.add("fuse_keeping")
+    tol0 = gmsh.option.getNumber("Geometry.ToleranceBoolean")
+    occ = gmsh.model.occ
+    real = occ.fuse
+    made = []
+
+    def fuse_boxes(x0, n_apart=0, tool_x=80.0, tol=None):
+        """A 100 mm cube at x0 and a 100 x 20 x 20 mm tool at x0 + tool_x (by default 32 of its 40 cm^3 stick out); the
+        result's volume [cm^3]."""
+        obj = [(3, occ.addBox(x0, 0, 0, 100, 100, 100))]
+        tool = [(3, occ.addBox(x0 + tool_x, 40, 40, 100, 20, 20))]
+        made[:] = obj + tool
+        centre = [x0 + tool_x + 50.0, 50.0, 50.0]
+
+        def lost_of(solids):
+            return [] if any(gmsh.model.isInside(3, s, centre) for s in solids) else ['the tool']
+
+        return B._occ_mass(occ, B._fuse_keeping(gmsh, 'dee0', obj, tool, lost_of, n_apart, tol)) / 1e3
+
+    def not_counted(why, **kw):
+        with pytest.raises(B._FuseNotCounted) as ex:
+            fuse_boxes(**kw)
+        assert ex.value.owner == 'dee0' and ex.value.why == why and str(ex.value) == f"the fuse into dee0: {why}"
+        assert gmsh.option.getNumber("Geometry.ToleranceBoolean") == 0.05
+
+    try:
+        gmsh.option.setNumber("Geometry.ToleranceBoolean", 0.05)
+        inputs = []
+
+        def spy(obj, tool, **kw):
+            inputs.append((obj + tool, gmsh.option.getNumber("Geometry.ToleranceBoolean")))
+            return real(obj, tool, **kw)
+
+        def no_copy(*a, **kw):
+            raise AssertionError("a copy ahead of a fuse changes the mesh of a model that builds")
+
+        monkeypatch.setattr(occ, 'fuse', spy)
+        monkeypatch.setattr(occ, 'copy', no_copy)
+        assert fuse_boxes(0.0) == pytest.approx(1032.0)
+        assert inputs == [(made, 0.05)]                    # one fuse, of the object and the tool themselves
+        inputs.clear()
+        assert fuse_boxes(300.0, tol=0.02) == pytest.approx(1032.0)
+        assert inputs == [(made, 0.02)] and gmsh.option.getNumber("Geometry.ToleranceBoolean") == 0.05
+        monkeypatch.undo()
+
+        def drops(obj, tool, **kw):                        # what 0.05 mm did to the blocks split at a bend
+            occ.remove(tool, recursive=True)
+            return obj, [obj]
+
+        monkeypatch.setattr(occ, 'fuse', drops)
+        not_counted("LOST metal - outside every resulting solid: the tool", x0=600.0)
+
+        def throws(obj, tool, **kw):                       # eval 0129's dee0
+            raise Exception("Union failed - BOPAlgo_AlertBuilderFailed")
+
+        monkeypatch.setattr(occ, 'fuse', throws)
+        not_counted("Union failed - BOPAlgo_AlertBuilderFailed", x0=900.0)
+        not_counted("Union failed - BOPAlgo_AlertBuilderFailed", x0=900.0, tol=0.02)
+
+        def breaks(obj, tool, **kw):                       # eval 0091's dee0: every centre inside, the dee in pieces
+            res, m = real(obj, tool, **kw)
+            return occ.cut(res, [(3, occ.addBox(1200.0, 0, 0, 50, 100, 100))], removeObject=True, removeTool=True)
+
+        monkeypatch.setattr(occ, 'fuse', breaks)
+        not_counted("1 solid(s) from 1, -468.0 cm^3 added by 40.0 cm^3 of tools", x0=1200.0)
+        monkeypatch.undo()
+
+        assert fuse_boxes(1500.0, n_apart=1, tool_x=200.0) == pytest.approx(1040.0)   # a grounded box, meant to stand apart
+        not_counted("2 solid(s) from 1, 40.0 cm^3 added by 40.0 cm^3 of tools", x0=1900.0, tool_x=200.0)
+        with pytest.raises(B._FuseNotCounted, match=r"1 solid\(s\) from 1, 0\.0 cm\^3 added by 8\.0 cm\^3 of tools"):
+            B._fuse_keeping(gmsh, 'dee0', [(3, occ.addBox(2300, 0, 0, 100, 100, 100))],
+                            [(3, occ.addBox(2340, 40, 40, 20, 20, 20))], lambda solids: [])              # a tool inside
+    finally:
+        monkeypatch.undo()
+        gmsh.option.setNumber("Geometry.ToleranceBoolean", tol0)
+        gmsh.model.remove()
+        if started:
+            gmsh.finalize()
+
+
+def test_a_fuse_that_does_not_count_starts_the_model_again(monkeypatch):
+    """build_model passes its keywords on and starts again from nothing with the failing owner's fuse at the next smaller
+    tolerance, the other owners' as they were. A model that counts the first time is one build with no tolerance set;
+    a fuse that counts at no tolerance fails, naming each; with exact booleans there is nothing smaller to try."""
+    B = pytest.importorskip('PyCentralRegion.geometry.builder')
+    dataclasses = pytest.importorskip('dataclasses')
+    monkeypatch.setattr(B, 'OPT', dataclasses.replace(B.OPT, occ_fuzzy_mm=0.05))
+    calls = []
+
+    def fake(fails):
+        def build(foot, dummy, sim, brick, dees, posts=None, verbose=True, fuse_tol=None, **kw):
+            calls.append((dict(fuse_tol), kw))
+            for owner, smallest_that_counts in fails.items():
+                if fuse_tol.get(owner, 0.05) > smallest_that_counts:
+                    raise B._FuseNotCounted(owner, 'lost g1')
+            return 'the model'
+        return build
+
+    monkeypatch.setattr(B, '_build_model', fake({}))
+    assert B.build_model(1, 2, 3, 4, 5, verbose=False, lc=8.0) == 'the model'
+    assert calls == [({}, {'lc': 8.0})]
+
+    calls.clear()
+    monkeypatch.setattr(B, '_build_model', fake({'dee0': 0.01, 'ground': 0.02}))
+    assert B.build_model(1, 2, 3, 4, 5, verbose=False) == 'the model'
+    assert [c[0] for c in calls] == [{}, {'dee0': 0.02}, {'dee0': 0.01}, {'dee0': 0.01, 'ground': 0.02}]
+
+    monkeypatch.setattr(B, '_build_model', fake({'dee1': -1.0}))
+    with pytest.raises(RuntimeError, match=r"the fuse into dee1: none counted at boolean tolerance 0\.05 mm: lost g1; "
+                                           r"0\.02 mm: lost g1; 0\.01 mm: lost g1; 0\.005 mm: lost g1; 0 mm: lost g1"):
+        B.build_model(1, 2, 3, 4, 5, verbose=False)
+
+    calls.clear()
+    monkeypatch.setattr(B, 'OPT', dataclasses.replace(B.OPT, occ_fuzzy_mm=0.0))
+    with pytest.raises(RuntimeError, match=r"the fuse into dee1: none counted at boolean tolerance 0 mm: lost g1"):
+        B.build_model(1, 2, 3, 4, 5, verbose=False)
+    assert len(calls) == 1
+
+
+def test_a_post_block_split_at_a_bend_is_fused(tmp_path):
+    """Eval 0003 of a connected campaign with posts by the between-band rule: at 0.05 mm the fuse into dee0 dropped both
+    pieces of gap 1's block, split at a bend of the gap line, which the builder's own check caught and stopped the
+    build. It builds now (about 30 s, when the design's input files are on this machine, else it skips)."""
+    pytest.importorskip('PyCentralRegion.geometry.builder')
+    from PyCentralRegion.geometry import build as GB
+    cfg_path = EXAMPLES / 'design_connected_cold.toml'
+    if not cfg_path.exists():
+        pytest.skip("the worked example is not in this checkout")
+    r1 = (104.5, 108.5, 110.5, 112.0, 120.5, 130.5, 148.5, 157.0)
+    r2 = (159.5, 156.0, 153.5, 156.0, 168.0, 179.5, 196.0, 202.0)
+    posts = [(1, 'dee', 58.584, 22.457), (1, 'dee', 67.009, 13.361), (1, 'dummy', 84.694, 19.095),
+             (1, 'dummy', 92.316, 15.117), (2, 'dee', 80.691, 11.988), (2, 'dummy', 96.915, 13.157),
+             (3, 'dee', 78.366, 10.163), (3, 'dummy', 92.84, 10.579), (4, 'dummy', 86.118, 11.091)]
+    model = tmp_path / 'model3d.pkl'
+    overrides = ['machine.dee_opening_deg=32.547930952023954', 'geometry.aperture_inner_mm=26.0',
+                 'geometry.aperture_outer_mm=32.0', 'geometry.aperture_taper_center_mm=120.0',
+                 'geometry.aperture_taper_length_mm=40.0', 'geometry.post_shape="cylinder"',
+                 'geometry.posts=[' + ', '.join(f'{{gap={g}, side="{s}", s_mm={m}, length_mm={n}}}'
+                                                for g, s, m, n in posts) + ']', f'paths.model3d="{model.as_posix()}"']
+    for g, (a, b) in enumerate(zip(r1, r2)):
+        overrides += [f'geometry.gap_line.{g}.r1_mm={a}', f'geometry.gap_line.{g}.f1=0.0',
+                      f'geometry.gap_line.{g}.r2_mm={b}'] + ([f'geometry.gap_line.{g}.f0=0.0'] if g else [])
+    cfg = C.load(cfg_path, overrides=overrides)
+    pc = C.section(cfg, 'paths')
+    if not all(Path(p).exists() for p in (pc.seed, pc.housing_outline, pc.handoff, pc.housing_step)):
+        pytest.skip("the design's input files are not on this machine")
+    log = io.StringIO()
+    with contextlib.redirect_stdout(log):
+        GB.build(cfg)
+    txt = log.getvalue()
+    notes = [ln for ln in txt.splitlines() if 'the fuse into' in ln]
+    assert model.exists() and "into dee0 -> 1 solid(s)" in txt, "\n".join(notes)
