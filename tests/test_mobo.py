@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,7 @@ PILOT = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_pilot.toml'
 CAMPAIGN = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_campaign.toml'
 SLIT = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_slit.toml'
 CONNECTED = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_connected.toml'
+V6O_C1 = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_v6o_c1.toml'
 SRC = Path(PyCentralRegion.__file__).resolve().parents[1]          # subprocesses import what the tests import
 HV_FRONT = (2.0 / 3.0) * (1.0 - (1.0 - toy.I_MAX) ** 1.5)
 # a smaller toy problem for the convergence test: the RF phase, a log-scaled trim and a continuous geometry variable
@@ -750,6 +752,37 @@ def test_connected_campaign_config(tmp_path):
     assert camp.warm_point(1)['phi'] == 28.0 and camp.warm_point(2)['phi'] == 38.0      # (checked its overrides)
 
 
+def test_v6o_c1_campaign_config(tmp_path):
+    """The full cold-started campaign on the v6 map: the dee opening, the channel and every gap line (r1 and dr along
+    the ray, the fractions across it; gap 0 without f0) as geometry, the RF phase and the magnet level as the cheap
+    ones; 65 kV, no trim, three objectives read at 0 deg in pass 7. Its base places posts by rule, and its base gap
+    lines lie inside the boxes (the warm starts take them); the post rule's bare run takes no cheap variable from an
+    evaluation."""
+    cfg = driver.load(V6O_C1)
+    names = [v.name for v in cfg.variables]
+    assert len(names) == 38 and names[0] == 'phi' and names[-2:] == ['phase', 'level'] and 'g0_f0' not in names
+    assert [v.kind for v in cfg.variables] == ['geometry'] * 36 + ['cheap'] * 2
+    assert all((v.low, v.high) == (-1.0, 1.0) for v in cfg.variables if v.name[-3:] in ('_f0', '_f1'))
+    assert all((v.low, v.high) == (12.0, 90.0) for v in cfg.variables if v.name.endswith('_dr'))
+    assert 'track.volt_scale=1.0' in cfg.fixed and not any('btrim' in v.target for v in cfg.variables)
+    assert cfg.n_startup >= 2 * (len(cfg.variables) + 2) + 1
+    assert [o.metric for o in cfg.objectives] == ['I_2pct_best_az', 'I_final_az', 'z_p95_az']
+    assert [c.label() for c in cfg.constraints] == ['E_med_az>=2.9']
+    if not Path(cfg.physics_python).is_file():
+        pytest.skip('the campaign names a physics interpreter of the machine it runs on')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        camp = driver.Campaign(driver.load(V6O_C1, [f'mobo.campaign_dir={C.toml_value(str(tmp_path))}']))
+    assert not [w for w in caught if 'bare run' in str(w.message)]
+    base = camp.base(cfg.search_fidelity)
+    assert base['post_rule']['enabled'] is True and base['geometry']['post_shape'] == 'cylinder'
+    lines = {g['gap']: g for g in base['geometry']['gap_line']}
+    for v in cfg.variables:
+        if v.name[-3:] in ('_r1', '_dr'):
+            assert v.low <= lines[int(v.name[1])][v.name[-2:] + '_mm'] <= v.high, v.name
+    assert [camp.warm_point(i)['phi'] for i in range(6)] == [38.0, 34.0, 42.0, 45.0, 36.0, 40.0]
+
+
 @pytest.mark.parametrize('path', [PILOT, CAMPAIGN], ids=['pilot', 'campaign'])
 def test_opt_in_trim(path, tmp_path):
     """The first-harmonic trim is opt-in (the design has no trim coils): its two variables are commented out, and
@@ -856,3 +889,41 @@ def test_flat_channel_designs_share_one_geometry_key(tmp_path):
     assert len({space.geometry_key(level, cheap_outer, {'center': c, 'outer': 34.0}) for c in (100.0, 200.0)}) == 2
     assert 'idle' not in space.geometry_parts(level, cheap_outer, {'center': 100.0, 'outer': 34.0})
     assert json.dumps(base, sort_keys=True) == snapshot                     # the base config is left as it was
+
+
+def test_posts_by_rule_key_the_geometry_by_what_the_bare_run_reads(tmp_path):
+    """With [post_rule] enabled a geometry's posts come from a run of its bare electrodes: the rule and the maps that
+    run reads (the magnet's and the inflector's) are part of the geometry's key. Without the section, or with it off,
+    the parts are what they always were."""
+    cfg = campaign(tmp_path, 'mobo.variables=[{name="inner", target="geometry.aperture_inner_mm", low=22.0, high=40.0, '
+                   'kind="geometry"}, {name="phase", target="toy.phases_deg", low=-40.0, high=0.0, as_list=true}]',
+                   'mobo.warm_start=[]')
+    base = {'geometry': {'ground': 'star'},
+            'paths': {'seed': 'seed.pkl', 'bfield_3d': 'b.txt', 'inflector_efield': 'e.pickle'}}
+    params = {'inner': 30.0, 'phase': -15.0}
+    plain = space.geometry_parts(base, cfg, params)
+    assert 'post_rule' not in plain['sections'] and set(plain['paths']) == set(space.GEOMETRY_PATHS)
+    off = {**base, 'post_rule': {'enabled': False, 'clear_mm': 4.0}}
+    assert space.geometry_key(off, cfg, params) == space.geometry_key(base, cfg, params)
+    on = {**base, 'post_rule': {'enabled': True}}
+    parts = space.geometry_parts(on, cfg, params)
+    assert parts['sections']['post_rule'] == {'enabled': True}
+    assert parts['paths']['bfield_3d'] == 'b.txt' and parts['paths']['inflector_efield'] == 'e.pickle'
+    others = (on, {**on, 'post_rule': {'enabled': True, 'clear_mm': 4.0}},
+              {**on, 'paths': {**base['paths'], 'bfield_3d': 'c.txt'}},
+              {**on, 'paths': {**base['paths'], 'inflector_efield': 'f.pickle'}})
+    assert len({space.geometry_key(b, cfg, params) for b in (base, *others)}) == 5
+
+
+def test_posts_by_rule_warn_of_cheap_variables_the_bare_run_takes(tmp_path):
+    """The bare run sets the RF phase and the magnet level itself; any other cheap variable reaches it from the
+    geometry's first evaluation: the campaign warns of those."""
+    sets = ['mobo.fixed=["toy.volt_scale=1.02", "post_rule.enabled=true"]', 'mobo.warm_start=[]',
+            'mobo.variables=[{name="phase", target="track.phases_deg", low=-40.0, high=0.0, as_list=true}, '
+            '{name="level", target="magnet.scale", low=0.995, high=1.005}, '
+            '{name="volt", target="track.volt_scale", low=0.9, high=1.0}, '
+            '{name="width", target="toy.gap_width_mm", low=2.0, high=8.0, kind="geometry"}]']
+    with pytest.warns(UserWarning) as caught:
+        driver.Campaign(campaign(tmp_path, *sets), runner=inprocess)
+    said = [str(w.message) for w in caught if 'bare run' in str(w.message)]
+    assert len(said) == 1 and "'volt' is cheap and sets track.volt_scale" in said[0]

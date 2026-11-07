@@ -214,6 +214,20 @@ def test_connected_gap_line_options(tmp_path):
     assert C.section(cfg, 'geometry').gap_line == g.gap_line
 
 
+def test_gap_line_by_its_length(tmp_path):
+    """dr_mm gives P2 by its distance from P1, r2_mm = r1_mm + dr_mm, whichever r1_mm an optimiser sets."""
+    assert O.GapLine(1, 108.5, dr_mm=47.5) == O.GapLine(1, 108.5, 156.0)
+    for bad in (dict(r2_mm=156.0, dr_mm=47.5), dict(dr_mm=-1.0)):
+        with pytest.raises(ConfigError, match='dr_mm must be > 0 and comes instead of r2_mm'):
+            O.GapLine(1, 108.5, **bad)
+    cfg = _load(tmp_path, '[geometry]\ngap_lines = "connected"\nsnap_nodes = false\ngap0_on_plate = true\n'
+                          '[[geometry.gap_line]]\ngap = 0\nr1_mm = 104.5\nr2_mm = 159.5\n'
+                          '[[geometry.gap_line]]\ngap = 1\nr1_mm = 108.5\ndr_mm = 47.5\n',
+                ['geometry.gap_line.1.r1_mm=120.0'])
+    assert C.section(cfg, 'geometry').gap_line[1] == O.GapLine(1, 120.0, 167.5)
+    assert cfg['geometry']['gap_line'][1] == {'gap': 1, 'r1_mm': 120.0, 'dr_mm': 47.5}     # the run file's form stays
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # the builder and the build
 def test_builder_refuses_other_machines():

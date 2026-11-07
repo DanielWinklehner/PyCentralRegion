@@ -83,7 +83,10 @@ Worked examples:
   evaluations, about 4.5-5 h (see Costs). Its header lists what the first pilot changed and what the loop does
   not see;
 - `configs/examples/hchc1p5/mobo_slit.toml`: a radial slit for the chosen design, a campaign of its own (cheap: the
-  slit's opening, azimuth and offset at one fixed pass), 20 evaluations.
+  slit's opening, azimuth and offset at one fixed pass), 20 evaluations;
+- `configs/examples/hchc1p5/mobo_v6o_c1.toml`: the full cold-started optimisation with the v6 field map and the
+  v6o_c1 inflector: the dee opening, the beam channel and every gap line (geometry) with the RF phase and the magnet
+  level (cheap), 38 variables, posts placed by rule in the loop ("Posts in the loop"), three objectives.
 
 In the pilot and the campaign a first-harmonic magnetic trim is opt-in: the worked example's design has no trim
 coils, so its two variables (`trim_c`, `trim_s`) are commented out. Uncomment them for a what-if, in another
@@ -121,7 +124,9 @@ A variable has one of two kinds:
 
 The geometry key is a hash of what the build and the BEM read: the sections `[geometry]`, `[machine]`, `[inflector]`
 and `[fields]` as the base run file writes them (with `fixed` and the fidelity's overrides), the paths `paths.seed`,
-`paths.handoff`, `paths.housing_outline` and `paths.housing_step`, and the geometry variables' values. It holds
+`paths.handoff`, `paths.housing_outline` and `paths.housing_step`, and the geometry variables' values. With posts
+placed by rule (`[post_rule] enabled`, "Posts in the loop") it also holds `[post_rule]` and the maps the bare run
+reads, `paths.bfield_3d` and `paths.inflector_efield`. It holds
 neither the code's defaults nor the files' contents: after a change of either, start another `campaign_dir`.
 The taper's place (`aperture_taper_center_mm`, `aperture_taper_length_mm`) is left out where the dees' channel and
 the dummy dees' each have one height at every radius (`GeometryConfig.idle_keys`): there it changes no electrode, it
@@ -148,8 +153,11 @@ Useful targets:
 | dee voltage | `track.volt_scale` | cheap |
 | first-harmonic trim | `btrim.amplitude_cos_t`, `btrim.amplitude_sin_t` (its Cartesian components) | cheap |
 | collimating slit | `slit.half_width_mm`, `slit.azimuth_deg`, `slit.offset_mm`, `slit.pass_index` (`integer = true`) | cheap |
+| magnet level | `magnet.scale` | cheap |
 | spiral-inflector rotation | `inflector.rotation_deg` (with `geometry.si_rotation = "fixed"`) | geometry |
+| dee opening | `machine.dee_opening_deg` (with `geometry.si_rotation = "corner"` the inflector turns with it) | geometry |
 | dee vertical aperture | `geometry.aperture_inner_mm`, `aperture_outer_mm`, `aperture_taper_center_mm`, `aperture_taper_length_mm` | geometry |
+| a connected gap line | `geometry.gap_line.<i>.r1_mm`, `dr_mm` (P2 at r1 + dr: no ordering constraint), `f0`, `f1` | geometry |
 | a gap window | `geometry.windows.<i>.half_height_mm` | geometry |
 
 Two knobs are awkward for any sampler in their plain form:
@@ -249,6 +257,49 @@ All three were correlated on the final survivors, while a turns-0-3 run knows on
 Re-check the correlations on that set before using them. The compression slope (`slope`), `dE_E_robust` and `W_eff`
 come from the end of the run, so they are not early stand-ins.
 
+## Posts in the loop (`[post_rule]`)
+
+Posts on the gap edges between the turns can be worth a milliamp or more (on campaign_connected2's design 0099, 4.50 →
+5.64 mA), but not on every geometry (on the v6o_c1 cold start, radial gap lines at 38°, the rule's 16 posts cost
+0.85 mA: 4.68 → 3.84 mA, each at its best phase, mostly as vertical losses in passes 1-2), and where they fit depends
+on where the beam crosses each gap, which every new geometry moves. With `[post_rule] enabled = true` in the base run
+file, `pcr evaluate` places them by rule for every new geometry, in two passes:
+
+1. **the bare pass**: the geometry without posts is built, solved and tracked in `<geometry>/bare/`, with the rule's
+   phase scan (`scan_phases_deg`, -45 ... +15° in 15° steps: a scan of `track.n_scan` particles, then the final run at
+   the best phase by transmission × energy) at the magnet level `scan_magnet_scale` (1.000), and scored. The rule
+   (`PyCentralRegion.geometry.post_rule`) then places the posts from its survivors' crossings of each gap edge, banded
+   by pass: on the gaps of `gaps` (1-5) one post row between the bands of passes k and k + 1 for every k in `rows`
+   (1, 2), `clear_mm` (5 mm) clear of each band's 0.5 % / 99.5 % quantiles and split at the edge's bends; on the gaps
+   of `inner_gaps` (1) a post inside the first band. `bare/posts.json` records the posts, every edge's bands and what
+   was left out, and the bare run's phase and scores;
+2. **the geometry with its posts** is built in `<geometry>/`, checked with the tracker's metal test (with
+   `track.obstacles = "columns"`, which refuses a model that is not closed) and solved; the evaluation tracks it at
+   its own phase and level.
+
+The bare pass runs once per geometry, in its first evaluation. The cheap followers and the verify re-evaluations reuse
+the record and the fields with posts, so the posts depend on the geometry and on the settings of its first evaluation
+other than its phase and level (the fidelity: the search fidelity), not on an evaluation's phase or level. So the
+campaign's cheap variables should be the RF phase and the magnet level only (the driver warns of any other: the bare
+pass would take its value from whichever evaluation came first), and its `fixed` overrides should stay as they are
+for the whole campaign. A geometry the rule gives no posts keeps its bare model and fields, and so does one whose build,
+metal test or field solve with posts fails (the record's `fallback` says why): it is a design without posts, not a
+failed evaluation. An error of memory, the GPU or the file system is no fallback: the evaluation fails and the
+geometry's next evaluation tries the model with posts again. A stopped evaluation's geometry continues where it was:
+every step reuses its output. The record belongs to the model it was made for (`model`): a model with posts by rule
+needs a folder of its own, as the campaign's geometries have. The scores in `result.json` hold `post_rule`: the number
+of posts, the fallback, the bare run's best phase, survivors and scores (`I_final_az`, `I_2pct_best_az`, `z_p95_az`,
+`E_med_az`, `T_az`), so what the posts gave can be read off every geometry.
+
+A new geometry costs about three times what it costs without the rule: on the v6o_c1 cold start about 15 min (bare
+build 24 s, bare BEM 3 min, the bare scan and final run 4.8 min, the rule 26 s, the build with posts 45 s, its BEM
+4.6 min, the final track 39 s) against about 5 min for a build, its BEM and one track. Cheap followers cost what they
+always did.
+
+The rule needs `geometry.posts` empty and a counterclockwise beam, and gives gap 0 no posts (its hardware is the
+housing exit and the hole plate). It was tested with round posts (`geometry.post_shape = "cylinder"`); square posts
+stop at the edge's bends. It reproduces the placement scripts of the posts tests (`posts_test_0099`) post for post.
+
 ## Samplers
 
 Both samplers are constrained and multi-objective, and both read the same store, so a campaign can switch between
@@ -310,6 +361,9 @@ enters instead as an infeasible stand-in (see Objectives and constraints).
 <campaign_dir>/evals/<id>.<fid>/    a re-evaluation at another fidelity (0007.verify); earlier tries <id>.<fid>.attempt<k>
 <campaign_dir>/geometries/<key>/    geometry.json (what the key hashes), model3d.pkl with the build's side files
                                     (model3d.msh, model3d.step, model3d_build.json, model3d_dees.png) and fields.pkl
+<campaign_dir>/geometries/<key>/bare/  [post_rule]: posts.json, the bare model with its side files (moved up when
+                                    the geometry gets no posts; its field map goes once fields.pkl exists) and track/
+                                    (the bare run's record files and scores)
 <campaign_dir>/preflight/           stdout.log, stderr.log of the check of the physics interpreter
 <campaign_dir>/driver.lock          held by the running driver
 ```

@@ -38,6 +38,7 @@ SAMPLERS = ('tpe', 'gp')
 # and the beam channel; the hand-off file gives the emitting plane): the geometry key hashes them
 GEOMETRY_SECTIONS = ('geometry', 'machine', 'inflector', 'fields')
 GEOMETRY_PATHS = ('seed', 'handoff', 'housing_outline', 'housing_step')
+POST_RULE_PATHS = ('bfield_3d', 'inflector_efield')
 # config keys the driver and the evaluator own: no variable may set them
 RESERVED_TARGETS = ('paths.model3d', 'paths.fields', 'run.out_dir')
 
@@ -250,6 +251,9 @@ def geometry_parts(base, cfg, params):
     parts = {'sections': {s: base.get(s, {}) for s in GEOMETRY_SECTIONS},
              'paths': {p: paths.get(p, '') for p in GEOMETRY_PATHS},
              'variables': {v.target: params[v.name] for v in cfg.geometry_variables}}
+    if base.get('post_rule', {}).get('enabled'):         # the posts come from a run of the bare electrodes: what it reads
+        parts['sections']['post_rule'] = base['post_rule']
+        parts['paths'].update({p: paths.get(p, '') for p in POST_RULE_PATHS})
     cheap_geometry = any(v.target.startswith('geometry.') for v in cfg.cheap_variables)
     idle = () if cheap_geometry else idle_geometry_keys(parts)
     geometry = {k: x for k, x in parts['sections']['geometry'].items() if k not in idle}

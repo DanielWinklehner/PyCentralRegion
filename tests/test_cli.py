@@ -1,6 +1,7 @@
 """`pcr` command line: `show` prints the resolved configuration with the overrides applied, and every stage command
-exists with the documented arguments."""
+exists with the documented arguments; `pcr evaluate` with [post_rule] (its stages replaced by stand-ins)."""
 import json
+from pathlib import Path
 
 import pytest
 
@@ -62,3 +63,264 @@ def test_campaign_commands_reach_the_driver(command, option, capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main([command, '--help'])
     assert exc.value.code == 0 and option in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# posts in the loop: `pcr evaluate` with [post_rule] enabled
+POST = {'gap': 1, 'side': 'dee', 's_mm': 40.0, 'length_mm': 20.0}
+SCORES = {'I_final_az': 5.0, 'I_2pct_best_az': 4.0, 'z_p95_az': 3.0, 'E_med_az': 3.1, 'T_az': 0.6}
+SCAN = (-45.0, -30.0, -15.0, 0.0, 15.0)          # the rule's default phase scan
+
+
+class _Stop(BaseException):
+    """A kill: what no stage catches."""
+
+
+class _Stages:
+    """Stand-ins for the stages of `pcr evaluate` that write and reuse their outputs as the real ones do: the build
+    writes a build's files (the model last), each holding the number of posts it was built with; the field map takes
+    its model's, and a track reads its field map's; the tracker's metal test ('columns') reads a model. ``fail``
+    {'build' | 'columns' | 'fields' | 'bare track': exception}: raised by the build, the metal test or the field solve
+    of a model with posts, or by the bare pass's tracking. ``log``: (stage, its output, what it did)."""
+
+    def __init__(self, monkeypatch, posts=(POST,), fail=None):
+        simulate3d = pytest.importorskip('PyCentralRegion.simulate3d')
+        post_rule = pytest.importorskip('PyCentralRegion.geometry.post_rule')
+        from PyCentralRegion.geometry.build import output_files
+        self.output_files, self.posts, self.fail, self.log = output_files, list(posts), dict(fail or {}), []
+        monkeypatch.setattr(cli, 'build_stage', self.build)
+        monkeypatch.setattr(cli, 'score_stage', self.score)
+        monkeypatch.setattr(cli, '_free_gpu', lambda: None)
+        monkeypatch.setattr(simulate3d, 'fields_stage', self.fields)
+        monkeypatch.setattr(simulate3d, 'track_stage', self.track)
+        monkeypatch.setattr(simulate3d, 'load_model3d', lambda path: dict(json.loads(Path(path).read_text()),
+                                                                          path=Path(path)))
+        monkeypatch.setattr(simulate3d, 'column_obstacles', self.columns)
+        monkeypatch.setattr(post_rule, 'posts_from_run', self.place)
+
+    def stages(self):
+        return [entry[0] for entry in self.log]
+
+    def build(self, cfg):
+        out = self.output_files(cfg['paths']['model3d'])
+        if out['model3d'].exists():
+            self.log.append(('build', out['model3d'], 'reused'))
+            return
+        if any(f.exists() for f in out.values()):
+            raise ConfigError("other outputs of a build exist: never overwritten")
+        n = len(cfg.get('geometry', {}).get('posts', []))
+        self.log.append(('build', out['model3d'], n))
+        for name, f in out.items():
+            if name == 'model3d' and n and 'build' in self.fail:
+                raise self.fail['build']
+            f.write_text(json.dumps({'posts': n}))
+
+    def columns(self, model3d, fc, verbose=True, odd='raise'):
+        assert odd == 'raise'
+        self.log.append(('columns', model3d['path'], model3d['posts']))
+        if model3d['posts'] and 'columns' in self.fail:
+            raise self.fail['columns']
+
+    def fields(self, cfg, verbose=True):
+        out = Path(cfg['paths']['fields'])
+        if out.exists():
+            self.log.append(('fields', out, 'reused'))
+            return out
+        model = json.loads(Path(cfg['paths']['model3d']).read_text())
+        self.log.append(('fields', out, model['posts']))
+        if model['posts'] and 'fields' in self.fail:
+            raise self.fail['fields']
+        out.write_text(json.dumps(model))
+        return out
+
+    def track(self, cfg, verbose=True):
+        out = Path(cfg['run']['out_dir'])
+        if out.name == 'track' and 'bare track' in self.fail:
+            raise self.fail['bare track']
+        self.log.append(('track', out, (tuple(cfg['track']['phases_deg']), cfg['magnet']['scale'],
+                                        json.loads(Path(cfg['paths']['fields']).read_text())['posts'])))
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'track_data.pkl').write_text('tracks')
+        summary = {'best_phase': -30.0}
+        (out / 'track.json').write_text(json.dumps(summary))
+        return summary
+
+    def score(self, cfg):
+        self.log.append(('score', Path(cfg['run']['out_dir']), None))
+        return dict(SCORES)
+
+    def place(self, cfg, rule=None, run_dir=None):
+        out = Path(cfg['run']['out_dir'])
+        assert (out / 'track_data.pkl').exists() and rule.enabled
+        self.log.append(('place', out, len(self.posts)))
+        return {'posts': [dict(p, between_bands=[1, 2], r_mm=100.0) for p in self.posts], 'edges': [], 'n_tracks': 10,
+                'n_survivors': 6, 'rule': {}}
+
+
+def _evaluation(geo, out):
+    """The config `pcr evaluate` gets from the campaign driver: the geometry's folder ``geo``, the evaluation's ``out``,
+    the evaluation's phase and level."""
+    return {'paths': {'model3d': str(geo / 'model3d.pkl'), 'fields': str(geo / 'fields.pkl')},
+            'run': {'out_dir': str(out)}, 'track': {'phases_deg': [-15.0]}, 'magnet': {'scale': 1.002},
+            'post_rule': {'enabled': True}}
+
+
+def test_evaluate_places_posts_from_a_bare_run(tmp_path, monkeypatch):
+    """The first evaluation of a geometry tracks its bare electrodes in <geometry>/bare at the rule's phase scan and
+    level, places the posts from those tracks, and builds, solves and tracks the geometry with them at its own phase
+    and level; a later evaluation of the geometry only tracks, with the same posts."""
+    st = _Stages(monkeypatch)
+    geo = tmp_path / 'geometries' / 'g'
+    bare = geo / 'bare'
+    geo.mkdir(parents=True)
+    cfg = _evaluation(geo, tmp_path / 'e0')
+    scores = cli.evaluate(cfg)
+    assert st.log == [('build', bare / 'model3d.pkl', 0), ('fields', bare / 'fields.pkl', 0),
+                      ('track', bare / 'track', (SCAN, 1.0, 0)), ('score', bare / 'track', None),
+                      ('place', bare / 'track', 1), ('build', geo / 'model3d.pkl', 1),
+                      ('columns', geo / 'model3d.pkl', 1), ('fields', geo / 'fields.pkl', 1),
+                      ('track', tmp_path / 'e0', ((-15.0,), 1.002, 1)), ('score', tmp_path / 'e0', None)]
+    assert cfg['geometry']['posts'] == [POST]
+    record = json.loads((bare / cli.POSTS_RECORD).read_text())
+    assert record['posts'] == [dict(POST, between_bands=[1, 2], r_mm=100.0)] and record['bare_phase_deg'] == -30.0
+    assert record['model'] == 'model3d.pkl'
+    assert record['bare_scores'] == SCORES and 'fallback' not in record
+    assert scores == {**SCORES, 'post_rule': {'n_posts': 1, 'fallback': '', 'bare_phase_deg': -30.0,
+                                              'n_survivors_bare': 6, 'bare': SCORES}}
+    # the bare pass keeps its model and scores, not its field map or tracks
+    assert (bare / 'model3d.pkl').exists() and (bare / 'track' / 'track.json').exists()
+    assert not (bare / 'fields.pkl').exists() and not (bare / 'track' / 'track_data.pkl').exists()
+    st.log.clear()
+    cfg = _evaluation(geo, tmp_path / 'e1')
+    cli.evaluate(cfg)
+    assert st.log == [('track', tmp_path / 'e1', ((-15.0,), 1.002, 1)), ('score', tmp_path / 'e1', None)]
+    assert cfg['geometry']['posts'] == [POST]
+
+
+def test_a_geometry_without_posts_keeps_its_bare_model(tmp_path, monkeypatch):
+    st = _Stages(monkeypatch, posts=())
+    geo = tmp_path / 'g'
+    geo.mkdir()
+    cfg = _evaluation(geo, tmp_path / 'e0')
+    scores = cli.evaluate(cfg)
+    assert st.stages() == ['build', 'fields', 'track', 'score', 'place', 'track', 'score']
+    assert st.log[-2][2] == ((-15.0,), 1.002, 0) and cfg['geometry']['posts'] == []
+    assert scores['post_rule']['n_posts'] == 0 and scores['post_rule']['fallback'] == ''
+    for f in [*st.output_files(geo / 'model3d.pkl').values(), geo / 'fields.pkl']:
+        assert json.loads(f.read_text()) == {'posts': 0}                # the bare outputs, moved up
+    assert not any((geo / 'bare').glob('model3d*')) and not (geo / 'bare' / 'fields.pkl').exists()
+
+
+@pytest.mark.parametrize('stage, error', [('build', RuntimeError('the fuse dropped a post')),
+                                          ('columns', ValueError('column test: the solid is not closed')),
+                                          ('fields', ConfigError('3D model too large'))])
+def test_a_failed_model_with_posts_falls_back_to_the_bare_one(tmp_path, monkeypatch, capsys, stage, error):
+    st = _Stages(monkeypatch, fail={stage: error})
+    geo = tmp_path / 'g'
+    geo.mkdir()
+    cfg = _evaluation(geo, tmp_path / 'e0')
+    scores = cli.evaluate(cfg)
+    reached = {'build': [], 'columns': ['columns'], 'fields': ['columns', 'fields']}[stage]
+    assert st.stages() == ['build', 'fields', 'track', 'score', 'place', 'build'] + reached + ['track', 'score']
+    assert st.log[-2][2] == ((-15.0,), 1.002, 0) and cfg['geometry']['posts'] == []
+    why = f"{type(error).__name__}: {error}"
+    assert json.loads((geo / 'bare' / cli.POSTS_RECORD).read_text())['fallback'] == why
+    assert scores['post_rule']['fallback'] == why and scores['post_rule']['n_posts'] == 0
+    assert 'this geometry stays without posts' in capsys.readouterr().out
+    for f in [*st.output_files(geo / 'model3d.pkl').values(), geo / 'fields.pkl']:
+        assert json.loads(f.read_text()) == {'posts': 0}                # the bare outputs, over what the failure left
+    st.log.clear()
+    cfg = _evaluation(geo, tmp_path / 'e1')
+    cli.evaluate(cfg)
+    assert st.stages() == ['track', 'score'] and cfg['geometry']['posts'] == []
+
+
+@pytest.mark.parametrize('stage, error', [('fields', MemoryError()), ('fields', PermissionError('locked')),
+                                          ('columns', type('OutOfMemoryError', (Exception,), {})('cupy'))])
+def test_an_error_of_the_machine_fails_the_evaluation_without_a_fallback(tmp_path, monkeypatch, stage, error):
+    """Memory, the GPU or the file system: nothing about the model with posts, so no fallback for good; the
+    geometry's next evaluation builds on what is there."""
+    st = _Stages(monkeypatch, fail={stage: error})
+    geo = tmp_path / 'g'
+    geo.mkdir()
+    with pytest.raises(type(error)):
+        cli.evaluate(_evaluation(geo, tmp_path / 'e0'))
+    assert 'fallback' not in json.loads((geo / 'bare' / cli.POSTS_RECORD).read_text())
+    assert (geo / 'model3d.pkl').exists() and not (geo / 'fields.pkl').exists()
+    st.fail.clear()
+    st.log.clear()
+    cfg = _evaluation(geo, tmp_path / 'e1')
+    cli.evaluate(cfg)
+    assert st.log[:2] == [('columns', geo / 'model3d.pkl', 1), ('fields', geo / 'fields.pkl', 1)]
+    assert cfg['geometry']['posts'] == [POST]
+
+
+def test_a_stopped_geometry_continues_where_it_was(tmp_path, monkeypatch):
+    geo, bare = tmp_path / 'g', tmp_path / 'g' / 'bare'
+    geo.mkdir()
+    # stopped in the bare pass's tracking: its model and field map are reused
+    st = _Stages(monkeypatch, fail={'bare track': _Stop()})
+    with pytest.raises(_Stop):
+        cli.evaluate(_evaluation(geo, tmp_path / 'e0'))
+    st.fail.clear()
+    st.log.clear()
+    cli.evaluate(_evaluation(geo, tmp_path / 'e1'))
+    assert st.log[:3] == [('build', bare / 'model3d.pkl', 'reused'), ('fields', bare / 'fields.pkl', 'reused'),
+                          ('track', bare / 'track', (SCAN, 1.0, 0))]
+    assert st.stages()[3:] == ['score', 'place', 'build', 'columns', 'fields', 'track', 'score']
+    # stopped in the build with posts: what it left goes, the bare pass is not repeated
+    geo, bare = tmp_path / 'h', tmp_path / 'h' / 'bare'
+    geo.mkdir()
+    st = _Stages(monkeypatch, fail={'build': _Stop()})
+    with pytest.raises(_Stop):
+        cli.evaluate(_evaluation(geo, tmp_path / 'e2'))
+    assert (geo / 'model3d.msh').exists() and not (geo / 'model3d.pkl').exists()
+    st.fail.clear()
+    st.log.clear()
+    cfg = _evaluation(geo, tmp_path / 'e3')
+    cli.evaluate(cfg)
+    assert st.stages() == ['build', 'columns', 'fields', 'track', 'score']
+    assert st.log[0] == ('build', geo / 'model3d.pkl', 1) and cfg['geometry']['posts'] == [POST]
+    # stopped while the bare outputs move up (no posts): the model went first, the rest follows
+    geo = tmp_path / 'k'
+    geo.mkdir()
+    st = _Stages(monkeypatch, posts=())
+    moved, real_move = [], cli._move
+
+    def move(source, target):
+        if len(moved) == 2:
+            raise _Stop()
+        moved.append(Path(target).name)
+        real_move(source, target)
+
+    monkeypatch.setattr(cli, '_move', move)
+    with pytest.raises(_Stop):
+        cli.evaluate(_evaluation(geo, tmp_path / 'e4'))
+    assert moved == ['model3d.pkl', 'model3d_dees.png'] and (geo / 'model3d.pkl').exists()
+    monkeypatch.setattr(cli, '_move', real_move)
+    st.log.clear()
+    cli.evaluate(_evaluation(geo, tmp_path / 'e5'))
+    assert st.stages() == ['track', 'score']
+    for f in [*st.output_files(geo / 'model3d.pkl').values(), geo / 'fields.pkl']:
+        assert json.loads(f.read_text()) == {'posts': 0}
+
+
+def test_post_rule_guards(tmp_path, monkeypatch):
+    _Stages(monkeypatch)
+    geo = tmp_path / 'g'
+    geo.mkdir()
+    (geo / 'model3d.pkl').write_text('{}')
+    with pytest.raises(ConfigError, match='without the post record'):
+        cli.evaluate(_evaluation(geo, tmp_path / 'e0'))
+    cfg = _evaluation(tmp_path / 'h', tmp_path / 'e1')
+    cfg['geometry'] = {'posts': [POST]}
+    with pytest.raises(ConfigError, match='geometry.posts must be empty'):
+        cli.evaluate(cfg)
+    # a second model in a folder with the first one's post record
+    geo = tmp_path / 'k'
+    geo.mkdir()
+    cli.evaluate(_evaluation(geo, tmp_path / 'e2'))
+    cfg = _evaluation(geo, tmp_path / 'e3')
+    cfg['paths'] = {'model3d': str(geo / 'other_model3d.pkl'), 'fields': str(geo / 'other_fields.pkl')}
+    with pytest.raises(ConfigError, match='post record of the model model3d.pkl, not of other_model3d.pkl'):
+        cli.evaluate(cfg)

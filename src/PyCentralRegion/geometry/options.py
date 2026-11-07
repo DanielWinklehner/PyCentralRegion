@@ -146,14 +146,22 @@ class GapLine:
     from P0 inward. The offsets are fractions in [-1, 1] of what the limits allow, so every fraction gives a buildable
     line: y1 = f1 x the largest |y1| with |y1| <= r1_mm tan(gap_line_d_max_deg) and the bend at P2 (gap 0: and at P1)
     <= bend_max_deg; y0 = f0 mapped linearly onto the y0 with |y0| <= gap_line_r0_mm tan(gap_line_d_max_deg) and the
-    bend at P1 <= bend_max_deg. All fractions 0 (the cold start) put every point on the ray."""
+    bend at P1 <= bend_max_deg. All fractions 0 (the cold start) put every point on the ray. ``dr_mm`` > 0 gives P2 by
+    its distance from P1 instead, r2_mm = r1_mm + dr_mm, so an optimizer can search r1 over the turns without an ordering
+    constraint (r2_mm is then not given)."""
     gap: int
     r1_mm: float
-    r2_mm: float
+    r2_mm: float = 0.0
     f0: float = 0.0
     f1: float = 0.0
+    dr_mm: float = 0.0
 
     def __post_init__(self):
+        if self.dr_mm < 0.0 or (self.dr_mm > 0.0 and self.r2_mm != 0.0):
+            raise ConfigError(f"gap line {self.gap}: dr_mm must be > 0 and comes instead of r2_mm, got dr_mm "
+                              f"{self.dr_mm:g} / r2_mm {self.r2_mm:g}")
+        if self.dr_mm > 0.0:
+            self.r2_mm, self.dr_mm = self.r1_mm + self.dr_mm, 0.0
         if not 0.0 < self.r1_mm < self.r2_mm:
             raise ConfigError(f"gap line {self.gap}: needs 0 < r1_mm < r2_mm, got {self.r1_mm:g} / {self.r2_mm:g}")
         for name in ('f0', 'f1'):
@@ -347,6 +355,37 @@ def channel_height_mm(r_mm, radii, heights) -> float:
     if r >= r1:
         return h1
     return (h1 - h0) / (r1 - r0) * (r - r0) + h0
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+@dataclasses.dataclass
+class PostRuleConfig:
+    """The [post_rule] section: posts placed by rule from the beam of the bare electrodes, as part of `pcr evaluate`
+    (``cli.post_rule_stage``; configs/defaults/geometry.toml documents the keys and geometry.post_rule the rule)."""
+    enabled: bool = False                # off: geometry.posts is what is built
+    gaps: tuple = (1, 2, 3, 4, 5)        # gaps that get posts between the turns' bands
+    rows: tuple = (1, 2)                 # row k: between the bands of passes k and k + 1
+    inner_gaps: tuple = (1,)             # gaps that get a post on the inside of their first band
+    clear_mm: float = 5.0                # arclength left between a post and each band's edge
+    min_share: float = 0.2               # a band needs this share of the survivors' crossings
+    lo_q: float = 0.005                  # a band's edges: its quantiles lo_q and 1 - lo_q
+    inner_clear_mm: float = 5.0          # the inner post's outer end this far inside the first band's edge ...
+    inner_len_mm: float = 20.0           # ... at most this long ...
+    inner_rmin_mm: float = 45.0          # ... never below this radius ...
+    inner_smin_mm: float = 8.0           # ... or this arclength (the nose round / the housing cut)
+    scan_phases_deg: tuple = (-45.0, -30.0, -15.0, 0.0, 15.0)   # the bare run's phase scan; its final run at the best
+    scan_magnet_scale: float = 1.0       # the bare run's magnet.scale: the posts depend on the geometry alone
+
+    def __post_init__(self):
+        if 0 in self.gaps or 0 in self.inner_gaps:
+            raise ConfigError("[post_rule]: gap 0 gets no posts (its hardware is the housing exit and the hole plate "
+                              "facing it)")
+        if not self.scan_phases_deg:
+            raise ConfigError("[post_rule] scan_phases_deg: at least one phase")
+        if not (self.clear_mm >= 0.0 and self.inner_clear_mm >= 0.0 and 0.0 <= self.lo_q < 0.5
+                and 0.0 < self.min_share <= 1.0 and self.inner_len_mm > 0.0 and self.scan_magnet_scale > 0.0):
+            raise ConfigError(f"[post_rule]: wants clear_mm, inner_clear_mm >= 0, 0 <= lo_q < 0.5, "
+                              f"0 < min_share <= 1, inner_len_mm > 0, scan_magnet_scale > 0; got {self}")
 
 
 # ---------------------------------------------------------------------------------------------------------------------

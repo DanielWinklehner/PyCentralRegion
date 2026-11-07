@@ -41,6 +41,7 @@ SECTIONS = {
     'magnet': 'PyCentralRegion.config:MagnetConfig',
     'inflector': 'PyCentralRegion.config:InflectorConfig',
     'geometry': 'PyCentralRegion.geometry.options:GeometryConfig',
+    'post_rule': 'PyCentralRegion.geometry.options:PostRuleConfig',
     'fields': 'PyCentralRegion.config:FieldsConfig',
     'track': 'PyCentralRegion.config:TrackConfig',
     'slit': 'PyCentralRegion.config:SlitConfig',

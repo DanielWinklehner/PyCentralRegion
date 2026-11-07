@@ -128,6 +128,8 @@ def value(scores, path):
 
 FULL_CORNERS_MAX = 12        # a section box of up to this many variables is checked at every corner
 RANDOM_CORNERS = 64          # ... a larger one per table, plus this many random corners of the whole box
+# what the bare run of [post_rule] (cli._bare_pass) sets itself; it takes every other setting from the evaluation
+BARE_PASS_TARGETS = ('track.phases_deg', 'magnet.scale')
 
 
 def _box_corners(box):
@@ -265,6 +267,7 @@ class Campaign:
         self.runner = runner
         self._base = {}
         self.check_overrides()
+        self.check_post_rule()
 
     # ---- configuration of one evaluation
     def base(self, fidelity):
@@ -308,6 +311,19 @@ class Campaign:
                 return
             except (config.ConfigError, TypeError, ValueError) as ex:
                 raise config.ConfigError(f"[mobo] {' '.join(sets) or f'fidelity {fidelity!r}'}: {ex}") from None
+
+    def check_post_rule(self):
+        """With posts by rule in the loop ([post_rule] enabled in the base) a geometry's posts come from a bare run in
+        its first evaluation, which sets the RF phase and the magnet level itself (BARE_PASS_TARGETS) and takes every
+        other setting from that evaluation: a cheap variable of another target would make the posts depend on which
+        evaluation of the geometry came first. Warns of each."""
+        if not self.base(self.cfg.search_fidelity).get('post_rule', {}).get('enabled'):
+            return
+        for v in self.cfg.cheap_variables:
+            if v.target not in BARE_PASS_TARGETS:
+                warnings.warn(f"[mobo] variable {v.name!r} is cheap and sets {v.target}: the post rule's bare run takes "
+                              f"it from the geometry's first evaluation, so the posts depend on that evaluation",
+                              stacklevel=2)
 
     def current(self, v):
         """The value a variable's target has in the base config: set there, else its section's default."""

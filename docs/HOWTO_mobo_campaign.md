@@ -155,6 +155,14 @@ A radial slit comes after, in a campaign of its own on the design this one choos
 opening, azimuth and offset at one fixed pass (one campaign per pass), 20 evaluations of about 1.6-1.9 min. Its
 header says how to point it at a campaign's design.
 
+`mobo_v6o_c1.toml` is the full optimisation from a cold start: the dee opening, the beam channel and all eight
+connected gap lines (36 geometry variables) with the RF phase and the magnet level (cheap), three objectives, and
+posts placed by rule in every new geometry's first evaluation (`[post_rule]` in its base run file
+`design_v6o_c1_cold.toml`; `docs/mobo.md`, "Posts in the loop"). That first evaluation builds, solves and tracks the
+geometry twice, bare and with its posts, so it takes several times a plain one (its header gives the measured times).
+Run it detached for a set number of hours (`--max-hours`) and stop it from the outside when needed: running the same
+command again continues it.
+
 `--max-hours` bounds one run of the driver. `max_evals` bounds the whole campaign (`--max-evals N` overrides it);
 running the same command again continues to it. `--set key=value` overrides any key of the campaign file for one run,
 e.g. `--set mobo.seed=3`.

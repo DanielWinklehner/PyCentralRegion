@@ -107,6 +107,8 @@ obstacles = "columns"       # metal test: "columns" (the metal's z intervals per
                             # for comparisons with deck runs) | "mesh" (the model's triangles, GPU, no fast path)
 extra_posts_mm = []         # full-height grounded posts [[x, y, r], ...] mm; obstacle test only, the field is unchanged
 extra_boxes_mm = []         # full-height grounded boxes [[xmin, xmax, ymin, ymax], ...] mm; obstacle test only
+extra_jaws_mm = []          # vertical jaw pairs [[x, y, r, z_half], ...] mm: metal at |z| >= z_half over the disc;
+                            # obstacle test only
 
 [slit]                      # a two-sided radial slit: two thin full-height jaws on one ray (obstacle only, no field;
                             # exact for jaws mounted inside a dee, away from its gaps). Cheap to optimise: no new BEM.

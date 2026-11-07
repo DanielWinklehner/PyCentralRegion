@@ -55,8 +55,15 @@
 # (P0 and P1 within gap_line_d_max_deg of the ray, the bends at P1 and P2 <= bend_max_deg), so every fraction gives a
 # buildable line and all 0 is the radial line. Gap 0 starts where the turned exit-plate line meets its ray (needs
 # gap0_on_plate; its bend there is free) and has no f0. One [[geometry.gap_line]] per gap, gaps 0 .. n in order:
-#     [[geometry.gap_line]]   # gap, r1_mm, r2_mm (0 < r1 < r2), f0 (= 0), f1 (= 0)
+#     [[geometry.gap_line]]   # gap, r1_mm, r2_mm (0 < r1 < r2) or dr_mm (> 0, instead of r2_mm: r2 = r1 + dr),
+#                             # f0 (= 0), f1 (= 0)
 # snap_nodes must be false and junctions empty (both move the seed's nodes).
+#
+# POSTS IN THE LOOP ([post_rule] enabled, read by `pcr evaluate` only): a geometry is first built, solved and tracked
+# bare, with a phase scan at magnet.scale = scan_magnet_scale; the rule places posts between the turns' bands of the
+# bare run's final tracks (PyCentralRegion.geometry.post_rule); the geometry is then built and solved again with them,
+# and that is the model every evaluation of the geometry tracks. geometry.posts must be empty. A post is
+# post_size_mm deep, with post_shape; set "cylinder" in the design so that both passes agree.
 #
 # tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/geometry/options.py.
 
@@ -141,3 +148,18 @@ mesh_flip_min_deg = 5.0      # repair triangles with an angle below this by edge
 occ_fuzzy_mm = 0.05          # OCC fuzzy boolean tolerance; 0 = exact booleans
 # output
 plot_dees = true             # write <prefix>_dees.png (the 2D layout) next to the model
+
+[post_rule]
+enabled = false              # off: geometry.posts is what is built
+gaps = [1, 2, 3, 4, 5]       # gaps that get posts between the turns' bands (gap 0 never: the housing exit and hole plate)
+rows = [1, 2]                # row k: between the bands of passes k and k + 1
+inner_gaps = [1]             # gaps that get a post on the inside of their first band
+clear_mm = 5.0               # arclength left between a post and each band's edge
+min_share = 0.2              # a band needs this share of the survivors' crossings
+lo_q = 0.005                 # a band's edges: its quantiles lo_q and 1 - lo_q
+inner_clear_mm = 5.0         # the inner post's outer end this far inside the first band's edge ...
+inner_len_mm = 20.0          # ... at most this long ...
+inner_rmin_mm = 45.0         # ... never below this radius ...
+inner_smin_mm = 8.0          # ... or this arclength (the nose round / the housing cut)
+scan_phases_deg = [-45.0, -30.0, -15.0, 0.0, 15.0]   # the bare run's phase scan; its final run at the best
+scan_magnet_scale = 1.0      # the bare run's magnet.scale: the posts depend on the geometry alone
