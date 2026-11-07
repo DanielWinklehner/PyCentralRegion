@@ -63,8 +63,8 @@ warm_start = [
     { phi = 34.0 },
     { phi = 42.0 },
     { phi = 45.0 },
-    { phi = 36.0, ap_inner = 34.804, ap_outer = 28.874, ap_center = 189.60, ap_length = 129.47 },
-    { phi = 40.0, ap_inner = 34.804, ap_outer = 28.874, ap_center = 189.60, ap_length = 129.47 },
+    { phi = 36.0, ap_inner = 34.804, ap_outer = 28.874, ap_start = 124.865, ap_length = 129.47 },   # centre 189.60
+    { phi = 40.0, ap_inner = 34.804, ap_outer = 28.874, ap_start = 124.865, ap_length = 129.47 },
 ]
 
 # --- geometry: the dee opening (the spiral inflector turns with it) -------------------------------------------------
@@ -75,8 +75,13 @@ low = 34.0
 high = 45.0
 kind = "geometry"
 
-# --- geometry: the beam channel [mm] (full heights: up to 2 x (plate_half_gap 24.5 - 5); at least the inflector's
-#     exit with its margin, 21.3) -------------------------------------------------------------------------------------
+# --- geometry: the beam channel [mm], the dees' and the dummy dees' alike (full heights: at least the inflector's exit
+#     with its margin, 21.3). The noses' face (z 25.0 mm out to r 70) allows 40 mm inside the taper (39: 0.5 mm of
+#     clearance), the poles' narrowest gap 50 mm beyond it. The taper starts no further in than where the noses' own
+#     taper begins (r 70; 72: 2 mm of clearance), so every point of the box fits the plates: the inner height fits at
+#     the taper's start (the bound is 42.3 mm at r 72 and rises 1.16 mm per mm to 50 at r 78.6), the outer at its end
+#     (r 82 or beyond), and beyond r 70 the bound only bends down, so the straight taper between stays under it. The
+#     build checks it at every radius (geometry.plate_profile_mm in the design file). ----------------------------------
 [[mobo.variables]]
 name = "ap_inner"
 target = "geometry.aperture_inner_mm"    # inside the taper
@@ -88,14 +93,14 @@ kind = "geometry"
 name = "ap_outer"
 target = "geometry.aperture_outer_mm"    # beyond it
 low = 22.0
-high = 39.0
+high = 50.0
 kind = "geometry"
 
 [[mobo.variables]]
-name = "ap_center"
-target = "geometry.aperture_taper_center_mm"
-low = 90.0
-high = 220.0
+name = "ap_start"
+target = "geometry.aperture_taper_start_mm"   # where the taper starts
+low = 72.0
+high = 215.0
 kind = "geometry"
 
 [[mobo.variables]]

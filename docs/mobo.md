@@ -128,8 +128,9 @@ and `[fields]` as the base run file writes them (with `fixed` and the fidelity's
 placed by rule (`[post_rule] enabled`, "Posts in the loop") it also holds `[post_rule]` and the maps the bare run
 reads, `paths.bfield_3d` and `paths.inflector_efield`. It holds
 neither the code's defaults nor the files' contents: after a change of either, start another `campaign_dir`.
-The taper's place (`aperture_taper_center_mm`, `aperture_taper_length_mm`) is left out where the dees' channel and
-the dummy dees' each have one height at every radius (`GeometryConfig.idle_keys`): there it changes no electrode, it
+The taper's place (`aperture_taper_center_mm`, `aperture_taper_length_mm`, `aperture_taper_start_mm`) is left out
+where the dees' channel and the dummy dees' each have one height at every radius (`GeometryConfig.idle_keys`): there
+it changes no electrode, it
 only adds points to the aperture tool, so the designs of one flat channel share one key and one build, and the parts
 list the keys left out (`idle`). No other key is left out (one that changes no electrode, such as `plot_dees`, still
 keys the geometry), and every other design's key is the hash of its parts as it always was.
@@ -156,7 +157,7 @@ Useful targets:
 | magnet level | `magnet.scale` | cheap |
 | spiral-inflector rotation | `inflector.rotation_deg` (with `geometry.si_rotation = "fixed"`) | geometry |
 | dee opening | `machine.dee_opening_deg` (with `geometry.si_rotation = "corner"` the inflector turns with it) | geometry |
-| dee vertical aperture | `geometry.aperture_inner_mm`, `aperture_outer_mm`, `aperture_taper_center_mm`, `aperture_taper_length_mm` | geometry |
+| dee vertical aperture | `geometry.aperture_inner_mm`, `aperture_outer_mm`, `aperture_taper_center_mm` or `aperture_taper_start_mm` (a box that keeps the taper outside a radius), `aperture_taper_length_mm` | geometry |
 | a connected gap line | `geometry.gap_line.<i>.r1_mm`, `dr_mm` (P2 at r1 + dr: no ordering constraint), `f0`, `f1` | geometry |
 | a gap window | `geometry.windows.<i>.half_height_mm` | geometry |
 

@@ -77,7 +77,11 @@ Before the first real run, check the campaign file:
 - The variables' ranges. For the dee aperture (`python -m PyCentralRegion.geometry.build bounds <base run toml>`
   prints the bounds; `geometry.options.check_bounds` holds the first three at build time):
   - every height <= 2 × (`geometry.plate_half_gap_mm` - `geometry.dee_wall_mm`), so the dee plates fit the gap
-    (40 mm on the worked example);
+    (40 mm on the worked example); where `geometry.plate_profile_mm` narrows the gap (a pole nose and its own
+    taper), at each radius with the half gap there. To keep every point of the box buildable, give the taper by its
+    start (`aperture_taper_start_mm`) with a lower bound no further in than where the nose's taper begins, the inner
+    height below the nose's bound and the outer one below the outer gap's: a taper at least as long as the nose's
+    rise to the outer bound then never cuts into it (the v6o_c1 campaign, `mobo_v6o_c1.toml`, does this);
   - the inner heights >= 2 × the spiral-inflector housing exit's half height, so the channel clears the exit
     (21.48 mm on the worked example);
   - the channel heights at the housing exit's outermost radius (dees and dummy dees) >= the same bound, so the channel

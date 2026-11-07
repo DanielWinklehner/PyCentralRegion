@@ -5,7 +5,10 @@
 # - the v6o_c1 hand-off (R 10 mm about the centroid, 97,981 particles, 8.035 mA), the inflector's E-field and housing
 #   from its levelled export (the emitting plane and the exit-plane spec found beside the housing outline);
 # - the dee opening 38 deg, at which the corner rule turns the inflector by 0 deg (19 - opening / 2), as exported;
-# - the plates at |z| 24.5 mm, the v6 map's iron face (channel heights up to 2 x (24.5 - 5) = 39 mm);
+# - the iron of the magnet's STEP (minidar_2010632.stp, 2026-11-06; the v6 map agrees to its 1 mm grid): the noses'
+#   face at z 25.0 mm out to r 70 mm and their own taper to 48.2 mm at r 110 (plate_profile_mm), the poles' narrowest
+#   half gap 30 mm at r 360 (plate_half_gap_mm): with 5 mm plates the channel may be 40 mm high inside r 70 and open
+#   up along the noses' taper to 50 mm at r 78.6 and beyond (the dees and the dummy dees alike);
 # - posts placed by rule in every evaluation of a new geometry ([post_rule]: a bare run, then the posts between the
 #   turns' bands on gaps 1-5 and inside the first band on gap 1); round posts (post_shape "cylinder").
 # The gap-line items give P2 by its distance from P1 (dr_mm), so an optimizer can move r1 over the turns freely; with
@@ -39,7 +42,9 @@ dee_opening_deg = 38.0
 rotation_deg = 0.0                     # the corner rule's turn at 38 deg
 
 [geometry]
-plate_half_gap_mm = 24.5
+plate_half_gap_mm = 30.0                            # the poles' narrowest half gap (r 360 mm): a channel up to 50 mm
+plate_profile_mm = [[70.0, 25.0], [110.0, 48.2]]    # the noses (face z 25.0 for r 50 .. 70) and their own taper
+aperture_taper_start_mm = 100.0                     # the base's taper (centre 120, length 40) by its start
 post_shape = "cylinder"
 
 # r1 / dr as in design_connected_cold.toml (r2 = r1 + dr)

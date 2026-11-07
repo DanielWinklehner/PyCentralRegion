@@ -38,7 +38,8 @@ def test_defaults_and_the_channel():
     g = GeometryConfig()
     assert g.aperture_heights() == (26.0, 30.0) and g.aperture_radii() == (100.0, 140.0)
     assert g.dummy_aperture_heights() == g.aperture_heights()          # 0 = the dees' values
-    assert O.check_bounds(g) == {'height_max_mm': 30.0, 'inner_min_mm': None, 'exit_r_mm': None}   # (their own bounds)
+    assert O.check_bounds(g) == {'height_max_mm': 30.0, 'height_max_inner_mm': 30.0, 'inner_min_mm': None,
+                                 'exit_r_mm': None}                                                 # (their own bounds)
     assert GeometryConfig(dummy_aperture_inner_mm=28.0).dummy_aperture_heights() == (28.0, 30.0)
     assert g.si_rotation == 'fixed'
 
@@ -99,6 +100,52 @@ def test_bounds_name_the_bound():
         O.check_bounds(GeometryConfig(dummy_aperture_outer_mm=31.0))
     with pytest.raises(ConfigError, match="leaves no room"):
         O.check_bounds(GeometryConfig(plate_half_gap_mm=5.0))
+
+
+def test_the_plates_bound_follows_a_nose_and_its_taper():
+    """A pole nose narrows the plates' gap inside its radius (plate_profile_mm, here the face at z 25 mm out to r 70
+    and its own taper to 48.2 mm at r 110, the gap elsewhere 30 mm): the channel may be 40 mm inside r 70, open up
+    along the nose's taper (50 mm from r 78.6) and be 50 mm beyond, but never cut into the nose."""
+    nose = dict(plate_half_gap_mm=30.0, plate_profile_mm=((70.0, 25.0), (110.0, 48.2)))
+    g = GeometryConfig(aperture_inner_mm=39.0, aperture_outer_mm=50.0, aperture_taper_start_mm=72.0,
+                       aperture_taper_length_mm=10.0, **nose)
+    assert g.aperture_radii() == (72.0, 82.0)
+    assert O.plate_bend_radii(g) == [70.0, pytest.approx(70.0 + 5.0 / 0.58), 110.0]
+    assert [O.channel_height_max_at_mm(g, r) for r in (0.0, 70.0, 90.0, 300.0)] == pytest.approx([40.0, 40.0, 50.0,
+                                                                                                  50.0])
+    assert O.channel_height_max_at_mm(g, 75.0) == pytest.approx(2.0 * (25.0 + 0.58 * 5.0 - 5.0))
+    assert O.check_bounds(g) == {'height_max_mm': 50.0, 'height_max_inner_mm': 40.0, 'inner_min_mm': None,
+                                 'exit_r_mm': None}
+    with pytest.raises(ConfigError, match=r"aperture_inner_mm = 41 mm exceeds its bound at r = 0 mm, 2 x \(the plates' "
+                                          r"half gap there 25 \(geometry\.plate_profile_mm"):
+        O.check_bounds(dataclasses.replace(g, aperture_inner_mm=41.0))
+    O.check_bounds(dataclasses.replace(g, aperture_inner_mm=22.0, aperture_taper_start_mm=70.0))  # steeper, below it
+    with pytest.raises(ConfigError, match=r"the channel is 42\.667 mm high at r = 70 mm, inside its taper \(60 \.\. 90 "
+                                          r"mm\), and exceeds its bound at r = 70 mm"):
+        O.check_bounds(dataclasses.replace(g, aperture_taper_start_mm=60.0, aperture_taper_length_mm=30.0))
+    with pytest.raises(ConfigError, match=r"aperture_outer_mm = 50 mm exceeds its bound at r = 70 mm"):
+        O.check_bounds(dataclasses.replace(g, aperture_inner_mm=22.0, aperture_taper_start_mm=60.0))  # ends too early
+    with pytest.raises(ConfigError, match=r"dummy_aperture_outer_mm = 51 mm exceeds its bound at r = 82 mm"):
+        O.check_bounds(dataclasses.replace(g, dummy_aperture_outer_mm=51.0))
+    with pytest.raises(ConfigError, match="leaves no room"):
+        O.check_bounds(GeometryConfig(plate_half_gap_mm=30.0, plate_profile_mm=((70.0, 4.0), (110.0, 48.2))))
+    for bad in (((70.0, 25.0), (60.0, 30.0)), ((70.0, 0.0),), ((70.0,),), (70.0, 25.0)):
+        with pytest.raises(ConfigError, match="plate_profile_mm wants"):
+            GeometryConfig(plate_profile_mm=bad)
+
+
+def test_the_taper_by_its_start(tmp_path):
+    """aperture_taper_start_mm gives the taper by its inner end (an optimizer can then keep it outside a radius with a
+    box): it replaces the centre, and a flat channel leaves it out of the geometry key like the centre."""
+    g = GeometryConfig(aperture_taper_start_mm=90.0, aperture_taper_length_mm=60.0)
+    assert g.aperture_radii() == (90.0, 150.0) and g.aperture_taper_center_mm == 120.0
+    assert GeometryConfig(aperture_taper_start_mm=90.0, aperture_taper_center_mm=300.0).aperture_radii() == (90.0, 130.0)
+    flat = GeometryConfig(aperture_outer_mm=26.0, aperture_taper_start_mm=90.0)
+    assert 'aperture_taper_start_mm' in flat.idle_keys() and not g.idle_keys()
+    back = C.section(_load(tmp_path, O.to_toml(g)), 'geometry')
+    assert back == g and back.aperture_radii() == (90.0, 150.0)
+    with pytest.raises(ConfigError, match="aperture_taper_start_mm must be >= 0"):
+        GeometryConfig(aperture_taper_start_mm=-1.0)
 
 
 def test_an_inverted_taper_must_clear_the_exit():
@@ -173,7 +220,7 @@ def test_design_example_geometry_table():
     g = C.section(C.load(DESIGN), 'geometry')
     assert g == GeometryConfig(**REF_GEOMETRY)
     assert O.check_bounds(g, exit_half_height_mm=10.741, exit_r_mm=84.87) == {
-        'height_max_mm': 40.0, 'inner_min_mm': pytest.approx(21.482), 'exit_r_mm': 84.87}
+        'height_max_mm': 40.0, 'height_max_inner_mm': 40.0, 'inner_min_mm': pytest.approx(21.482), 'exit_r_mm': 84.87}
 
 
 def _connected(**kw):
@@ -287,8 +334,14 @@ def test_exit_half_height_and_bounds_from_the_outline(tmp_path):
                        "aperture 4\n30 -5 -9\n30 5 -9\n30 5 11\n30 -5 11\n")
     assert B.exit_half_height_mm(B.read_housing_outline(outline)) == 11.0
     cfg = _load(tmp_path, f'[paths]\nhousing_outline = "{outline.as_posix()}"\n[geometry]\nplate_half_gap_mm = 25.0\n')
-    assert GB.bounds(cfg) == {'height_max_mm': 40.0, 'inner_min_mm': 22.0, 'exit_r_mm': pytest.approx(925.0 ** 0.5),
-                              'exit_half_height_mm': 11.0, 'plate_half_gap_mm': 25.0, 'dee_wall_mm': 5.0}
+    assert GB.bounds(cfg) == {'height_max_mm': 40.0, 'height_max_inner_mm': 40.0, 'inner_min_mm': 22.0,
+                              'exit_r_mm': pytest.approx(925.0 ** 0.5), 'exit_half_height_mm': 11.0,
+                              'plate_half_gap_mm': 25.0, 'plate_profile_mm': [], 'dee_wall_mm': 5.0}
+    cfg = _load(tmp_path, f'[paths]\nhousing_outline = "{outline.as_posix()}"\n[geometry]\nplate_half_gap_mm = 30.0\n'
+                          f'plate_profile_mm = [[70, 25], [110, 48.2]]\n')
+    b = GB.bounds(cfg)
+    assert (b['height_max_mm'], b['height_max_inner_mm'], b['plate_profile_mm']) == (50.0, 40.0, [[70.0, 25.0],
+                                                                                                  [110.0, 48.2]])
     # aperture_inset_mm is (long side, short side): the 20 mm z side is the LONGER edge, 1 mm off each of its ends
     cfg = _load(tmp_path, f'[paths]\nhousing_outline = "{outline.as_posix()}"\n[geometry]\naperture_inset_mm = [1.0, 0.0]\n')
     assert GB.bounds(cfg)['exit_half_height_mm'] == 10.0

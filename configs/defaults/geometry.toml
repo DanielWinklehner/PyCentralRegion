@@ -13,7 +13,8 @@
 #
 # THE BEAM CHANNEL. Every dee is hollowed by a channel of full height aperture_inner_mm inside the radial taper and
 # aperture_outer_mm beyond it, linear in between, from r0 = aperture_taper_center_mm - aperture_taper_length_mm / 2 to
-# r1 = aperture_taper_center_mm + aperture_taper_length_mm / 2. The dummy dees and the star ground share the taper and
+# r1 = aperture_taper_center_mm + aperture_taper_length_mm / 2, or from r0 = aperture_taper_start_mm over the length
+# when the start is given (it replaces the centre). The dummy dees and the star ground share the taper and
 # take dummy_aperture_inner_mm / dummy_aperture_outer_mm when those are non-zero. The four channel fields are
 # independent - an optimiser needs no ordering constraint (inner > outer is an inverted taper). The old
 # "inner,outer" / "r0,r1" strings convert with options.aperture_from_spec ("26,32", "100,140" -> 26 / 32 / 120 / 40).
@@ -22,7 +23,10 @@
 # (`python -m PyCentralRegion.geometry.build bounds run.toml` prints them for a config):
 #   every channel height (dees, and dummy dees when set) <= 2 x (plate_half_gap_mm - dee_wall_mm)
 #       the dee plates, dee_wall_mm thick, must fit inside the vertical gap of the plates / poles they sit between
-#       (40 mm for a 25 mm half gap and 5 mm walls; 30 mm for these defaults);
+#       (40 mm for a 25 mm half gap and 5 mm walls; 30 mm for these defaults); where plate_profile_mm narrows that
+#       half gap (a pole nose and its own taper), the channel at each radius <= 2 x (the half gap there - dee_wall_mm):
+#       with [[70, 25], [110, 48.2]] and plate_half_gap_mm = 30 the channel may be 40 mm inside r 70, open up along
+#       the nose's taper (to 50 mm at r 78.6) and be 50 mm beyond;
 #   aperture_inner_mm (and dummy_aperture_inner_mm when set) >= 2 x the spiral-inflector housing exit's half height,
 #   and so is the channel height (dees and dummy dees) at the exit's outermost radius
 #       the channel must clear the exit the beam leaves the housing by over the opening's whole radial span (the second
@@ -97,9 +101,12 @@ aperture_inner_mm = 26.0     # dee channel full height inside the taper (>= 2 x 
 aperture_outer_mm = 30.0     # ... and beyond it (<= 2 x (plate_half_gap_mm - dee_wall_mm))
 aperture_taper_center_mm = 120.0   # the height changes linearly over centre -+ length / 2
 aperture_taper_length_mm = 40.0    # (> 0)
+aperture_taper_start_mm = 0.0      # > 0: the taper runs from here over its length (replaces the centre)
 dummy_aperture_inner_mm = 0.0      # dummy dees' (and star ground's) full heights; 0 = the dees' value
 dummy_aperture_outer_mm = 0.0
 plate_half_gap_mm = 20.0     # half the vertical gap of the plates / poles the dees sit between
+plate_profile_mm = []        # where that gap is narrower: [[r, half gap], ...] mm, r ascending, linear between,
+                             # constant beyond the ends; the half gap at r is the smaller of it and plate_half_gap_mm
 # dees
 r_max_mm = 0.0               # dees and model end here (<= [machine] r_max_cavity_m); 0 = r_max_cavity_m
 housing_clearance_mm = 10.0  # the dee metal of gaps 1 .. n stays this far off the housing

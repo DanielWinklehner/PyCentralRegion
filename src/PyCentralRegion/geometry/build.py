@@ -56,7 +56,7 @@ from PyCentralRegion import config as C
 from PyCentralRegion.config import ConfigError
 from . import builder as B
 from . import views as V
-from .options import HoleSpec, channel_height_max_mm, check_bounds
+from .options import HoleSpec, channel_height_max_at_mm, channel_height_max_mm, check_bounds, plate_bend_radii
 
 EXPORT_HANDOFFS = ('handoff_sc_all_level.h5', 'handoff_vac_all_level.h5')
 EXIT_SPEC_NAME = 'exit_plane_spec.json'
@@ -142,10 +142,16 @@ def _channel_report(g, bounds: dict, exit_half: float) -> None:
     print(f"  dees: {g.aperture_inner_mm:g} mm inside r = {r0:g} mm, {g.aperture_outer_mm:g} mm beyond r = {r1:g} mm "
           f"(taper centre {g.aperture_taper_center_mm:g}, length {g.aperture_taper_length_mm:g} mm)")
     print("  dummy dees and ground: " + ("the dees' heights" if same else f"{d_in:g} / {d_out:g} mm (an asymmetric gap)"))
-    print(f"  bounds: every height <= 2 x (plate_half_gap_mm {g.plate_half_gap_mm:g} - dee_wall_mm {g.dee_wall_mm:g}) "
-          f"= {bounds['height_max_mm']:g} mm; the inner heights and the heights at the housing exit's outermost "
-          f"radius {bounds['exit_r_mm']:.2f} mm >= 2 x its half height {exit_half:.3f} = {bounds['inner_min_mm']:.3f} mm"
-          f"  -> within bounds")
+    if g.plate_profile_mm:
+        at = ", ".join(f"{channel_height_max_at_mm(g, r):g} mm at r = {r:g}" for r in plate_bend_radii(g))
+        print(f"  bounds: every height <= 2 x (the plates' half gap there - dee_wall_mm {g.dee_wall_mm:g}): "
+              f"plate_half_gap_mm {g.plate_half_gap_mm:g} narrowed by plate_profile_mm, {at} (linear between, constant "
+              f"beyond)")
+    else:
+        print(f"  bounds: every height <= 2 x (plate_half_gap_mm {g.plate_half_gap_mm:g} - dee_wall_mm "
+              f"{g.dee_wall_mm:g}) = {bounds['height_max_mm']:g} mm")
+    print(f"  the inner heights and the heights at the housing exit's outermost radius {bounds['exit_r_mm']:.2f} mm "
+          f">= 2 x its half height {exit_half:.3f} = {bounds['inner_min_mm']:.3f} mm  -> within bounds")
 
 
 def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
@@ -221,11 +227,13 @@ def _layout_rest(cfg, s, g, inp, dees, geom, result, trj, si_rot, dees_png, line
 
 
 def bounds(cfg) -> dict:
-    """The channel-height bounds of this config's build [mm] without building: {'height_max_mm' (every height),
+    """The channel-height bounds of this config's build [mm] without building: {'height_max_mm' (every height, where
+    the plates are furthest apart), 'height_max_inner_mm' (on the axis: inside plate_profile_mm's first point),
     'inner_min_mm' (aperture_inner_mm and dummy_aperture_inner_mm, and the heights at exit_r_mm), 'exit_r_mm' (the
-    housing exit's outermost radius), 'exit_half_height_mm', 'plate_half_gap_mm', 'dee_wall_mm'}: what a campaign sets
-    its geometry.aperture_*_mm ranges from. Reads the housing outline only and does not check the current heights
-    (``build`` does)."""
+    housing exit's outermost radius), 'exit_half_height_mm', 'plate_half_gap_mm', 'plate_profile_mm', 'dee_wall_mm'}:
+    what a campaign sets its geometry.aperture_*_mm ranges from (with a profile, the taper's radii too: the bound at a
+    radius is ``options.channel_height_max_at_mm``). Reads the housing outline only and does not check the current
+    heights (``build`` does)."""
     g = C.section(cfg, 'geometry')
     pc = C.section(cfg, 'paths')
     ol = B.read_housing_outline(_existing(C.require(pc.housing_outline, 'paths.housing_outline'),
@@ -234,8 +242,9 @@ def bounds(cfg) -> dict:
         with contextlib.redirect_stdout(io.StringIO()):
             ol['aperture'] = B.inset_aperture(ol['aperture'], *map(float, g.aperture_inset_mm))
     e = B.exit_half_height_mm(ol)
-    return {'height_max_mm': channel_height_max_mm(g), 'inner_min_mm': 2.0 * e, 'exit_r_mm': B.exit_radius_mm(ol),
-            'exit_half_height_mm': e, 'plate_half_gap_mm': float(g.plate_half_gap_mm),
+    return {'height_max_mm': channel_height_max_mm(g), 'height_max_inner_mm': channel_height_max_at_mm(g, 0.0),
+            'inner_min_mm': 2.0 * e, 'exit_r_mm': B.exit_radius_mm(ol), 'exit_half_height_mm': e,
+            'plate_half_gap_mm': float(g.plate_half_gap_mm), 'plate_profile_mm': [list(p) for p in g.plate_profile_mm],
             'dee_wall_mm': float(g.dee_wall_mm)}
 
 

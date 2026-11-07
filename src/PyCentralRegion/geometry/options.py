@@ -12,13 +12,16 @@ Lengths are millimetres (the units of the housing outline and of gmsh), angles d
 
 The beam channel: every dee is hollowed by a channel of full height ``aperture_inner_mm`` inside the radial taper and
 ``aperture_outer_mm`` beyond it, linear in between, from r0 = aperture_taper_center_mm - aperture_taper_length_mm / 2
-to r1 = aperture_taper_center_mm + aperture_taper_length_mm / 2 (``channel_height_mm``). The dummy dees (and the star
-ground) share the taper radii and take their own heights when ``dummy_aperture_inner_mm`` / ``dummy_aperture_outer_mm``
-are non-zero. The four are independent (an optimiser needs no ordering constraint: inner > outer is an inverted
-taper); when both channels are flat (inner = outer, for the dees and for the dummy dees) the taper's place changes
-no electrode (``GeometryConfig.idle_keys``). ``check_bounds`` holds them to what can be built, at build time:
+to r1 = aperture_taper_center_mm + aperture_taper_length_mm / 2 (``channel_height_mm``), or from r0 =
+aperture_taper_start_mm over the length when the start is given. The dummy dees (and the star ground) share the taper
+radii and take their own heights when ``dummy_aperture_inner_mm`` / ``dummy_aperture_outer_mm`` are non-zero. The four
+are independent (an optimiser needs no ordering constraint: inner > outer is an inverted taper); when both channels
+are flat (inner = outer, for the dees and for the dummy dees) the taper's place changes no electrode
+(``GeometryConfig.idle_keys``). ``check_bounds`` holds them to what can be built, at build time:
 
-* every height <= 2 x (plate_half_gap_mm - dee_wall_mm): the dee plates must fit inside the plate / pole gap;
+* at every radius, every height <= 2 x (the plates' half gap there - dee_wall_mm): the dee plates must fit inside the
+  plate / pole gap. The half gap is plate_half_gap_mm, or ``plate_profile_mm`` where that is smaller (a pole nose and
+  its own taper: the channel may open up along the nose's taper, never into it);
 * the channel clears the spiral-inflector housing's exit, the opening the beam leaves the housing by: the inner
   heights, and the heights at the exit's outermost radius, >= 2 x the exit's half height (the largest |z| of the exit
   aperture the housing outline carries, after aperture_inset_mm). The second binds only for an inverted taper that
@@ -208,10 +211,15 @@ class GeometryConfig:
     aperture_outer_mm: float = 30.0      # ... and outside it
     aperture_taper_center_mm: float = 120.0   # the taper runs linearly over centre -+ length / 2
     aperture_taper_length_mm: float = 40.0    # (> 0)
+    aperture_taper_start_mm: float = 0.0      # > 0: the taper runs from here over its length instead (it replaces the
+                                              # centre: start + length / 2)
     dummy_aperture_inner_mm: float = 0.0      # dummy dees' (and star ground's) full heights; 0 = the dees' value
     dummy_aperture_outer_mm: float = 0.0
     plate_half_gap_mm: float = 20.0      # half the vertical gap of the plates / poles the dees sit between: every
                                          # channel height <= 2 x (plate_half_gap_mm - dee_wall_mm)
+    plate_profile_mm: tuple = ()         # where that gap is narrower: [[r, half gap], ...] mm, r ascending, linear
+                                         # between, constant beyond the ends (a pole nose and its taper); the plates'
+                                         # half gap at r is the smaller of it and plate_half_gap_mm
     # --- dees ----------------------------------------------------------------------------------------------------
     r_max_mm: float = 0.0                # dees and model end here (<= [machine] r_max_cavity_m); 0 = r_max_cavity_m
     housing_clearance_mm: float = 10.0   # the dee metal of gaps 1 .. n stays this far off the housing
@@ -278,9 +286,20 @@ class GeometryConfig:
                      'plate_half_gap_mm', 'lc_mm'):
             if not getattr(self, name) > 0.0:
                 raise ConfigError(f"geometry.{name} must be > 0, got {getattr(self, name)!r}")
-        for name in ('dummy_aperture_inner_mm', 'dummy_aperture_outer_mm', 'dee_wall_mm'):
+        for name in ('dummy_aperture_inner_mm', 'dummy_aperture_outer_mm', 'dee_wall_mm', 'aperture_taper_start_mm'):
             if getattr(self, name) < 0.0:
                 raise ConfigError(f"geometry.{name} must be >= 0, got {getattr(self, name)!r}")
+        if self.aperture_taper_start_mm > 0.0:
+            self.aperture_taper_center_mm = float(self.aperture_taper_start_mm) + 0.5 * float(self.aperture_taper_length_mm)
+        try:
+            profile = tuple((float(r), float(h)) for r, h in self.plate_profile_mm)
+        except (TypeError, ValueError):
+            profile = None
+        if profile is None or any(r < 0.0 or h <= 0.0 for r, h in profile) or any(
+                b[0] <= a[0] for a, b in zip(profile, profile[1:])):
+            raise ConfigError(f"geometry.plate_profile_mm wants [r, half gap] pairs [mm], r >= 0 ascending and half "
+                              f"gaps > 0; got {self.plate_profile_mm!r}")
+        self.plate_profile_mm = profile
         r0, r1 = self.aperture_radii()
         if not 0.0 < r0 < r1 < 1000.0:
             raise ConfigError(f"geometry.aperture_taper_center_mm / aperture_taper_length_mm: the taper must lie inside "
@@ -342,7 +361,7 @@ class GeometryConfig:
         so the designs of one flat channel share one build. Other keys that change no electrode (plot_dees, say)
         stay in the key."""
         flat = len(set(self.aperture_heights())) == 1 and len(set(self.dummy_aperture_heights())) == 1
-        return ('aperture_taper_center_mm', 'aperture_taper_length_mm') if flat else ()
+        return ('aperture_taper_center_mm', 'aperture_taper_length_mm', 'aperture_taper_start_mm') if flat else ()
 
 
 def channel_height_mm(r_mm, radii, heights) -> float:
@@ -391,36 +410,96 @@ class PostRuleConfig:
 # ---------------------------------------------------------------------------------------------------------------------
 # bounds of the channel heights (checked at build time)
 def channel_height_max_mm(geometry: GeometryConfig) -> float:
-    """The largest channel full height the plates leave room for: 2 x (plate_half_gap_mm - dee_wall_mm)."""
+    """The largest channel full height the plates leave room for, where they are furthest apart:
+    2 x (plate_half_gap_mm - dee_wall_mm)."""
     return 2.0 * (float(geometry.plate_half_gap_mm) - float(geometry.dee_wall_mm))
+
+
+def plate_half_gap_at_mm(geometry: GeometryConfig, r_mm) -> float:
+    """The plates' half gap [mm] at radius r_mm: plate_half_gap_mm, or plate_profile_mm there where that is smaller
+    (linear between its points, constant beyond its ends)."""
+    top, prof, r = float(geometry.plate_half_gap_mm), geometry.plate_profile_mm, float(r_mm)
+    if not prof:
+        return top
+    if r <= prof[0][0]:
+        return min(top, prof[0][1])
+    for (r0, h0), (r1, h1) in zip(prof, prof[1:]):
+        if r <= r1:
+            return min(top, h0 + (h1 - h0) * (r - r0) / (r1 - r0))
+    return min(top, prof[-1][1])
+
+
+def channel_height_max_at_mm(geometry: GeometryConfig, r_mm) -> float:
+    """The largest channel full height the plates leave room for at radius r_mm:
+    2 x (``plate_half_gap_at_mm`` - dee_wall_mm)."""
+    return 2.0 * (plate_half_gap_at_mm(geometry, r_mm) - float(geometry.dee_wall_mm))
+
+
+def plate_bend_radii(geometry: GeometryConfig) -> list:
+    """The radii [mm] where the plates' half gap bends: plate_profile_mm's points, and where the profile crosses
+    plate_half_gap_mm. Between and beyond them it is linear (constant beyond the outermost)."""
+    top, prof = float(geometry.plate_half_gap_mm), geometry.plate_profile_mm
+    out = {r for r, _ in prof}
+    for (r0, h0), (r1, h1) in zip(prof, prof[1:]):
+        if (h0 - top) * (h1 - top) < 0.0:
+            out.add(r0 + (top - h0) * (r1 - r0) / (h1 - h0))
+    return sorted(out)
+
+
+def _plate_bound(g, r, top):
+    """The plate bound at r as an error message's words."""
+    if not g.plate_profile_mm:
+        return (f"its bound 2 x (geometry.plate_half_gap_mm - geometry.dee_wall_mm) = 2 x ({g.plate_half_gap_mm:g} - "
+                f"{g.dee_wall_mm:g}) = {top:g} mm")
+    half = plate_half_gap_at_mm(g, r)
+    return (f"its bound at r = {r:g} mm, 2 x (the plates' half gap there {half:g} (geometry.plate_profile_mm / "
+            f"plate_half_gap_mm) - geometry.dee_wall_mm {g.dee_wall_mm:g}) = {2.0 * (half - g.dee_wall_mm):g} mm")
 
 
 def check_bounds(geometry: GeometryConfig, exit_half_height_mm: float = None, exit_r_mm: float = None) -> dict:
     """Hold the channel heights to what can be built; a ConfigError names the first bound violated.
 
-    * every height (dees and, when set, dummy dees) <= 2 x (plate_half_gap_mm - dee_wall_mm);
+    * at every radius, every height (dees and, when set, dummy dees) <= 2 x (the plates' half gap there -
+      dee_wall_mm) (``channel_height_max_at_mm``): plate_half_gap_mm, narrowed where plate_profile_mm says so. Both
+      the channel and the bound are linear between their bend radii (the taper's ends, ``plate_bend_radii``) and
+      constant beyond them, so the heights at those radii and at r = 0 hold the channel everywhere;
     * the channel clears the spiral-inflector housing's exit, whose half height ``exit_half_height_mm`` is the largest
       |z| of its exit aperture (``builder.exit_half_height_mm`` reads it off the housing outline): the inner heights
       >= 2 x exit_half_height_mm, and so are the heights of the dees' and of the dummy dees' channel at the exit's
       outermost radius ``exit_r_mm`` (``builder.exit_radius_mm``). A height profile is monotonic in r, so the two
       together hold the channel over the opening's whole radial span; the second binds only for an inverted taper
       that starts inside the exit. Neither is checked without the exit's half height (no outline at hand).
-    Returns the bounds {'height_max_mm', 'inner_min_mm', 'exit_r_mm'} for a campaign to set its variable ranges from."""
+    Returns the bounds {'height_max_mm' (where the plates are furthest apart), 'height_max_inner_mm' (on the axis:
+    inside the profile's first point), 'inner_min_mm', 'exit_r_mm'} for a campaign to set its variable ranges from."""
     g = geometry
     top = channel_height_max_mm(g)
+    radii = sorted({0.0, *g.aperture_radii(), *plate_bend_radii(g)})
+    if min(channel_height_max_at_mm(g, r) for r in radii) <= 0.0:
+        raise ConfigError(f"geometry.plate_half_gap_mm = {g.plate_half_gap_mm:g} mm"
+                          + (f" / plate_profile_mm {[list(p) for p in g.plate_profile_mm]}" if g.plate_profile_mm else "")
+                          + f" leaves no room for the geometry.dee_wall_mm = {g.dee_wall_mm:g} mm dee plates")
     heights = [('aperture_inner_mm', g.aperture_inner_mm, True), ('aperture_outer_mm', g.aperture_outer_mm, False)]
     if g.dummy_aperture_inner_mm > 0.0:
         heights.append(('dummy_aperture_inner_mm', g.dummy_aperture_inner_mm, True))
     if g.dummy_aperture_outer_mm > 0.0:
         heights.append(('dummy_aperture_outer_mm', g.dummy_aperture_outer_mm, False))
-    if top <= 0.0:
-        raise ConfigError(f"geometry.plate_half_gap_mm = {g.plate_half_gap_mm:g} mm leaves no room for the "
-                          f"geometry.dee_wall_mm = {g.dee_wall_mm:g} mm dee plates")
-    for name, v, _ in heights:
-        if float(v) > top + 1e-9:
-            raise ConfigError(f"geometry.{name} = {float(v):g} mm exceeds its bound 2 x (geometry.plate_half_gap_mm - "
-                              f"geometry.dee_wall_mm) = 2 x ({g.plate_half_gap_mm:g} - {g.dee_wall_mm:g}) = {top:g} mm: "
-                              f"the dee plates must fit inside the plate / pole gap")
+    r0, r1 = g.aperture_radii()
+    profiles = [(('aperture_inner_mm', 'aperture_outer_mm'), g.aperture_heights())]
+    if g.dummy_aperture_heights() != g.aperture_heights():      # the dees' heights are checked first: a dummy height
+        profiles.append((('dummy_aperture_inner_mm', 'dummy_aperture_outer_mm'),   # that fails here is its own
+                         g.dummy_aperture_heights()))
+    for names, hh in profiles:
+        for r in radii:
+            h = channel_height_mm(r, (r0, r1), hh)
+            if h <= channel_height_max_at_mm(g, r) + 1e-9:
+                continue
+            if r <= r0 or r >= r1:
+                raise ConfigError(f"geometry.{names[0] if r <= r0 else names[1]} = {h:g} mm exceeds "
+                                  f"{_plate_bound(g, r, top)}: the dee plates must fit inside the plate / pole gap")
+            raise ConfigError(f"geometry.{names[0]} / {names[1]}: the channel is {h:.3f} mm high at r = {r:g} mm, "
+                              f"inside its taper ({r0:g} .. {r1:g} mm), and exceeds {_plate_bound(g, r, top)}: start "
+                              f"or end the taper further out (aperture_taper_start_mm / center_mm, length_mm), or lower "
+                              f"the outer height")
     lo = None
     if exit_half_height_mm is not None:
         lo = 2.0 * float(exit_half_height_mm)
@@ -441,7 +520,8 @@ def check_bounds(geometry: GeometryConfig, exit_half_height_mm: float = None, ex
                                       f"exit's half height = {lo:.3f} mm: the channel must clear the exit over its "
                                       f"whole radial span (start the taper, aperture_taper_center_mm - "
                                       f"aperture_taper_length_mm / 2, outside that radius, or keep the height there)")
-    return {'height_max_mm': top, 'inner_min_mm': lo, 'exit_r_mm': None if exit_r_mm is None else float(exit_r_mm)}
+    return {'height_max_mm': top, 'height_max_inner_mm': channel_height_max_at_mm(g, 0.0), 'inner_min_mm': lo,
+            'exit_r_mm': None if exit_r_mm is None else float(exit_r_mm)}
 
 
 # ---------------------------------------------------------------------------------------------------------------------

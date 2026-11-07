@@ -10,6 +10,7 @@ import dataclasses
 import functools
 import hashlib
 import importlib.util
+import itertools
 import json
 import math
 import os
@@ -768,6 +769,19 @@ def test_v6o_c1_campaign_config(tmp_path):
     assert cfg.n_startup >= 2 * (len(cfg.variables) + 2) + 1
     assert [o.metric for o in cfg.objectives] == ['I_2pct_best_az', 'I_final_az', 'z_p95_az']
     assert [c.label() for c in cfg.constraints] == ['E_med_az>=2.9']
+    by = {v.name: v for v in cfg.variables}
+    assert by['ap_start'].target == 'geometry.aperture_taper_start_mm' and 'ap_center' not in by
+    # every corner of the channel's box fits the plates of the base design (the noses and their own taper)
+    from PyCentralRegion.geometry import options as O
+    geo = C.section(C.load(V6O_C1.parent / cfg.base_config_file), 'geometry')
+    assert geo.plate_profile_mm == ((70.0, 25.0), (110.0, 48.2)) and geo.plate_half_gap_mm == 30.0
+    assert by['ap_start'].low >= geo.plate_profile_mm[0][0] and by['ap_outer'].high == O.channel_height_max_mm(geo)
+    assert by['ap_inner'].high < O.channel_height_max_at_mm(geo, 0.0) == 40.0
+    for corner in itertools.product(*[(by[k].low, by[k].high) for k in ('ap_inner', 'ap_outer', 'ap_start',
+                                                                         'ap_length')]):
+        g = dataclasses.replace(geo, **dict(zip(('aperture_inner_mm', 'aperture_outer_mm', 'aperture_taper_start_mm',
+                                                 'aperture_taper_length_mm'), corner)))
+        O.check_bounds(g)
     if not Path(cfg.physics_python).is_file():
         pytest.skip('the campaign names a physics interpreter of the machine it runs on')
     with warnings.catch_warnings(record=True) as caught:
