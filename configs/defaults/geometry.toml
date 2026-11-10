@@ -170,3 +170,5 @@ inner_rmin_mm = 45.0         # ... never below this radius ...
 inner_smin_mm = 8.0          # ... or this arclength (the nose round / the housing cut)
 scan_phases_deg = [-45.0, -30.0, -15.0, 0.0, 15.0]   # the bare run's phase scan; its final run at the best
 scan_magnet_scale = 1.0      # the bare run's magnet.scale: the posts depend on the geometry alone
+fuzzy_retry_mm = [0.02, 0.1]  # a model with posts that fails is built again at these geometry.occ_fuzzy_mm [mm] in
+                              # turn before the geometry stays without posts (its record keeps the one that worked)

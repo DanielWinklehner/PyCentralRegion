@@ -128,11 +128,15 @@ def post_rule_stage(cfg):
     without posts in <model's folder>/bare/ and writes the record; it never runs again for that geometry, so the posts
     depend on the geometry (and the settings of its first evaluation but its phase and level), not on an evaluation's
     phase or level. The record belongs to one model: a model with posts needs a folder of its own. The second pass
-    builds the model with the posts, checks it with the tracker's metal test, and solves it. A geometry that gets no
-    posts, or whose model with them fails (recorded: 'fallback'), keeps its bare model and fields: it is a design without
-    posts, not a failed one; an error of memory, the GPU or the file system fails the evaluation instead
-    (``_transient``). Every step is reused when its output exists, so a stopped evaluation's geometry continues where
-    it was. The bare field map goes once the final one exists."""
+    builds the model with the posts, checks it with the tracker's metal test, and solves it; when any of that fails, it
+    builds the model again at each geometry.occ_fuzzy_mm of [post_rule] fuzzy_retry_mm in turn (OCC's boolean
+    tolerance: two faces that nearly coincide fail at one tolerance and not at another). The record keeps the
+    tolerance that worked ('occ_fuzzy_mm', which the geometry's later runs set too) and every failed attempt
+    ('failed_at'). A geometry that gets no posts, or whose model with them fails at every tolerance (recorded:
+    'fallback', the first attempt's error), keeps its bare model and fields: it is a design without posts, not a
+    failed one; an error of memory, the GPU or the file system fails the evaluation instead (``_transient``). Every
+    step is reused when its output exists, so a stopped evaluation's geometry continues where it was. The bare field
+    map goes once the final one exists."""
     from .geometry.build import output_files
     from .geometry.post_rule import TRACK_DATA
     from .simulate3d import column_obstacles, fields_stage, load_model3d
@@ -157,24 +161,55 @@ def post_rule_stage(cfg):
     def use(posts):
         cfg.setdefault('geometry', {})['posts'] = [{k: p[k] for k in ('gap', 'side', 's_mm', 'length_mm')} for p in posts]
 
+    def tolerance(mm):                       # this run's geometry.occ_fuzzy_mm: its config.json records it
+        config.set_dotted(cfg, 'geometry.occ_fuzzy_mm', float(mm))
+
+    def write():
+        config.write_atomic(path, lambda p: p.write_text(json.dumps(record, indent=1)))
+
+    own = float(config.section(cfg, 'geometry').occ_fuzzy_mm)
     use(applied_posts(record))
+    if applied_posts(record) and record.get('occ_fuzzy_mm') is not None:
+        tolerance(record['occ_fuzzy_mm'])    # the model with posts was built at a retry's tolerance
     if not fields.exists() and applied_posts(record):
-        try:
-            if not model.exists():
-                for f in output_files(model).values():    # what a stopped build left: a build refuses to overwrite it
-                    f.unlink(missing_ok=True)
-                build_stage(cfg)
-            if config.section(cfg, 'track').obstacles == 'columns':     # the tracker refuses a model that is not
-                column_obstacles(load_model3d(model), config.section(cfg, 'fields'), verbose=False, odd='raise')
-            fields_stage(cfg)
-        except (Exception, SystemExit) as exc:               # a library's sys.exit too, as in _cmd_evaluate
-            if isinstance(exc, Exception) and _transient(exc):
-                raise
-            record['fallback'] = f"{type(exc).__name__}: {exc}"
-            config.write_atomic(path, lambda p: p.write_text(json.dumps(record, indent=1)))
+        first = float(config.section(cfg, 'geometry').occ_fuzzy_mm)
+        failed = []
+        for k, mm in enumerate([first] + [x for x in map(float, rule.fuzzy_retry_mm) if x != first]):
+            try:
+                if k:                        # the failed attempt's model goes: a build reuses a model that exists
+                    for f in output_files(model).values():
+                        f.unlink(missing_ok=True)
+                    tolerance(mm)
+                    print(f"[post rule] building the model with {len(record['posts'])} posts again at "
+                          f"geometry.occ_fuzzy_mm = {mm:g} mm", flush=True)
+                if not model.exists():
+                    for f in output_files(model).values():    # what a stopped build left: never overwritten
+                        f.unlink(missing_ok=True)
+                    build_stage(cfg)
+                    if k:                    # the geometry's later runs, and a stopped run's redo, set it too
+                        record.update(occ_fuzzy_mm=mm, failed_at=list(failed))
+                        write()
+                if config.section(cfg, 'track').obstacles == 'columns':     # the tracker refuses a model that is not
+                    column_obstacles(load_model3d(model), config.section(cfg, 'fields'), verbose=False, odd='raise')
+                fields_stage(cfg)
+                break
+            except (Exception, SystemExit) as exc:           # a library's sys.exit too, as in _cmd_evaluate
+                if isinstance(exc, Exception) and _transient(exc):
+                    raise
+                failed.append({'occ_fuzzy_mm': mm, 'error': f"{type(exc).__name__}: {exc}"})
+                print(f"[post rule] the model with {len(record['posts'])} posts failed at geometry.occ_fuzzy_mm = "
+                      f"{mm:g} mm ({failed[-1]['error']})", flush=True)
+                _free_gpu()
+        else:
+            record.pop('occ_fuzzy_mm', None)
+            record.update(fallback=failed[0]['error'], failed_at=failed)
+            write()
+            if float(config.section(cfg, 'geometry').occ_fuzzy_mm) != own:
+                tolerance(own)               # the bare model's
             use([])
-            print(f"[post rule] the model with {len(record['posts'])} posts failed ({record['fallback']}): this "
-                  f"geometry stays without posts", flush=True)
+            tried = ', '.join(f"{a['occ_fuzzy_mm']:g}" for a in failed)
+            print(f"[post rule] the model with {len(record['posts'])} posts failed at every tolerance ({tried} mm; "
+                  f"first: {record['fallback']}): this geometry stays without posts", flush=True)
         _free_gpu()
     if not fields.exists():          # no posts: the bare outputs become the geometry's, over what a failed model with
         targets = output_files(model)            # posts left: the model first (a geometry folder without its model is

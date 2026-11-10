@@ -394,6 +394,8 @@ class PostRuleConfig:
     inner_smin_mm: float = 8.0           # ... or this arclength (the nose round / the housing cut)
     scan_phases_deg: tuple = (-45.0, -30.0, -15.0, 0.0, 15.0)   # the bare run's phase scan; its final run at the best
     scan_magnet_scale: float = 1.0       # the bare run's magnet.scale: the posts depend on the geometry alone
+    fuzzy_retry_mm: tuple = (0.02, 0.1)  # a model with posts that fails is built again at these geometry.occ_fuzzy_mm
+                                         # [mm] in turn before the geometry stays without posts; () never again
 
     def __post_init__(self):
         if 0 in self.gaps or 0 in self.inner_gaps:
@@ -401,6 +403,8 @@ class PostRuleConfig:
                               "facing it)")
         if not self.scan_phases_deg:
             raise ConfigError("[post_rule] scan_phases_deg: at least one phase")
+        if not (isinstance(self.fuzzy_retry_mm, (list, tuple)) and all(float(x) > 0.0 for x in self.fuzzy_retry_mm)):
+            raise ConfigError(f"[post_rule] fuzzy_retry_mm: a list of tolerances > 0 [mm]; got {self.fuzzy_retry_mm!r}")
         if not (self.clear_mm >= 0.0 and self.inner_clear_mm >= 0.0 and 0.0 <= self.lo_q < 0.5
                 and 0.0 < self.min_share <= 1.0 and self.inner_len_mm > 0.0 and self.scan_magnet_scale > 0.0):
             raise ConfigError(f"[post_rule]: wants clear_mm, inner_clear_mm >= 0, 0 <= lo_q < 0.5, "

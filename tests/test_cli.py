@@ -81,13 +81,15 @@ class _Stages:
     writes a build's files (the model last), each holding the number of posts it was built with; the field map takes
     its model's, and a track reads its field map's; the tracker's metal test ('columns') reads a model. ``fail``
     {'build' | 'columns' | 'fields' | 'bare track': exception}: raised by the build, the metal test or the field solve
-    of a model with posts, or by the bare pass's tracking. ``log``: (stage, its output, what it did)."""
+    of a model with posts, or by the bare pass's tracking; ``fail_tol``: the geometry.occ_fuzzy_mm of the model at
+    which they fail (None: at every one). ``log``: (stage, its output, what it did)."""
 
-    def __init__(self, monkeypatch, posts=(POST,), fail=None):
+    def __init__(self, monkeypatch, posts=(POST,), fail=None, fail_tol=None):
         simulate3d = pytest.importorskip('PyCentralRegion.simulate3d')
         post_rule = pytest.importorskip('PyCentralRegion.geometry.post_rule')
         from PyCentralRegion.geometry.build import output_files
         self.output_files, self.posts, self.fail, self.log = output_files, list(posts), dict(fail or {}), []
+        self.fail_tol, self.tol = fail_tol, None              # the tolerance of the last model built
         monkeypatch.setattr(cli, 'build_stage', self.build)
         monkeypatch.setattr(cli, 'score_stage', self.score)
         monkeypatch.setattr(cli, '_free_gpu', lambda: None)
@@ -101,6 +103,9 @@ class _Stages:
     def stages(self):
         return [entry[0] for entry in self.log]
 
+    def _fails(self, stage):
+        return stage in self.fail and (self.fail_tol is None or self.tol in self.fail_tol)
+
     def build(self, cfg):
         out = self.output_files(cfg['paths']['model3d'])
         if out['model3d'].exists():
@@ -109,16 +114,17 @@ class _Stages:
         if any(f.exists() for f in out.values()):
             raise ConfigError("other outputs of a build exist: never overwritten")
         n = len(cfg.get('geometry', {}).get('posts', []))
+        self.tol = cfg.get('geometry', {}).get('occ_fuzzy_mm', 0.05)
         self.log.append(('build', out['model3d'], n))
         for name, f in out.items():
-            if name == 'model3d' and n and 'build' in self.fail:
+            if name == 'model3d' and n and self._fails('build'):
                 raise self.fail['build']
             f.write_text(json.dumps({'posts': n}))
 
     def columns(self, model3d, fc, verbose=True, odd='raise'):
         assert odd == 'raise'
         self.log.append(('columns', model3d['path'], model3d['posts']))
-        if model3d['posts'] and 'columns' in self.fail:
+        if model3d['posts'] and self._fails('columns'):
             raise self.fail['columns']
 
     def fields(self, cfg, verbose=True):
@@ -128,7 +134,7 @@ class _Stages:
             return out
         model = json.loads(Path(cfg['paths']['model3d']).read_text())
         self.log.append(('fields', out, model['posts']))
-        if model['posts'] and 'fields' in self.fail:
+        if model['posts'] and self._fails('fields'):
             raise self.fail['fields']
         out.write_text(json.dumps(model))
         return out
@@ -221,10 +227,14 @@ def test_a_failed_model_with_posts_falls_back_to_the_bare_one(tmp_path, monkeypa
     cfg = _evaluation(geo, tmp_path / 'e0')
     scores = cli.evaluate(cfg)
     reached = {'build': [], 'columns': ['columns'], 'fields': ['columns', 'fields']}[stage]
-    assert st.stages() == ['build', 'fields', 'track', 'score', 'place', 'build'] + reached + ['track', 'score']
+    assert st.stages() == (['build', 'fields', 'track', 'score', 'place'] + (['build'] + reached) * 3     # 3 tolerances
+                           + ['track', 'score'])
     assert st.log[-2][2] == ((-15.0,), 1.002, 0) and cfg['geometry']['posts'] == []
+    assert cfg['geometry']['occ_fuzzy_mm'] == 0.05                        # the bare model's, after the retries
     why = f"{type(error).__name__}: {error}"
-    assert json.loads((geo / 'bare' / cli.POSTS_RECORD).read_text())['fallback'] == why
+    record = json.loads((geo / 'bare' / cli.POSTS_RECORD).read_text())
+    assert record['fallback'] == why and 'occ_fuzzy_mm' not in record
+    assert record['failed_at'] == [{'occ_fuzzy_mm': mm, 'error': why} for mm in (0.05, 0.02, 0.1)]
     assert scores['post_rule']['fallback'] == why and scores['post_rule']['n_posts'] == 0
     assert 'this geometry stays without posts' in capsys.readouterr().out
     for f in [*st.output_files(geo / 'model3d.pkl').values(), geo / 'fields.pkl']:
@@ -233,6 +243,44 @@ def test_a_failed_model_with_posts_falls_back_to_the_bare_one(tmp_path, monkeypa
     cfg = _evaluation(geo, tmp_path / 'e1')
     cli.evaluate(cfg)
     assert st.stages() == ['track', 'score'] and cfg['geometry']['posts'] == []
+
+
+@pytest.mark.parametrize('stage, error', [('build', RuntimeError('The 1D mesh seems not to be forming a closed loop')),
+                                          ('columns', ValueError('column test: the solid is not closed')),
+                                          ('fields', ConfigError('3D model too large'))])
+def test_a_model_with_posts_that_fails_is_built_again_at_another_tolerance(tmp_path, monkeypatch, stage, error):
+    """A model with posts that fails at the configured geometry.occ_fuzzy_mm is built again at [post_rule]
+    fuzzy_retry_mm's tolerances in turn; the record keeps the one that worked, and the geometry's next runs set it."""
+    st = _Stages(monkeypatch, fail={stage: error}, fail_tol=(0.05,))
+    geo = tmp_path / 'g'
+    geo.mkdir()
+    cfg = _evaluation(geo, tmp_path / 'e0')
+    scores = cli.evaluate(cfg)
+    reached = {'build': [], 'columns': ['columns'], 'fields': ['columns', 'fields']}[stage]
+    assert st.stages() == (['build', 'fields', 'track', 'score', 'place', 'build'] + reached
+                           + ['build', 'columns', 'fields', 'track', 'score'])
+    assert cfg['geometry']['posts'] == [POST] and cfg['geometry']['occ_fuzzy_mm'] == 0.02
+    record = json.loads((geo / 'bare' / cli.POSTS_RECORD).read_text())
+    assert 'fallback' not in record and record['occ_fuzzy_mm'] == 0.02
+    assert record['failed_at'] == [{'occ_fuzzy_mm': 0.05, 'error': f"{type(error).__name__}: {error}"}]
+    assert scores['post_rule']['n_posts'] == 1 and scores['post_rule']['fallback'] == ''
+    assert json.loads((geo / 'fields.pkl').read_text()) == {'posts': 1}
+    st.log.clear()
+    cfg = _evaluation(geo, tmp_path / 'e1')
+    cli.evaluate(cfg)
+    assert st.stages() == ['track', 'score'] and cfg['geometry']['occ_fuzzy_mm'] == 0.02
+
+
+def test_without_retry_tolerances_a_failed_model_falls_back_at_once(tmp_path, monkeypatch):
+    st = _Stages(monkeypatch, fail={'build': RuntimeError('the fuse dropped a post')})
+    geo = tmp_path / 'g'
+    geo.mkdir()
+    cfg = _evaluation(geo, tmp_path / 'e0')
+    cfg['post_rule']['fuzzy_retry_mm'] = []
+    cli.evaluate(cfg)
+    assert st.stages().count('build') == 2                     # the bare pass's, and one with posts
+    record = json.loads((geo / 'bare' / cli.POSTS_RECORD).read_text())
+    assert record['fallback'] == 'RuntimeError: the fuse dropped a post' and len(record['failed_at']) == 1
 
 
 @pytest.mark.parametrize('stage, error', [('fields', MemoryError()), ('fields', PermissionError('locked')),
