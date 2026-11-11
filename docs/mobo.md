@@ -389,8 +389,9 @@ its compile off every evaluation but the first after an edit of `fast_track3d.py
     Its cache was off because the serial and the parallel build of the kernel shared one numba cache entry (numba 0.64
     does not key it on `parallel`), so each loaded the other's build. Since 2026-11-11 the parallel build has a cache
     file of its own: the first process after an edit of `fast_track3d.py` compiles both builds (209 s on CPU), every
-    later one loads them, and its first 3D track takes 0.3 s instead of 161-169 s (1000 particles, one turn, no space
-    charge, on CPU: `F:\HCHC1.5\Results\CR\mobo\warmup_fix_2026-11-11`);
+    later one loads them. A cheap follower of the v6r60o_c1 tests (g0287 at the search fidelity, on the GPU) then
+    takes 28-29 s instead of 204-221 s, its bunch track 15 s instead of 180-197 s, with the same fates
+    (`F:\HCHC1.5\Results\CR\mobo\warmup_fix_2026-11-11`);
   - tracking the 10 000 particles takes 17-22 s after that, 11-16 s of it the space-charge solves;
   - start-up, the system and the reference particle, the record files and the scoring take the other 13-14 s.
 - **A new geometry** adds the build, about 20 s, and its fields: 233 s on the full-chain check of 2026-11-02 (the

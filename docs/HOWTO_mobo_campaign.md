@@ -145,7 +145,8 @@ Planning the budget:
   about 65 s of the first pilot's 1.6 min (in the one search evaluation with the column test its kernel phase, the
   compile included, took 80 s), 136-169 s by 2026-11-11. Since then the parallel kernel is cached on disk like the
   serial one: only the first evaluation after an edit of `fast_track3d.py` compiles it (about 3.5 min), every later
-  one loads it, so take the compile off the other evaluations (`docs/mobo.md`, "Costs");
+  one loads it, so take the compile off the other evaluations (a cheap follower of the v6r60o_c1 tests: 28-29 s
+  instead of about 3.5 min; `docs/mobo.md`, "Costs");
 - with `cheap_per_geometry = 3`, a quarter of the evaluations build a geometry;
 - `n_startup` evaluations come before the model takes over: at least 2 × the number of variables + 1
   (`mobo_campaign.toml`: 20, the warm start and 19 random designs, which are the base and 4 random geometries with
