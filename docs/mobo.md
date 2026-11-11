@@ -381,11 +381,16 @@ evaluation of that geometry builds afresh.
 
 ## Costs
 
-Measured on the worked example (28 threads, one GPU):
+Measured on the worked example (28 threads, one GPU). The times predate the cached parallel kernel of 2026-11-11: take
+its compile off every evaluation but the first after an edit of `fast_track3d.py`.
 - **A cheap evaluation** (the search fidelity on known fields) takes 95-108 s, median 97 s: the pilot's 20 evaluations
   (`mobo_pilot.toml`, 2026-11-02) took 33 min. Of that:
-  - every evaluation process compiles the parallel 3D tracking kernel first, about 65 s (numba 0.64 reloads a cached
-    parallel build single-threaded, so the cache is off on purpose);
+  - every evaluation process compiled the parallel 3D tracking kernel first, about 65 s (136-169 s on 2026-11-11).
+    Its cache was off because the serial and the parallel build of the kernel shared one numba cache entry (numba 0.64
+    does not key it on `parallel`), so each loaded the other's build. Since 2026-11-11 the parallel build has a cache
+    file of its own: the first process after an edit of `fast_track3d.py` compiles both builds (209 s on CPU), every
+    later one loads them, and its first 3D track takes 0.3 s instead of 161-169 s (1000 particles, one turn, no space
+    charge, on CPU: `F:\HCHC1.5\Results\CR\mobo\warmup_fix_2026-11-11`);
   - tracking the 10 000 particles takes 17-22 s after that, 11-16 s of it the space-charge solves;
   - start-up, the system and the reference particle, the record files and the scoring take the other 13-14 s.
 - **A new geometry** adds the build, about 20 s, and its fields: 233 s on the full-chain check of 2026-11-02 (the
@@ -406,7 +411,8 @@ Measured on the worked example (28 threads, one GPU):
   particles (`metal_columns_2026-11-02\track`), on the same parallel kernel as the evaluations, spent 71-96 s in that
   phase with either test, the code from before the column test 83 s (`raster_head_2000`), and repeats differ by up to
   9 s. If it stays near 80 s, a cheap evaluation takes about 1.9 min and the campaign about 5 h. Its verify tracking
-  took 396 s, as long as the full-chain check's 397 s.
+  took 396 s, as long as the full-chain check's 397 s. (Since the cached parallel kernel of 2026-11-11 only the first
+  process after an edit of `fast_track3d.py` pays the compile.)
 
 ## The toy campaign
 

@@ -141,9 +141,11 @@ $campaign = "$repo\configs\examples\hchc1p5\mobo_campaign.toml"
 Planning the budget:
 - a new geometry's evaluation takes about 4 min on the worked example (build about 20 s, fields about 2 min, then
   the tracking), and the driver follows it with `cheap_per_geometry` cheap evaluations of about 1.6-1.9 min each;
-- every evaluation process first compiles the tracking kernel, about 65 s of the first pilot's 1.6 min (in the one
-  search evaluation with the column test its kernel phase, the compile included, took 80 s, a fixed cost per process:
-  `docs/mobo.md`, "Costs");
+- the times here include the compile of the tracking kernel, which every evaluation process paid until 2026-11-11:
+  about 65 s of the first pilot's 1.6 min (in the one search evaluation with the column test its kernel phase, the
+  compile included, took 80 s), 136-169 s by 2026-11-11. Since then the parallel kernel is cached on disk like the
+  serial one: only the first evaluation after an edit of `fast_track3d.py` compiles it (about 3.5 min), every later
+  one loads it, so take the compile off the other evaluations (`docs/mobo.md`, "Costs");
 - with `cheap_per_geometry = 3`, a quarter of the evaluations build a geometry;
 - `n_startup` evaluations come before the model takes over: at least 2 × the number of variables + 1
   (`mobo_campaign.toml`: 20, the warm start and 19 random designs, which are the base and 4 random geometries with

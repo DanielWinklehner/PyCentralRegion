@@ -83,6 +83,7 @@ default. ``finder.fast3d_interp = 'batch'`` selects the exact mode.
 Part of: PyCentralRegion (2026-09-16)
 """
 import time
+import types
 
 import numpy as np
 
@@ -1148,13 +1149,31 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
 # the kernel is to get rid of exactly that overhead. PAR_MIN_PARTICLES is where
 # the parallel one starts to win (measured, see FAST3D_KERNEL_REPORT.md).
 _chunk3d_serial = njit(cache=True)(_chunk3d_impl)
-# cache=False on purpose. With cache=True numba 0.64 hands back a SERIALIZED
-# build of a parallel=True function on every load after the first: a fresh
-# compile scales with the thread count, the cached one runs single-threaded and
-# is indistinguishable from _chunk3d_serial (measured, 2026-09-16). The parallel
-# variant is chosen from PAR_MIN_PARTICLES on. Its compile takes about 65 s with
-# 28 threads (2026-11-02), two thirds of a 10 000-particle search evaluation.
-_chunk3d_par = njit(cache=False, parallel=True)(_chunk3d_impl)
+
+
+def _renamed(fn, name):
+    """``fn`` under another name: the same code, globals, defaults and closure, filed apart by numba's disk cache.
+
+    numba files a cached function by its source file, qualified name and first line, and keys the entry on the
+    argument types and the bytecode, never on the compile options (numba 0.64, ``core/caching.py``). Two dispatchers
+    of ONE function, a serial and a ``parallel=True`` one, therefore share one cache entry, and each loads the build
+    the other saved last. That was the "cached parallel build runs single-threaded" of 2026-09-16: the parallel
+    dispatcher had loaded the serial build. So the parallel kernel ran with the cache off and was compiled afresh in
+    every process: 136-169 s on 2026-11-11 (the serial build: 18-19 s), most of a cheap evaluation."""
+    code = fn.__code__.replace(co_name=name, co_qualname=name)
+    out = types.FunctionType(code, fn.__globals__, name, fn.__defaults__, fn.__closure__)
+    out.__qualname__, out.__module__ = name, fn.__module__
+    out.__doc__, out.__kwdefaults__ = fn.__doc__, fn.__kwdefaults__
+    return out
+
+
+# The parallel variant, chosen from PAR_MIN_PARTICLES on, is cached like the serial one, in its own files
+# __pycache__/fast_track3d._chunk3d_par_impl-<line>.*: the first process after an edit of this file compiles both
+# builds (209 s on 2026-11-11, 190 s of it the parallel one), every later process loads them in under a second. Like
+# the serial build it does not see an edit of a file it calls into (metal_columns.py, PyPATools' interpolators and
+# pusher): numba checks this file only, and the selftest gates the interpolation and the column test against those
+# modules' own functions (``_require_selftest``).
+_chunk3d_par = njit(cache=True, parallel=True)(_renamed(_chunk3d_impl, '_chunk3d_par_impl'))
 # Below this the thread fork/join of two parallel regions per step (~25 us each
 # on the laptop) costs more than the work: measured best-of-3 on the smoke model,
 # 120 particles serial 4.7x vs parallel 3.6x, 480 particles serial 3.2x vs

@@ -154,6 +154,13 @@ the probes. It needs:
 Every run record of track.json carries `fast_path`: whether the compiled kernel ran and, if not, why. A run that
 cannot use it goes the Python path: same answer, far slower.
 
+The kernel's two builds, serial below 256 particles and parallel from 256 on, are cached on disk
+(`src/PyCentralRegion/__pycache__/fast_track3d._chunk3d_impl-*` and `._chunk3d_par_impl-*`): the first process after an
+edit of `fast_track3d.py` compiles them, about 3.5 min, and every later one loads them in under a second. numba checks
+that cache against `fast_track3d.py` only, so after an edit of a module the kernel calls into (`metal_columns.py`,
+PyPATools' interpolators or pusher) touch `fast_track3d.py`: the kernel's selftest finds a stale column test or
+interpolation and sends the run down the Python path, with the reason in `fast_path`.
+
 Outputs in `run.out_dir`:
 - `track.json`: summary, per-turn statistics of every run, the reference particle, the inputs;
 - `track_data.pkl`: arrays (states, hits, tracks, snapshots, the model's sections);
