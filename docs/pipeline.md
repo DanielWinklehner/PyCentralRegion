@@ -164,7 +164,13 @@ other RF buckets, at other azimuths, are not there.
   positions, so on the same mesh). A train run and its control differ by the neighbours' forces on the run's bunch;
   the control and a run of the bunch alone differ by the mesh. Compare a train with its control, not with the bunch
   alone: a change of mesh moves the particles too (at 1000 particles on a 32-node mesh more than the neighbours
-  do).
+  do). Measured on one design: at search fidelity the mesh alone changes the turn width by -3 to -4 %, at
+  verification fidelity by -0.8 % and every other score by less than 1 %.
+- **What to expect** (one design, a train of five against its control, the same at search and at verification
+  fidelity): the final current does not change (0.000 ± 0.002 mA of 6.5 mA with every particle), 0.1 % of the
+  bunch is lost in turn 2 instead of turn 7, the bunch is 6 % longer, turn separation over turn width drops by
+  1.2 %, and the vertical size grows by about 1 % averaged over a turn at unchanged emittance (3 % at one azimuth:
+  the breathing of the envelope shifts, so compare turn means, not one readout).
 - **`track.train_charge`** scales the other bunches' charge. At 0 they are weightless: tracked on the same mesh, but
   nothing feels them and they feel no charge of their own. That is a cheaper control (one solve per step) and a
   rougher one: without their own space charge the other bunches have other sizes, so the mesh is not the same.
@@ -187,7 +193,9 @@ other RF buckets, at other azimuths, are not there.
   (2026-11-13, RTX 4070 Ti SUPER): one solve of a five-bunch train takes 18 ms on 64 × 512 × 64 nodes (50,000
   particles) and 127 ms on 128 × 512 × 128 (503,125), against 3 ms and 25 ms for the bunch alone on 64³ and 128³;
   a search-fidelity run of 7 turns takes 14 s for the bunch alone, 51 s in a train of three (its control 88 s) and
-  105 s in a train of five (124 s).
+  105 s in a train of five (124 s); a verification-fidelity run (100,625 particles per bunch, a solve every step)
+  648 s for the bunch alone, 2033 s in a train of five (153 ms per step in the solve) and 3079 s for its control
+  (268 ms).
 - **GPU memory:** 64 × 512 × 64 nodes hold 1.24 GiB, as the bunch alone on 128³ does; 128 × 512 × 128 hold
   3.41 GiB, more than the solver's default memory pool of 2 GiB, in which every solve of that mesh fails. Set
   `track.sc_gpu_pool_gb` (4 or more); the run refuses a train mesh that cannot fit its pool
