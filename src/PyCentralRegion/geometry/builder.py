@@ -326,9 +326,59 @@ def exit_radius_mm(ol: dict) -> float:
     return float(np.hypot(ap[:, 0], ap[:, 1]).max())
 
 
+def centre_exit_aperture(ol: dict) -> dict:
+    """The housing outline with its exit aperture centred on the median plane (geometry.exit_opening = 'centred').
+
+    The export puts the opening where the beam leaves the inflector, which is not on z = 0 (v6r60o_c1: a ring of
+    R 10 mm centred at z = -0.76 mm), and that one opening is all that keeps these electrodes from being mirror
+    symmetric about the median plane. Centred, the opening keeps the exit half height h (the largest |z| the exported
+    one reaches), so it contains the exported opening and the channel bounds stay what they were: a round ring keeps
+    its centre's x and y and is scaled about it to the radius h; any other aperture keeps x and y and is stretched in z
+    to span -h .. +h. The returned outline carries what was done as 'aperture_centred'."""
+    ap = np.asarray(ol['aperture'], dtype=float)
+    if ap.ndim != 2 or ap.shape[1] != 3 or len(ap) < 3:
+        raise ConfigError("geometry.exit_opening = 'centred': the housing outline carries no exit aperture (x y z)")
+    z_lo, z_hi = float(ap[:, 2].min()), float(ap[:, 2].max())
+    if not z_hi > z_lo:
+        raise ConfigError("geometry.exit_opening = 'centred': the exit aperture has no height")
+    h = max(abs(z_lo), abs(z_hi))
+    out = dict(ol)
+    fit = _circle_fit(ap)
+    if fit is not None and fit[2] < 0.01:
+        c, r, _ = fit
+        _, _, vt = np.linalg.svd(ap - c, full_matrices=False)
+        h = max(h, float(r) * float(np.sqrt(max(0.0, 1.0 - vt[-1][2] ** 2))) + abs(float(c[2])))
+        out['aperture'] = np.array([c[0], c[1], 0.0]) + (h / float(r)) * (ap - c)
+        out['aperture_centred'] = {'shape': 'round', 'radius_mm': [float(r), h], 'z_centre_mm': float(c[2])}
+    else:
+        zc, half = 0.5 * (z_lo + z_hi), 0.5 * (z_hi - z_lo)
+        new = ap.copy()
+        new[:, 2] = (ap[:, 2] - zc) * (h / half)
+        out['aperture'] = new
+        out['aperture_centred'] = {'shape': f'{len(ap)}-corner polygon', 'half_height_mm': [half, h],
+                                   'z_centre_mm': zc}
+    return out
+
+
 # =====================================================================================================================
 # 3. the emitting plane and the beam channel
 # =====================================================================================================================
+def level_plane(plane: dict) -> dict:
+    """The emitting plane with a level normal (its z component dropped): with geometry.exit_opening = 'centred' the
+    exit opening is swept along it, so the bore stays on the median plane instead of following the beam's slope.
+    The returned plane carries the slope it had as 'tilt_deg'."""
+    n = np.array(plane['normal'], dtype=float)
+    tilt = float(np.degrees(np.arcsin(np.clip(n[2] / np.linalg.norm(n), -1.0, 1.0))))
+    n[2] = 0.0
+    if not np.linalg.norm(n) > 0.0:
+        raise ConfigError("geometry.exit_opening = 'centred': the emitting plane is level, its normal vertical")
+    out = dict(plane)
+    out['normal'] = n / np.linalg.norm(n)
+    out['tilt_deg'] = tilt
+    return out
+
+
+
 def emitting_plane(handoff_path) -> dict:
     """The plane the central region's particles are emitted from, measured from the hand-off file.
 
@@ -2597,11 +2647,127 @@ def _build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: 
         gmsh.option.setNumber("Mesh.MeshSizeMin", min(gmsh.option.getNumber("Mesh.MeshSizeMin"), nl))
         say("dee0 nose: " + ", ".join(f"{s:g} mm within {r_:.1f} mm" for r_, s in zones)
             + " of the round's centre, full height (nose_lc_mm)")
+    lc_far = float(OPT.lc_far_mm)
+    if lc_far > 0.0 and not ids:               # a uniform mesh has no field yet: the far ramp needs one to top
+        t = fld.add("MathEval")
+        fld.setString(t, "F", f"{lc:g}")
+        ids.append(t)
     if ids:
         m = fld.add("Min")
         fld.setNumbers(m, "FieldsList", ids)
+        if lc_far > 0.0:
+            # the faces far above and below the channel (the electrodes' top and bottom, the upper walls) carry
+            # little of what shapes the field in the channel: the size grows from the fields above at |z| = z0 to
+            # lc_far at |z| = z1 (the larger of the two everywhere, so nothing below z0 changes)
+            z0, z1 = float(OPT.lc_far_z0_mm), float(OPT.lc_far_z1_mm)
+            t_ = f"((Sqrt(z*z) - {z0:g}) / {z1 - z0:g})"
+            zf = fld.add("MathEval")
+            fld.setString(zf, "F", f"{lc_far:g} * 0.5 * (Sqrt({t_}*{t_}) - Sqrt(({t_} - 1)*({t_} - 1)) + 1)")
+            top = fld.add("Max")
+            fld.setNumbers(top, "FieldsList", [m, zf])
+            m = top
+            gmsh.option.setNumber("Mesh.MeshSizeMax", max(mesh_max, lc_far))
+            say(f"far faces: mesh size up to {lc_far:g} mm, growing over |z| = {z0:g} .. {z1:g} mm (lc_far_mm)")
         fld.setAsBackgroundMesh(m)
     return gmsh, groups, r_tool, polys
+
+
+# =====================================================================================================================
+# 12b. a mirror-symmetric mesh: the upper half meshed, then mirrored (geometry.mirror_mesh)
+# =====================================================================================================================
+MIRROR_VOLUME_TOL = 1e-4          # an electrode's upper half may differ from half its volume by this fraction
+MIRROR_CENTROID_TOL_MM = 0.02     # ... and its centre of mass may lie this far off the median plane
+
+
+class MirrorRefused(RuntimeError):
+    """The built electrodes are not mirror symmetric about the median plane as far as the cut can tell (or the cut
+    itself failed): ``build`` then meshes the whole electrodes instead, and says so."""
+
+
+def cut_upper_half(gmsh, groups: dict, verbose: bool = True) -> tuple:
+    """Every electrode of the built model cut to z >= 0 (one OCC intersection per electrode with a box of its own),
+    with a check that it is mirror symmetric about the median plane as far as its volume can tell: the upper half
+    holds half of it (to ``MIRROR_VOLUME_TOL``) and its centre of mass lies on the plane (to
+    ``MIRROR_CENTROID_TOL_MM``). An electrode that fails is named in a ``MirrorRefused`` (the options that could put
+    metal off the plane are refused when the section is read, so this is a boolean that went wrong, or a rule of the
+    builder that is not symmetric). Returns (groups of the upper halves, {electrode: fraction of its volume in the
+    upper half}); the physical groups are set again, as ``_build_model`` sets them. gmsh then meshes the upper halves
+    only, and ``mirror_model`` makes the whole mesh. The model is changed either way: after a refusal it has to be
+    built again to be meshed whole."""
+    occ = gmsh.model.occ
+    t0 = time.time()
+    whole, z_cm = {}, {}
+    for name, vols in groups.items():
+        mass = [occ.getMass(3, v) for v in vols]
+        whole[name] = float(sum(mass))
+        z_cm[name] = float(sum(m * occ.getCenterOfMass(3, v)[2] for m, v in zip(mass, vols)) / whole[name])
+    (x0, y0, z0, x1, y1, z1) = gmsh.model.getBoundingBox(-1, -1)
+    pad = 10.0
+    new, share = {}, {}
+    for name, vols in groups.items():
+        box = occ.addBox(x0 - pad, y0 - pad, 0.0, (x1 - x0) + 2.0 * pad, (y1 - y0) + 2.0 * pad, z1 + pad)
+        out, _ = occ.intersect([(3, v) for v in vols], [(3, box)], removeObject=True, removeTool=True)
+        new[name] = [t for d, t in out if d == 3]
+        if not new[name]:
+            raise MirrorRefused(f"the cut at the median plane left nothing of {name}")
+        share[name] = float(sum(occ.getMass(3, v) for v in new[name])) / whole[name]
+    bad = [f"{name} (upper half {share[name]:.6f} of its volume, centre of mass at z = {z_cm[name]:+.4f} mm)"
+           for name in groups
+           if abs(share[name] - 0.5) > MIRROR_VOLUME_TOL or abs(z_cm[name]) > MIRROR_CENTROID_TOL_MM]
+    if bad:
+        raise MirrorRefused("not mirror symmetric about the median plane: " + "; ".join(bad))
+    occ.synchronize()
+    gmsh.model.removePhysicalGroups()
+    for name, vols in new.items():
+        gmsh.model.addPhysicalGroup(3, vols, name=name)
+        faces = sorted({abs(s) for v in vols for _, s in gmsh.model.getBoundary([(3, v)], oriented=False)})
+        gmsh.model.addPhysicalGroup(2, faces, name=f"{name}_surface")
+    if verbose:
+        print(f"[build] mirror mesh: every electrode cut at the median plane ({time.time() - t0:.1f} s); in the upper "
+              "half: " + ", ".join(f"{k} {share[k]:.6f}" for k in sorted(share)) + " of its volume")
+    return new, share
+
+
+def mirror_model(model, verbose: bool = True):
+    """The whole, closed model from ``to_electrode_model``'s model of the upper halves: the triangles on the cut plane
+    go (they lie inside the metal), every other triangle gets its mirror image, with the nodes on the plane shared.
+    Per solid the upper triangles come first, then their images in the same order, so each solid stays one contiguous
+    block (params['solids']) and ``gap_fields.mirror_pairs`` finds every pair. params['mirror_mesh'] says so."""
+    from PyCentralRegion.gap_fields import ElectrodeModel
+    v = np.array(model.vertices, dtype=float)
+    t = np.asarray(model.triangles, dtype=np.int64)
+    v[np.abs(v[:, 2]) < 1e-9, 2] = 0.0                     # nodes of the cut: on the plane to the last bit
+    if v[:, 2].min() < 0.0:
+        raise RuntimeError(f"mirror_model: the half model reaches below the median plane (z = {v[:, 2].min() * MM:.6f} mm)")
+    on_plane = v[:, 2] == 0.0
+    cut = on_plane[t].all(axis=1)
+    image = np.arange(len(v))
+    image[~on_plane] = len(v) + np.arange(int((~on_plane).sum()))
+    v_all = np.vstack([v, v[~on_plane] * np.array([1.0, 1.0, -1.0])])
+    blocks, pots, solids, n = [], [], [], 0
+    for s in model.params['solids']:
+        a, b = s['tri_range']
+        up = t[a:b][~cut[a:b]]
+        if not len(up):
+            raise RuntimeError(f"mirror_model: {s['name']} has no triangle off the median plane")
+        blocks += [up, image[up][:, [0, 2, 1]]]            # the image, turned so that its normal points outward too
+        pots.append(np.full(2 * len(up), s['potential']))
+        solids.append({'name': s['name'], 'potential': s['potential'], 'tri_range': (n, n + 2 * len(up))})
+        n += 2 * len(up)
+    tris = np.vstack(blocks)
+    used = np.unique(tris)
+    remap = -np.ones(len(v_all), dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    params = dict(model.params)
+    params['solids'] = solids
+    params['mirror_mesh'] = True
+    out = ElectrodeModel(vertices=v_all[used], triangles=remap[tris], potentials=np.concatenate(pots), wedges=[],
+                         params=params)
+    if verbose:
+        print(f"[model] mirrored: {len(t) - int(cut.sum()):,} triangles of the upper half ({int(cut.sum()):,} on the cut "
+              f"plane dropped) -> {len(tris):,} triangles, {len(out.vertices):,} nodes; "
+              + ", ".join(f"{s['name']} {s['tri_range'][1] - s['tri_range'][0]}" for s in solids))
+    return out
 
 
 # =====================================================================================================================
@@ -2693,9 +2859,11 @@ def flip_bad_triangles(gmsh, min_deg: float = None, passes: int = 4, verbose: bo
     return n_flip
 
 
-def mesh_and_report(gmsh, groups, prefix: str = None, verbose: bool = True):
+def mesh_and_report(gmsh, groups, prefix: str = None, verbose: bool = True, step: bool = True):
     """Surface-mesh the model, repair slivers, report per-electrode element counts and quality, and write
-    <prefix>.msh / <prefix>.step. Returns (vertices [m], triangles, owner per triangle, triangles per electrode)."""
+    <prefix>.msh / <prefix>.step (``step`` False: the mesh only - a build with geometry.mirror_mesh writes the CAD of
+    the whole electrodes before it cuts them, and meshes their upper halves here). Returns (vertices [m], triangles,
+    owner per triangle, triangles per electrode)."""
     t0 = time.time()
     gmsh.model.mesh.generate(2)
     flip_bad_triangles(gmsh, verbose=verbose)
@@ -2730,8 +2898,9 @@ def mesh_and_report(gmsh, groups, prefix: str = None, verbose: bool = True):
         f"shortest edge {edge.min():.4f} mm")
     if prefix:
         gmsh.write(f"{prefix}.msh")
-        gmsh.write(f"{prefix}.step")
-        say(f"wrote {prefix}.msh and {prefix}.step")
+        if step:
+            gmsh.write(f"{prefix}.step")
+        say(f"wrote {prefix}.msh" + (f" and {prefix}.step" if step else " (the upper half's mesh)"))
     return verts, tris, np.array(owner), per
 
 

@@ -101,10 +101,14 @@ def fields_stage(cfg, verbose=True):
 
     t1 = time.time()
     sol3d = solve_gap_field(model3d, tol=fc.tol, solver=fc.solver, gpu_fit_safety=fc.gpu_fit_safety,
-                            verbose=verbose)
-    say(f"[fields] solve {time.time() - t1:.0f} s ({sol3d.n_iterations} it, {sol3d.solver}/{sol3d.device_interface})")
+                            symmetry=fc.symmetry, verbose=verbose)
+    say(f"[fields] solve {time.time() - t1:.0f} s ({sol3d.n_unknowns} unknowns"
+        + (" of a mirror-symmetric mesh" if sol3d.mirror else "") + f", {sol3d.n_iterations} it, "
+        f"{sol3d.solver}/{sol3d.device_interface})")
     info = {'n_elements_3d': model3d.n_elements, 'solve_s_3d': sol3d.solve_time_s, 'iterations_3d': sol3d.n_iterations,
             'solver_3d': f'{sol3d.solver}/{sol3d.device_interface}',
+            'assembly_s_3d': sol3d.assembly_time_s, 'unknowns_3d': sol3d.n_unknowns, 'mirror_3d': bool(sol3d.mirror),
+            'residual_3d': sol3d.final_residual,
             'phi_at_handoff_3d_V': float(sol3d.potential(traj[:1], verbose=False)[0]),
             'orbit_contacts': clr['n_contact'], 'bars': 0, 'patches': 0}
 
@@ -114,7 +118,7 @@ def fields_stage(cfg, verbose=True):
     xs = np.arange(-bem_xy, bem_xy + 0.5 * fc.dxy_m, fc.dxy_m)
     zb = np.arange(-fc.z_half_m, fc.z_half_m + 0.5 * fc.dz_m, fc.dz_m)
     bem3d = bem_field3d(sol3d, xs, xs, zb, metal=metal, chunk=fc.pot_chunk, r_max=bem_xy, pot_device=fc.pot_device,
-                        pot_precision=fc.pot_precision, pot_check=fc.pot_check, verbose=verbose)
+                        pot_precision=fc.pot_precision, pot_check=fc.pot_check, mirror_z=sol3d.mirror, verbose=verbose)
     info['bem_pot'] = {'device': fc.pot_device, 'precision': fc.pot_precision, 'chunk': fc.pot_chunk,
                        'seconds': time.time() - t1}
     say(f"[fields] BEM field grid {len(xs)}x{len(xs)}x{len(zb)} to r = {bem_xy * 1e3:.0f} mm in {time.time() - t1:.0f} s "

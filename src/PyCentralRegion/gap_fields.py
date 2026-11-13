@@ -2138,6 +2138,9 @@ def build_gap_electrodes(design_or_cavities,
 # BEM solve + field extraction
 # ============================================================================
 _OPENCL_CPU_OK: Optional[bool] = None
+# a mirror-symmetric mesh's folded system up to this size is factored directly on the CPU (solver 'auto'): 8 N^2 bytes
+# is 10 GB here and LAPACK takes about (N / 12,000)^3 x 3 s on a 28-thread desktop (23k unknowns: 19 s, measured)
+_DIRECT_MAX_UNKNOWNS = 36000
 
 
 def _bempp(device_interface: str = 'auto'):
@@ -2190,6 +2193,7 @@ def _gpu_fits(n: int, restart: int, safety: float = 1.25) -> Tuple[bool, str]:
     13.8 GB against 15.5 GB free, but 17.1 GB at 1.25), 1.05 is enough in practice."""
     try:
         import cupy as cp
+        cp.get_default_memory_pool().free_all_blocks()    # blocks an earlier stage's solver cached are free to use
         free, total = cp.cuda.Device().mem_info
     except Exception as exc:                      # no cupy / no device / driver error
         return False, f"cupy unavailable ({type(exc).__name__}: {exc})"
@@ -2200,19 +2204,153 @@ def _gpu_fits(n: int, restart: int, safety: float = 1.25) -> Tuple[bool, str]:
     return True, f"{need / 2**30:.1f} GB of {free / 2**30:.1f} GB free"
 
 
-def _gmres_jacobi(weak_form, rhs: np.ndarray, tol: float, restart: int,
+def mirror_pairs(model, lattice_m: float = 1e-9):
+    """Is the surface mesh mirror symmetric about the median plane z = 0, triangle for triangle?
+
+    Returns ``(upper, partner)`` when every node has a mirror node (on a lattice of ``lattice_m``), every triangle a
+    mirror triangle other than itself, and the two of a pair carry the same potential: ``partner[t]`` is the mirror
+    image of triangle t, and ``upper`` marks one triangle of every pair (the one with the higher centroid; the lower
+    index when both centroids lie in the plane). None otherwise. On such a mesh the charge is the same on both
+    triangles of a pair, so ``solve_gap_field`` solves for the upper ones only: half the unknowns, a quarter of the
+    matrix. ``geometry.mirror_mesh`` builds such meshes (the upper half meshed, then mirrored); a mesh that gmsh made of
+    the whole model is not one, however symmetric the solids are."""
+    v = np.asarray(model.vertices, dtype=float)
+    t = np.asarray(model.triangles, dtype=np.int64)
+    pot = np.asarray(model.potentials, dtype=float)
+    n = len(t)
+    if n < 2 or n % 2:
+        return None
+    q = np.rint(v / float(lattice_m)).astype(np.int64)
+    qm = q * np.array([1, 1, -1], dtype=np.int64)
+    uniq, inv = np.unique(np.vstack([q, qm]), axis=0, return_inverse=True)
+    inv = np.asarray(inv).ravel()
+    node_of = np.full(len(uniq), -1, dtype=np.int64)
+    node_of[inv[:len(q)]] = np.arange(len(q))
+    mirror_node = node_of[inv[len(q):]]
+    if len(uniq) != len(q) or np.any(mirror_node < 0):       # two nodes at one place, or a node without its image
+        return None
+    keys = np.sort(t, axis=1)
+    _, inv = np.unique(np.vstack([keys, np.sort(mirror_node[t], axis=1)]), axis=0, return_inverse=True)
+    inv = np.asarray(inv).ravel()
+    tri_of = np.full(int(inv.max()) + 1, -1, dtype=np.int64)
+    tri_of[inv[:n]] = np.arange(n)
+    partner = tri_of[inv[n:]]
+    idx = np.arange(n)
+    if np.any(partner < 0) or np.any(partner == idx) or np.any(partner[partner] != idx):
+        return None
+    if np.any(np.abs(pot - pot[partner]) > 1e-9 * max(float(np.abs(pot).max()), 1e-30)):
+        return None
+    cz = v[t][:, :, 2].mean(axis=1)
+    upper = (cz > cz[partner]) | ((cz == cz[partner]) & (idx < partner))
+    if int(upper.sum()) * 2 != n:
+        return None
+    return upper, partner
+
+
+def _fold_columns(a: np.ndarray, first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """``a[:, first] + a[:, second]`` as a new array. Where the indices run consecutively (the builder lays a mirrored
+    mesh out solid by solid, the upper triangles then their images) the columns are copied block by block: a fancy
+    gather of a matrix of several GB takes ten times as long."""
+    n = len(first)
+    out = np.empty((a.shape[0], n), dtype=a.dtype)
+    for idx, add in ((np.asarray(first), False), (np.asarray(second), True)):
+        brk = np.flatnonzero(np.diff(idx) != 1) + 1
+        starts, ends = np.concatenate([[0], brk]), np.concatenate([brk, [n]])
+        if len(starts) > max(64, n // 16):         # scattered indices: the plain gather
+            if add:
+                out += a[:, idx]
+            else:
+                out[:] = a[:, idx]
+            continue
+        for s, e in zip(starts, ends):
+            block = a[:, idx[s]:idx[s] + (e - s)]
+            if add:
+                out[:, s:e] += block
+            else:
+                out[:, s:e] = block
+    return out
+
+
+def _gmres_gpu(a_gpu, b_gpu, d_gpu, tol: float, restart: int, maxiter: int, residuals: List[float], xp=None):
+    """Restarted GMRES on the GPU for A x = b with the Jacobi preconditioner on the right (A D^-1 y = b, x = D^-1 y),
+    the residual tested after EVERY matrix-vector product (Givens rotations of the Hessenberg matrix on the host).
+
+    ``cupyx.scipy.sparse.linalg.gmres`` tests it only once per restart cycle: with the cycle of 1000 these meshes need
+    (shorter cycles stall on thin metal) it made 1000 products where 60 to 150 reach the tolerance. With the
+    preconditioner on the right the rotations give the norm of the true residual, so the test is the scipy path's.
+    Returns (x on the device, info, products made); ``residuals`` gets the relative residual after each.
+    ``xp`` is the array module of the three arrays: cupy (the default), or numpy (the tests run it on the CPU)."""
+    from scipy.linalg import solve_triangular
+    if xp is None:
+        import cupy as xp
+    to_host = getattr(xp, 'asnumpy', np.asarray)
+    n = int(b_gpu.size)
+    m = int(max(1, min(restart, n)))
+    bnorm = float(xp.linalg.norm(b_gpu))
+    x = xp.zeros(n, dtype=xp.float64)
+    if bnorm == 0.0:
+        return x, 0, 0
+    basis = xp.empty((n, m + 1), dtype=xp.float64, order='F')
+    hess = np.zeros((m + 1, m))
+    cs, sn, g = np.zeros(m), np.zeros(m), np.zeros(m + 1)
+    total, info = 0, 0
+    while True:
+        r = b_gpu - a_gpu @ x
+        beta = float(xp.linalg.norm(r))
+        if beta <= tol * bnorm:
+            break
+        if total >= maxiter:
+            info = total
+            break
+        basis[:, 0] = r / beta
+        g[:] = 0.0
+        g[0] = beta
+        k = 0
+        for j in range(m):
+            w = a_gpu @ (basis[:, j] / d_gpu)
+            q = basis[:, :j + 1]
+            h = q.T @ w                            # classical Gram-Schmidt, twice: as stable as the modified one,
+            w -= q @ h                             # and two matrix-vector products instead of j + 1 dot products
+            h2 = q.T @ w
+            w -= q @ h2
+            col = np.array(to_host(h + h2), dtype=float)
+            hn = float(xp.linalg.norm(w))
+            for i in range(j):                     # the rotations so far, then the one that removes hn
+                col[i], col[i + 1] = cs[i] * col[i] + sn[i] * col[i + 1], -sn[i] * col[i] + cs[i] * col[i + 1]
+            rho = float(np.hypot(col[j], hn))
+            cs[j], sn[j] = (col[j] / rho, hn / rho) if rho > 0.0 else (1.0, 0.0)
+            col[j] = rho
+            hess[:j + 1, j] = col
+            g[j + 1] = -sn[j] * g[j]
+            g[j] = cs[j] * g[j]
+            total += 1
+            k = j + 1
+            res = abs(g[k]) / bnorm
+            residuals.append(float(res))
+            if res <= tol or hn == 0.0 or total >= maxiter:
+                break
+            basis[:, k] = w / hn
+        y = solve_triangular(hess[:k, :k], g[:k])
+        x += (basis[:, :k] @ xp.asarray(y)) / d_gpu
+    return x, info, total
+
+
+def _gmres_jacobi(a: np.ndarray, rhs: np.ndarray, tol: float, restart: int,
                   maxiter: int, use_gpu: bool):
-    """Jacobi-preconditioned restarted GMRES on the dense weak-form matrix.
+    """Jacobi-preconditioned restarted GMRES on a dense matrix (the weak-form matrix, or its fold for a mirror
+    symmetric mesh).
 
     Ported from spyral_inflector.bempp_gmres_wrapper. The Laplace single-layer
     matrix is badly scaled (its diagonal spans orders of magnitude with the
     element size), and dividing the diagonal out roughly halves the iteration
     count versus the mass-matrix strong form. ``maxiter`` counts INNER
-    iterations for both backends. Returns (x, info, residuals, n_reported):
-    scipy reports one residual per inner iteration, cupy one per restart cycle
-    (it always runs full cycles of ``restart`` matrix-vector products).
+    iterations (matrix-vector products) for both backends. Returns (x, info, residuals, n_iterations); both backends
+    report one residual per product (the GPU path is ``_gmres_gpu``).
+
+    On the GPU the matrix is one 8 N^2-byte block. PyPATools' FFT space-charge solver caps CuPy's default memory pool
+    (2 GiB unless told otherwise) for the rest of the process, so a solve that follows a tracked run in one process
+    (the posts of ``[post_rule]``) could not allocate it: the cap is lifted for the solve and put back after.
     """
-    a = _dense_matrix(weak_form)
     if a is None:
         raise RuntimeError("Jacobi GMRES needs the dense weak-form matrix "
                            "(dense assembly only)")
@@ -2226,18 +2364,21 @@ def _gmres_jacobi(weak_form, rhs: np.ndarray, tol: float, restart: int,
 
     if use_gpu:
         import cupy as cp
-        import cupyx.scipy.sparse.linalg as cu_linalg
-        a_gpu = cp.asarray(a, dtype=cp.float64)
-        b_gpu = cp.asarray(rhs, dtype=cp.float64)
-        d_gpu = cp.asarray(diag, dtype=cp.float64)
-        precond = cu_linalg.LinearOperator(a.shape, matvec=lambda v: v / d_gpu,
-                                           dtype=cp.float64)
-        x_gpu, info = cu_linalg.gmres(a_gpu, b_gpu, rtol=tol, atol=0.0,
-                                      restart=restart, maxiter=maxiter, M=precond,
-                                      callback=callback, callback_type='pr_norm')
-        x = cp.asnumpy(x_gpu)
-        del a_gpu, b_gpu, d_gpu, x_gpu, precond
-        cp.get_default_memory_pool().free_all_blocks()   # hand the N^2 block back
+        pool = cp.get_default_memory_pool()
+        limit = int(pool.get_limit())
+        if limit:
+            pool.set_limit(size=0)
+        try:
+            a_gpu = cp.asarray(a, dtype=cp.float64)
+            b_gpu = cp.asarray(rhs, dtype=cp.float64)
+            d_gpu = cp.asarray(diag, dtype=cp.float64)
+            x_gpu, info, _ = _gmres_gpu(a_gpu, b_gpu, d_gpu, tol, restart, maxiter, residuals)
+            x = cp.asnumpy(x_gpu)
+            del a_gpu, b_gpu, d_gpu, x_gpu
+        finally:
+            pool.free_all_blocks()                 # hand the N^2 block back
+            if limit:
+                pool.set_limit(size=limit)
     else:
         import scipy.sparse.linalg as spla
         precond = spla.LinearOperator(a.shape, matvec=lambda v: v / diag, dtype=float)
@@ -2252,6 +2393,96 @@ def _gmres_jacobi(weak_form, rhs: np.ndarray, tol: float, restart: int,
     return x, int(info), residuals, len(residuals) - 1
 
 
+class _PotentialKernels:
+    """Bempp's OpenCL kernels of the Laplace single-layer potential, built ONCE for a space and a charge and applied
+    to batch after batch of points.
+
+    ``bempp_cl``'s potential operator builds its three OpenCL programs from source every time one is made, so one
+    operator per batch cost 2.1-2.4 s on the GPU before any arithmetic (measured 2026-11-13; pyopencl's binary cache
+    does not work in every environment): the 24 batches of a 5.78 M-point field grid took 63 s, of which the
+    arithmetic is 9 s. This is ``bempp_cl.core.opencl_assemblers.potential_assembler`` with the builds and the
+    constant buffers taken out of the loop: the same kernels, quadrature rule and work-group layout, and so the same
+    values to the last bit (checked on that grid)."""
+
+    def __init__(self, space, coefficients, device: str, precision: str):
+        import pyopencl as cl
+        import bempp_cl.api
+        from bempp_cl.api.integration.triangle_gauss import rule
+        from bempp_cl.api.operators import OperatorDescriptor
+        from bempp_cl.api.utils.helpers import get_type
+        from bempp_cl.core import opencl_assemblers
+        from bempp_cl.core.opencl_kernels import (default_context, default_device, get_kernel_from_name,
+                                                  get_kernel_from_operator_descriptor, get_vector_width)
+        self._cl = cl
+        descriptor = OperatorDescriptor("laplace_single_layer_potential", [], "laplace_single_layer",
+                                        "default_scalar", precision, False, None, 1)
+        local = space.localised_space
+        quad_points, quad_weights = rule(bempp_cl.api.GLOBAL_PARAMETERS.quadrature.regular)
+        self.dtype = np.dtype(get_type(precision).real)
+        self.ctx, self.device = default_context(device), default_device(device)
+        indices = local.support_elements
+        self.n_elements = len(indices)
+        self.width = get_vector_width(precision, device_type=device)
+        self.group = opencl_assemblers.WORKGROUP_SIZE_POTENTIAL
+        self.remainder = self.n_elements % self.group
+        self.main = self.n_elements - self.remainder
+        options = {"NUMBER_OF_QUAD_POINTS": len(quad_weights), "SHAPESET": local.shapeset.identifier,
+                   "NUMBER_OF_SHAPE_FUNCTIONS": local.number_of_shape_functions,
+                   "WORKGROUP_SIZE": self.group // self.width}
+        self.k_main = self.k_sum = self.k_remainder = None
+        if self.main > 0:
+            self.k_main = get_kernel_from_operator_descriptor(descriptor, options, "potential", device_type=device)
+            self.k_sum = get_kernel_from_name("sum_for_potential_novec", options, precision, device_type=device)
+        if self.remainder > 0:
+            options["WORKGROUP_SIZE"] = self.remainder
+            self.k_remainder = get_kernel_from_operator_descriptor(descriptor, options, "potential", force_novec=True,
+                                                                   device_type=device)
+        read = cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR
+        x = space.map_to_full_grid @ (space.dof_transformation @ np.asarray(coefficients))
+        self.b_indices = cl.Buffer(self.ctx, read, hostbuf=indices)
+        self.b_normals = cl.Buffer(self.ctx, read, hostbuf=local.normal_multipliers)
+        self.b_grid = cl.Buffer(self.ctx, read, hostbuf=local.grid.as_array.astype(self.dtype))
+        self.b_quad_points = cl.Buffer(self.ctx, read, hostbuf=quad_points.ravel(order="F").astype(self.dtype))
+        self.b_quad_weights = cl.Buffer(self.ctx, read, hostbuf=quad_weights.astype(self.dtype))
+        self.b_coefficients = cl.Buffer(self.ctx, read, hostbuf=np.real(x).astype(self.dtype))
+        self.b_options = cl.Buffer(self.ctx, read, hostbuf=np.array([0.0], dtype=self.dtype))
+
+    def __call__(self, points: np.ndarray) -> np.ndarray:
+        """The potential at (n, 3) points, one launch."""
+        cl = self._cl
+        mf = cl.mem_flags
+        n = len(points)
+        size = self.dtype.itemsize
+        result = np.empty(n, dtype=self.dtype)
+        b_points = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                             hostbuf=np.ascontiguousarray(points[:, :3]).ravel().astype(self.dtype))
+        b_result = cl.Buffer(self.ctx, mf.READ_WRITE, size=size * n)
+        with cl.CommandQueue(self.ctx, device=self.device) as queue:
+            cl.enqueue_fill_buffer(queue, b_result, np.uint8(0), 0, n * size)
+            if self.main > 0:
+                sum_size = n * (self.n_elements // self.group) * size
+                b_sum = cl.Buffer(self.ctx, mf.READ_WRITE, size=sum_size)
+                cl.enqueue_fill_buffer(queue, b_sum, np.uint8(0), 0, sum_size)
+                queue.finish()
+                self.k_main(queue, (n, self.main // self.width), (1, self.group // self.width), self.b_grid,
+                            self.b_indices, self.b_normals, b_points, self.b_coefficients, self.b_quad_points,
+                            self.b_quad_weights, b_sum, self.b_options)
+                self.k_sum(queue, (n,), (1,), b_sum, b_result, np.uint32(self.n_elements // self.group))
+            if self.remainder > 0:
+                self.k_remainder(queue, (n, self.remainder), (1, self.remainder), self.b_grid, self.b_indices,
+                                 self.b_normals, b_points, self.b_coefficients, self.b_quad_points,
+                                 self.b_quad_weights, b_result, self.b_options, global_offset=(0, self.main))
+            cl.enqueue_copy(queue, result, b_result)
+        return result.astype(float)
+
+
+# One launch of the potential kernel must stay well inside the two seconds after which Windows resets a display GPU's
+# driver (a batch of 2 M points against 45k triangles did exactly that, and took the OpenCL context with it):
+# point-triangle pairs per launch, by (device, precision). 1.2e10 pairs take 0.4 s on an RTX 4070 Ti SUPER in single
+# precision (measured: 3e10 pairs/s); its double-precision rate is about 60 times lower.
+_PAIRS_PER_LAUNCH = {('gpu', 'single'): 1.2e10, ('gpu', 'double'): 2.0e8}
+
+
 @dataclass
 class GapFieldSolution:
     """Solved surface charge (Neumann data) + evaluation helpers."""
@@ -2260,11 +2491,30 @@ class GapFieldSolution:
     neumann: object
     gmres_info: int
     solve_time_s: float
-    n_iterations: int = 0          # scipy/strong: inner iterations; cupy: restart cycles
-    solver: str = ''               # 'cupy' | 'scipy' | 'strong'
+    n_iterations: int = 0          # matrix-vector products of the iterative solvers; 0 for the direct solve
+    solver: str = ''               # 'cupy' | 'scipy' | 'strong' | 'dense'
     device_interface: str = ''     # dense-assembly backend: 'opencl' | 'numba'
     assembly_time_s: float = 0.0
     final_residual: float = float('nan')
+    mirror: bool = False           # solved for the upper triangles of a mirror-symmetric mesh only
+    n_unknowns: int = 0            # unknowns of the linear system (half the triangles when ``mirror``)
+    _kernels: dict = dataclass_field(default_factory=dict, repr=False, compare=False)
+
+    def _potential_kernels(self, device: str, precision: str):
+        """The compiled potential kernels for this solution on ``device`` (built at the first call), or None when
+        Bempp's OpenCL interface is not in use or its internals are not the ones ``_PotentialKernels`` knows."""
+        key = (device, precision)
+        if key not in self._kernels:
+            import bempp_cl.api as bempp
+            kernels = None
+            if str(bempp.DEFAULT_DEVICE_INTERFACE) == 'opencl':
+                try:
+                    kernels = _PotentialKernels(self.space, self.neumann.coefficients, device, precision)
+                except Exception as exc:           # another bempp_cl, no such device: the operator per batch still works
+                    warnings.warn(f"potential kernels not built once ({type(exc).__name__}: {exc}); every batch "
+                                  f"builds its own", stacklevel=3)
+            self._kernels[key] = kernels
+        return self._kernels[key]
 
     def potential(self, pts: np.ndarray, chunk: int = 50000,
                   verbose: bool = False, device: Optional[str] = None,
@@ -2273,6 +2523,8 @@ class GapFieldSolution:
 
         ``device``    : 'cpu' | 'gpu'; default 'cpu'.
         ``precision`` : 'double' | 'single'; default 'double'.
+        ``chunk``     : points per batch; on the GPU a batch is also held to ``_PAIRS_PER_LAUNCH`` point-triangle
+                        pairs, so that no launch runs into the display driver's time-out.
 
         Unlike the boundary assembly - O(N^2), singular and near-singular quadrature, where a
         consumer GPU's fp64 rate loses badly to the CPU runtime - this is M x N regular
@@ -2282,6 +2534,9 @@ class GapFieldSolution:
         trilinearly interpolated, so its useful precision is set by the grid spacing, not by the
         mantissa. Check it rather than trust it - ``bem_field3d(..., pot_check=N)`` re-evaluates
         N random points in double on the CPU and reports the difference.
+
+        With Bempp's OpenCL interface the kernels are built once per solution, device and precision
+        (``_PotentialKernels``) and every batch is one launch; otherwise each batch makes its own Bempp operator.
         """
         from bempp_cl.api.operators.potential import laplace as lap_pot
         import bempp_cl.api as bempp
@@ -2293,13 +2548,20 @@ class GapFieldSolution:
             raise ValueError(f"precision must be 'single' or 'double', got {precision!r}")
         pts = np.atleast_2d(np.asarray(pts, dtype=float))
         out = np.empty(len(pts))
+        pairs = _PAIRS_PER_LAUNCH.get((device, precision))
+        if pairs is not None:
+            chunk = int(max(1000, min(int(chunk), pairs // max(int(self.model.n_elements), 1))))
+        kernels = self._potential_kernels(device, precision) if len(pts) else None
         prev = bempp.POTENTIAL_OPERATOR_DEVICE_TYPE
         bempp.POTENTIAL_OPERATOR_DEVICE_TYPE = device
         try:
             for i0 in range(0, len(pts), chunk):
                 block = pts[i0:i0 + chunk]
-                op = lap_pot.single_layer(self.space, block.T.copy(), precision=precision)
-                out[i0:i0 + len(block)] = np.real(op * self.neumann).ravel()
+                if kernels is not None:
+                    out[i0:i0 + len(block)] = kernels(block)
+                else:
+                    op = lap_pot.single_layer(self.space, block.T.copy(), precision=precision)
+                    out[i0:i0 + len(block)] = np.real(op * self.neumann).ravel()
                 if verbose and len(pts) > chunk:
                     print(f"[gap_fields]   potential eval {i0 + len(block)}/{len(pts)}")
         finally:
@@ -2454,8 +2716,9 @@ def solve_gap_field(model: ElectrodeModel,
                     solver: str = 'auto',
                     device_interface: str = 'auto',
                     gpu_fit_safety: float = 1.25,
+                    symmetry: str = 'auto',
                     verbose: bool = True) -> GapFieldSolution:
-    """Laplace Dirichlet solve (DP0 / single-layer / GMRES) on the model.
+    """Laplace Dirichlet solve (DP0 / single-layer) on the model.
 
     Parameters
     ----------
@@ -2464,9 +2727,8 @@ def solve_gap_field(model: ElectrodeModel,
     maxiter : int
         Maximum number of INNER GMRES iterations (matrix-vector products).
     restart : int, optional
-        Restart depth. Default 200 for the Jacobi solvers (measured optimum
-        on the spiral-inflector and dee meshes), 1000 for ``solver='strong'``.
-    solver : {'auto', 'cupy', 'scipy', 'strong'}
+        Restart depth, default 1000 (thin metal stalls at 200).
+    solver : {'auto', 'cupy', 'scipy', 'strong', 'dense'}
         'cupy'   Jacobi-preconditioned GMRES on the GPU. The dense N x N
                  float64 matrix is copied to the device, so it needs about
                  8 N^2 bytes of free GPU memory (~38k elements on a 16 GB
@@ -2474,15 +2736,29 @@ def solve_gap_field(model: ElectrodeModel,
         'scipy'  the same algorithm on the CPU.
         'strong' the original path: bempp's scipy GMRES on the mass-matrix
                  preconditioned strong form (kept for regression; about 2x
-                 the iterations of Jacobi, ~5x slower than cupy at 27k).
-        'auto'   'cupy' when it is importable and the matrix fits the free
-                 GPU memory, else 'scipy'.
+                 the iterations of Jacobi, ~5x slower than cupy at 27k). Always the whole mesh.
+        'dense'  a direct LU on the CPU (LAPACK): no tolerance and no iteration count that depends on the mesh.
+        'auto'   for a mirror-symmetric mesh with at most ``_DIRECT_MAX_UNKNOWNS`` unknowns: 'dense'; else 'cupy'
+                 when it is importable and the matrix fits the free GPU memory, else 'scipy'.
     device_interface : {'auto', 'opencl', 'numba'}
         Dense-assembly backend (see ``_bempp``): 'auto' takes OpenCL on the
         CPU device when pyopencl and a CPU OpenCL platform exist, else numba.
     gpu_fit_safety : float
         Head-room factor on the matrix bytes when 'auto' / 'cupy' checks
         whether the dense matrix fits the free GPU memory (see ``_gpu_fits``).
+    symmetry : {'auto', 'off', 'require'}
+        'auto'   test the mesh (``mirror_pairs``): when it is mirror symmetric about z = 0 triangle for triangle, only
+                 the rows of the upper triangles are assembled and the mirror image is folded into them,
+                 A_h[k, l] = A[u_k, u_l] + A[u_k, mirror(u_l)]. The charge is the full system's (it is the same on
+                 both triangles of a pair) for half the assembly, half the unknowns and a quarter of the matrix:
+                 23k unknowns for a 46k-triangle model, which LAPACK factors in 20 s.
+        'off'    always the whole mesh.
+        'require' fail when the mesh is not mirror symmetric.
+
+    Measured 2026-11-13 on a mirrored 45,938-triangle model, on the CPU: rows-only assembly 6.8 s against 11.7 s
+    for the whole matrix, LU 19.4 s (GMRES to 1e-5: 67 products, 6.4 s; to 1e-7: 179, 15.8 s) against 60.6 s for
+    the whole system's GMRES to 1e-7; total charge per electrode equal to 4e-7, the field in the beam region to 1e-7
+    (median). GMRES at 1e-5 leaves single charges up to 3 % of the peak charge off the direct solution.
 
     Measured on the single-dee model with 27k elements (10 numba threads,
     other jobs running): assembly numba 38 s / OpenCL-CPU 4.9 s; solve strong
@@ -2500,8 +2776,16 @@ def solve_gap_field(model: ElectrodeModel,
     if solver not in ('auto', 'cupy', 'scipy', 'strong', 'dense'):
         raise ValueError("solver must be 'auto', 'cupy', 'scipy', 'strong' or 'dense', "
                          f"got {solver!r}")
+    if symmetry not in ('auto', 'off', 'require'):
+        raise ValueError(f"symmetry must be 'auto', 'off' or 'require', got {symmetry!r}")
+    pairs = mirror_pairs(model) if symmetry != 'off' and solver != 'strong' else None
+    if symmetry == 'require' and pairs is None:
+        raise RuntimeError("symmetry='require': " + (
+            "solver='strong' solves the whole mesh" if solver == 'strong' else
+            "the mesh is not mirror symmetric about z = 0 triangle for triangle (geometry.mirror_mesh builds one "
+            "that is)"))
     bempp = _bempp(device_interface)
-    n = int(model.n_elements)
+    n_el = int(model.n_elements)
     if bempp.DEFAULT_DEVICE_INTERFACE == 'opencl':
         # the OpenCL device caps single allocations well below host RAM; the
         # dense matrix must fit in one buffer, else assemble with numba
@@ -2510,28 +2794,72 @@ def solve_gap_field(model: ElectrodeModel,
             max_alloc = int(default_cpu_device().max_mem_alloc_size)
         except Exception:
             max_alloc = None
-        if max_alloc is not None and 8.0 * n * n > 0.9 * max_alloc:
+        need = 8.0 * n_el * (n_el // 2 if pairs is not None else n_el)
+        if max_alloc is not None and need > 0.9 * max_alloc:
             if verbose:
-                print(f"[gap_fields] {n} elements: dense matrix {8.0 * n * n / 2**30:.1f} GB "
+                print(f"[gap_fields] {n_el} elements: dense matrix {need / 2**30:.1f} GB "
                       f"exceeds the OpenCL device's max allocation "
                       f"({max_alloc / 2**30:.1f} GB); assembling with numba")
             bempp = _bempp('numba')
     from bempp_cl.api.operators.boundary import laplace as lap_bnd
 
-    grid = bempp.Grid(model.vertices.T.copy(),
-                      model.triangles.T.astype(np.uint32).copy())
-    space = bempp.function_space(grid, "DP", 0)
-    n = int(space.global_dof_count)
-    dirichlet = bempp.GridFunction(space, coefficients=model.potentials.astype(float))
-    slp = lap_bnd.single_layer(space, space, space)
-
-    t0 = time.time()
-    weak = slp.weak_form()               # dense assembly (cached on the operator)
-    t_asm = time.time() - t0
+    vertices = np.asarray(model.vertices, dtype=float).T.copy()
+    elements = np.asarray(model.triangles).T.astype(np.uint32).copy()
+    potentials = np.asarray(model.potentials, dtype=float)
     backend = str(bempp.DEFAULT_DEVICE_INTERFACE)
+    weak = matrix = rhs_half = u = partner = None
+    t_asm = 0.0
+    if pairs is not None:
+        upper, partner = pairs
+        u = np.flatnonzero(upper)
+        grid = bempp.Grid(vertices, elements, np.where(upper, 1, 2).astype(np.uint32))
+        space = bempp.function_space(grid, "DP", 0)
+        rows = bempp.function_space(grid, "DP", 0, segments=[1])
+        dirichlet = bempp.GridFunction(space, coefficients=potentials)
+        # the fold takes row k for the k-th upper triangle in mesh order: Bempp must have numbered the segment's
+        # unknowns that way (it does; another bempp_cl may not)
+        try:
+            in_order = (int(rows.global_dof_count) == len(u)
+                        and np.array_equal(np.asarray(rows.support_elements).ravel(), u)
+                        and np.array_equal(np.asarray(rows.local2global)[u, 0], np.arange(len(u))))
+        except Exception:
+            in_order = False
+        rect = None
+        if in_order:
+            slp = lap_bnd.single_layer(space, rows, rows)
+            t0 = time.time()
+            rect = _dense_matrix(slp.weak_form())             # the upper triangles' rows, every column
+            if rect is not None and rect.shape == (len(u), n_el):
+                matrix = _fold_columns(rect, u, partner[u])
+                t_asm = time.time() - t0
+                n = len(u)
+                # the right-hand side of a piecewise-constant space: potential x area (Bempp's own projection onto the
+                # segment space gives the same numbers, to 2e-15, for 2.5 s)
+                corners = np.asarray(model.vertices, dtype=float)[np.asarray(model.triangles)[u]]
+                rhs_half = potentials[u] * 0.5 * np.linalg.norm(np.cross(corners[:, 1] - corners[:, 0],
+                                                                         corners[:, 2] - corners[:, 0]), axis=1)
+            del rect
+        if matrix is None:
+            if verbose:
+                print("[gap_fields] this bempp_cl does not give the upper triangles' rows in mesh order: solving the "
+                      "whole mesh")
+            pairs = None
+    if pairs is None:
+        grid = bempp.Grid(vertices, elements)
+        space = bempp.function_space(grid, "DP", 0)
+        n = int(space.global_dof_count)
+        dirichlet = bempp.GridFunction(space, coefficients=potentials)
+        slp = lap_bnd.single_layer(space, space, space)
+        t0 = time.time()
+        weak = slp.weak_form()               # dense assembly (cached on the operator)
+        t_asm = time.time() - t0
     if verbose:
-        print(f"[gap_fields] assembled {n} x {n} single-layer matrix in "
-              f"{t_asm:.1f} s ({backend})")
+        if pairs is not None:
+            print(f"[gap_fields] mirror-symmetric mesh: the {n} upper rows of {n_el} triangles assembled and folded to "
+                  f"{n} x {n} in {t_asm:.1f} s ({backend})")
+        else:
+            print(f"[gap_fields] assembled {n} x {n} single-layer matrix in "
+                  f"{t_asm:.1f} s ({backend})")
 
     if restart is None:
         # thin-feature meshes (min_metal_width ~ 1 mm) stall at restart 200
@@ -2539,6 +2867,8 @@ def solve_gap_field(model: ElectrodeModel,
         # bytes, i.e. < 0.5 GB up to 60k elements
         restart = 1000
     auto = solver == 'auto'
+    if auto and pairs is not None and n <= _DIRECT_MAX_UNKNOWNS:
+        solver = 'dense'
     if solver in ('auto', 'cupy'):
         fits, why = _gpu_fits(n, restart, gpu_fit_safety)
         if solver == 'cupy' and not fits:
@@ -2548,24 +2878,17 @@ def solve_gap_field(model: ElectrodeModel,
             if verbose and not fits:
                 print(f"[gap_fields] cupy solver not used: {why}")
 
+    def charge(x):
+        """The solution as one value per triangle (the upper triangles' values on their mirror images too)."""
+        x = np.asarray(x, dtype=float).ravel()
+        if pairs is None:
+            return x
+        full = np.empty(n_el)
+        full[u] = x
+        full[partner[u]] = x
+        return full
+
     def run(which):
-        if which == 'dense':
-            # 2026-09-15: direct LU of the dense weak-form matrix on the CPU (LAPACK, in place). For meshes where
-            # both iterative forms grind (the 50 mm-aperture model, 70k elements: weak Jacobi GMRES stalled, strong
-            # form reached 1.9e-4 in 20000 iterations / 6.5 h), the factorization is minutes at 8 N^2 bytes of RAM
-            # (39 GB at 70k). The matrix is overwritten by its factors, so no residual is reported (n_reported = 1).
-            import scipy.linalg as sla
-            a = _dense_matrix(weak)
-            if a is None:
-                raise RuntimeError("solver='dense' needs the dense weak-form matrix (dense assembly only)")
-            rhs = dirichlet.projections(slp.dual_to_range)
-            if verbose:
-                print(f"[gap_fields] dense LU of the {a.shape[0]} x {a.shape[1]} matrix "
-                      f"({8.0 * a.shape[0] * a.shape[1] / 2**30:.1f} GB, in place)", flush=True)
-            lu, piv = sla.lu_factor(a, overwrite_a=True, check_finite=False)
-            x = sla.lu_solve((lu, piv), np.asarray(rhs, dtype=float), check_finite=False)
-            del lu
-            return bempp.GridFunction(space, coefficients=np.asarray(x).ravel()), 0, [float('nan')], 1
         if which == 'strong':
             from bempp_cl.api.linalg import gmres
             neu, inf, res, it = gmres(
@@ -2573,10 +2896,29 @@ def solve_gap_field(model: ElectrodeModel,
                 use_strong_form=True, return_residuals=True,
                 return_iteration_count=True)
             return neu, int(inf), list(res), int(it)
-        rhs = dirichlet.projections(slp.dual_to_range)
-        x, inf, res, it = _gmres_jacobi(weak, rhs, tol=tol, restart=restart,
+        a = matrix if pairs is not None else _dense_matrix(weak)
+        b = rhs_half if pairs is not None else np.asarray(dirichlet.projections(slp.dual_to_range), dtype=float)
+        if which == 'dense':
+            # 2026-09-15: direct LU of the dense matrix on the CPU (LAPACK). For meshes where both iterative forms
+            # grind (the 50 mm-aperture model, 70k elements: weak Jacobi GMRES stalled, strong form reached 1.9e-4 in
+            # 20000 iterations / 6.5 h), the factorization is minutes at 8 N^2 bytes of RAM (39 GB at 70k). The whole
+            # mesh's matrix is overwritten by its factors, so no residual is reported; the folded matrix of a
+            # mirror-symmetric mesh is a quarter of that and is kept for the residual.
+            import scipy.linalg as sla
+            if a is None:
+                raise RuntimeError("solver='dense' needs the dense weak-form matrix (dense assembly only)")
+            if verbose:
+                print(f"[gap_fields] dense LU of the {a.shape[0]} x {a.shape[1]} matrix "
+                      f"({8.0 * a.shape[0] * a.shape[1] / 2**30:.1f} GB" + (")" if pairs is not None else ", in place)"),
+                      flush=True)
+            lu, piv = sla.lu_factor(a, overwrite_a=pairs is None, check_finite=False)
+            x = sla.lu_solve((lu, piv), b, check_finite=False)
+            del lu
+            res = float(np.linalg.norm(a @ x - b) / np.linalg.norm(b)) if pairs is not None else float('nan')
+            return bempp.GridFunction(space, coefficients=charge(x)), 0, [res], 0
+        x, inf, res, it = _gmres_jacobi(a, b, tol=tol, restart=restart,
                                         maxiter=maxiter, use_gpu=(which == 'cupy'))
-        return bempp.GridFunction(space, coefficients=x), int(inf), res, int(it)
+        return bempp.GridFunction(space, coefficients=charge(x)), int(inf), res, int(it)
 
     t0 = time.time()
     neumann, info, residuals, n_iter = run(solver)
@@ -2587,6 +2929,11 @@ def solve_gap_field(model: ElectrodeModel,
         if verbose:
             print(f"[gap_fields] GMRES ({solver}) stalled at residual {last:.1e} after "
                   f"{time.time() - t0:.0f} s; retrying with the strong form")
+        if pairs is not None:                # the strong form is the whole mesh's
+            del matrix
+            return solve_gap_field(model, tol=tol, maxiter=maxiter, restart=restart, solver='strong',
+                                   device_interface=device_interface, gpu_fit_safety=gpu_fit_safety,
+                                   symmetry='off', verbose=verbose)
         solver = 'strong'
         t0 = time.time()
         neumann, info, residuals, n_iter = run('strong')
@@ -2601,15 +2948,19 @@ def solve_gap_field(model: ElectrodeModel,
             f"fins are intrinsically hard for this operator). A hard stall at "
             f"O(0.1+) residual points to intersecting/overlapping electrode "
             f"surfaces instead.")
+    final = float(residuals[-1]) if len(residuals) else float('nan')
     if verbose:
-        unit = "restart cycles" if solver == 'cupy' else "iterations"
-        print(f"[gap_fields] GMRES ({solver}) solved {n} DOFs in {dt:.1f} s "
-              f"({n_iter} {unit})")
+        if solver == 'dense':
+            print(f"[gap_fields] direct solve (LU) of {n} unknowns in {dt:.1f} s"
+                  + (f" (residual {final:.1e})" if np.isfinite(final) else ""))
+        else:
+            print(f"[gap_fields] GMRES ({solver}) solved {n} DOFs in {dt:.1f} s "
+                  f"({n_iter} iterations)")
     return GapFieldSolution(
         model=model, space=space, neumann=neumann, gmres_info=int(info),
         solve_time_s=dt, n_iterations=int(n_iter), solver=solver,
-        device_interface=backend, assembly_time_s=t_asm,
-        final_residual=float(residuals[-1]) if len(residuals) else float('nan'))
+        device_interface=backend, assembly_time_s=t_asm, final_residual=final,
+        mirror=pairs is not None, n_unknowns=int(n))
 
 
 def make_bem_efield(design,

@@ -92,6 +92,10 @@ emitting_plane_file = ""     # hand-off file whose particle cloud is the emittin
                              # export's own (handoff_sc_all_level.h5 beside the outline's folder), else paths.handoff
 channel_back_mm = 1.0        # beam channel starts this far upstream of the emitting plane
 channel_extend_mm = 200.0    # ... and runs this far downstream along its normal
+exit_opening = "export"      # the housing's exit opening: "export" (where the outline has it, swept along the emitting
+                             # plane's normal) | "centred" (on the median plane, with the exported opening's exit half
+                             # height so that it contains it, swept level: the electrodes are then mirror symmetric
+                             # about z = 0, which mirror_mesh below needs)
 aperture_inset_mm = [0.0, 0.0]   # narrow the exit aperture: off each end of its (longer, shorter) edge
 cluster_tol_mm = 0.5         # outline files without curves: vertices this close to a long face form a cluster
 keep_every = 5               # ... and every Nth loose vertex is a spline knot
@@ -148,6 +152,16 @@ lc_outer_mm = 0.0            # > lc_mm: graded, lc_mm inside r_fine_mm, this bey
 r_fine_mm = 150.0
 r_coarse_mm = 220.0
 lc_posts_mm = 0.0            # < lc_mm: refine round every post, window block and hole
+lc_far_mm = 0.0              # > 0: coarser faces far from the channel (the electrodes' top and bottom, the upper
+                             # walls): the size grows from the bulk's at |z| = lc_far_z0_mm to this at lc_far_z1_mm.
+                             # 32 with 34 / 48 takes about 30 % of the triangles; 0 = off
+lc_far_z0_mm = 34.0          # ... at least 6 mm above the highest channel face
+lc_far_z1_mm = 48.0          # ... at most half_height_mm
+mirror_mesh = false          # true: mesh the upper half (z >= 0) and mirror it. The mesh is then mirror symmetric
+                             # triangle for triangle and `pcr fields` solves it as half a model ([fields] symmetry).
+                             # Needs exit_opening = "centred" and windows / holes centred on the median plane; the
+                             # build checks every electrode's volume and centre of mass and refuses otherwise.
+                             # <prefix>.step stays the whole CAD, <prefix>.msh is the upper half's mesh
 nose_lc_mm = 2.0             # a round dee0 nose: this size on it, twice it out to the ground; 0 = off
 mesh_algorithm = 6           # gmsh Mesh.Algorithm (6 = Frontal-Delaunay)
 mesh_size_min_mm = 0.0       # gmsh Mesh.MeshSizeMin; 0 = lc_mm / 2

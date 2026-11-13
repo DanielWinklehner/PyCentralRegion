@@ -202,6 +202,10 @@ class GeometryConfig:
                                          # own (handoff_sc_all_level.h5 beside the outline's folder), else paths.handoff
     channel_back_mm: float = 1.0         # beam channel starts this far upstream of the emitting plane
     channel_extend_mm: float = 200.0     # ... and runs this far downstream along its normal
+    exit_opening: str = 'export'         # the housing's exit opening: 'export' (where the outline has it, swept along
+                                         # the emitting plane's normal) | 'centred' (on the median plane, with the
+                                         # exported one's exit half height, swept level: the electrodes are then
+                                         # mirror symmetric about z = 0)
     aperture_inset_mm: tuple = (0.0, 0.0)   # narrow the exit aperture: off each end of its (longer, shorter) edge
     cluster_tol_mm: float = 0.5          # outline files without curves: vertices this close to a long face cluster
     keep_every: int = 5                  # ... and every Nth loose vertex is a spline knot
@@ -262,6 +266,13 @@ class GeometryConfig:
     r_fine_mm: float = 150.0
     r_coarse_mm: float = 220.0
     lc_posts_mm: float = 0.0             # < lc_mm: refine round every post, window block and hole
+    lc_far_mm: float = 0.0               # > 0: the faces far from the channel are meshed up to this size: the size
+                                         # grows from the bulk's at |z| = lc_far_z0_mm to this at lc_far_z1_mm; 0 = off
+    lc_far_z0_mm: float = 34.0
+    lc_far_z1_mm: float = 48.0
+    mirror_mesh: bool = False            # mesh the upper half (z >= 0) and mirror it: a mesh that is mirror symmetric
+                                         # triangle for triangle, which `pcr fields` solves as half a model
+                                         # (needs exit_opening = 'centred' and hardware centred on the median plane)
     nose_lc_mm: float = 2.0              # a round dee0 nose: this size on it, twice it out to the ground; 0 = off
     mesh_algorithm: int = 6              # gmsh Mesh.Algorithm (6 = Frontal-Delaunay)
     mesh_size_min_mm: float = 0.0        # gmsh Mesh.MeshSizeMin; 0 = lc_mm / 2
@@ -275,6 +286,7 @@ class GeometryConfig:
                                      ('si_rotation', self.si_rotation, ('fixed', 'corner')),
                                      ('dee_inner', self.dee_inner, ('arc', 'hug')),
                                      ('ground', self.ground, ('dummies', 'star')),
+                                     ('exit_opening', self.exit_opening, ('export', 'centred')),
                                      ('post_shape', self.post_shape, ('square', 'cylinder'))):
             if value not in allowed:
                 raise ConfigError(f"geometry.{name} = {value!r}; allowed: {', '.join(allowed)}")
@@ -311,6 +323,29 @@ class GeometryConfig:
         if self.lc_outer_mm > self.lc_mm and not self.r_coarse_mm > self.r_fine_mm:
             raise ConfigError(f"geometry: a graded mesh needs r_coarse_mm > r_fine_mm, got {self.r_fine_mm} / "
                               f"{self.r_coarse_mm}")
+        if self.lc_far_mm < 0.0:
+            raise ConfigError(f"geometry.lc_far_mm must be >= 0, got {self.lc_far_mm!r}")
+        if self.lc_far_mm > 0.0:
+            top = 0.5 * max(self.aperture_heights() + self.dummy_aperture_heights())
+            if not self.lc_far_mm > self.lc_mm:
+                raise ConfigError(f"geometry.lc_far_mm = {self.lc_far_mm:g} coarsens the faces far from the channel: it "
+                                  f"must exceed lc_mm = {self.lc_mm:g} (0 = off)")
+            if not top + 6.0 <= self.lc_far_z0_mm < self.lc_far_z1_mm <= self.half_height_mm:
+                raise ConfigError(f"geometry.lc_far_z0_mm / lc_far_z1_mm = {self.lc_far_z0_mm:g} / {self.lc_far_z1_mm:g}: "
+                                  f"the far faces' mesh may start to grow 6 mm above the highest channel face at the "
+                                  f"earliest (|z| >= {top + 6.0:g} mm) and reaches lc_far_mm at z1 <= half_height_mm = "
+                                  f"{self.half_height_mm:g}")
+        if self.mirror_mesh:
+            if self.exit_opening != 'centred':
+                raise ConfigError("geometry.mirror_mesh mirrors the mesh of the upper half: the housing's exit opening "
+                                  "must lie on the median plane (set exit_opening = 'centred')")
+            off = [f"window on gap {w.gap} {w.side} (z_center_mm = {w.z_center_mm:g})" for w in self.windows
+                   if float(getattr(w, 'z_center_mm', 0.0)) != 0.0]
+            off += [f"hole on gap {h.gap} {h.side} (z_mm = {h.z_mm:g})" for h in self.holes
+                    if float(getattr(h, 'z_mm', 0.0)) != 0.0]
+            if off:
+                raise ConfigError("geometry.mirror_mesh mirrors the mesh of the upper half, but this hardware is not "
+                                  "centred on the median plane: " + "; ".join(off))
         # options that would otherwise be ignored without a word
         if self.gap0_face_mm > 0.0 and self.ground != 'star':
             raise ConfigError(f"geometry.gap0_face_mm = {self.gap0_face_mm:g} fills gap 0's dummy side of the star "

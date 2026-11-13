@@ -154,6 +154,17 @@ def _channel_report(g, bounds: dict, exit_half: float) -> None:
           f">= 2 x its half height {exit_half:.3f} = {bounds['inner_min_mm']:.3f} mm  -> within bounds")
 
 
+def _centred_report(note: dict) -> None:
+    if note['shape'] == 'round':
+        (r0, r1), zc = note['radius_mm'], note['z_centre_mm']
+        print(f"  exit opening centred (geometry.exit_opening): R {r0:.4f} mm at z = {zc:+.4f} mm -> R {r1:.4f} mm at "
+              f"z = 0 (it contains the exported opening; the exit half height stays {r1:.4f} mm)")
+    else:
+        (h0, h1), zc = note['half_height_mm'], note['z_centre_mm']
+        print(f"  exit opening centred (geometry.exit_opening): a {note['shape']}, z = {zc - h0:+.4f} .. {zc + h0:+.4f} mm "
+              f"-> {-h1:+.4f} .. {h1:+.4f} mm (x and y kept)")
+
+
 def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
     """Configure the builder from cfg and lay the electrodes out in 2D exactly as ``build`` does, printing its reports
     (``verbose``). The tools that place hardware call this, so they see the build's edges: the same node snap,
@@ -207,6 +218,9 @@ def _layout_rest(cfg, s, g, inp, dees, geom, result, trj, si_rot, dees_png, line
     V.print_housing_outline(ol, inp['housing_outline'])
     if any(float(v) != 0.0 for v in g.aperture_inset_mm):
         ol['aperture'] = B.inset_aperture(ol['aperture'], *map(float, g.aperture_inset_mm))
+    if g.exit_opening == 'centred':
+        ol = B.centre_exit_aperture(ol)
+        _centred_report(ol['aperture_centred'])
     sim = B.housing_outline(ol)
     exit_half = B.exit_half_height_mm(ol)
     bounds = check_bounds(g, exit_half, B.exit_radius_mm(ol))
@@ -241,6 +255,8 @@ def bounds(cfg) -> dict:
     if any(float(v) != 0.0 for v in g.aperture_inset_mm):
         with contextlib.redirect_stdout(io.StringIO()):
             ol['aperture'] = B.inset_aperture(ol['aperture'], *map(float, g.aperture_inset_mm))
+    if g.exit_opening == 'centred':
+        ol = B.centre_exit_aperture(ol)
     e = B.exit_half_height_mm(ol)
     return {'height_max_mm': channel_height_max_mm(g), 'height_max_inner_mm': channel_height_max_at_mm(g, 0.0),
             'inner_min_mm': 2.0 * e, 'exit_r_mm': B.exit_radius_mm(ol), 'exit_half_height_mm': e,
@@ -315,11 +331,15 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
                          lay=lay)['hole']
         B.OPT = dataclasses.replace(B.OPT, holes=tuple(B.OPT.holes) + (hole,), gap0_hole_r_mm=0.0)
     plane = B.rotate_plane(B.emitting_plane(inp['emitting_plane']), si_rot)
+    if g.exit_opening == 'centred':
+        plane = B.level_plane(plane)
     brick = B.beam_channel(ol['aperture'], plane)
     print(f"\n[channel] emitting plane from {inp['emitting_plane']} ({inp['emitting_plane_from']}): "
           f"{plane['n_particles']:,} particles within {plane['flatness']:.2e} mm of it, point "
           f"({plane['point'][0]:+.3f}, {plane['point'][1]:+.3f}, {plane['point'][2]:+.3f}) mm, normal "
-          f"({plane['normal'][0]:+.4f}, {plane['normal'][1]:+.4f}, {plane['normal'][2]:+.4f})")
+          f"({plane['normal'][0]:+.4f}, {plane['normal'][1]:+.4f}, {plane['normal'][2]:+.4f})"
+          + (f" (levelled: the plane's own slopes {plane['tilt_deg']:+.3f} deg; geometry.exit_opening = 'centred')"
+             if 'tilt_deg' in plane else ""))
     print(f"[channel] the {len(ol['aperture'])}-corner exit aperture projected on it, swept "
           f"{-brick['back']:+g} .. {brick['extend']:+g} mm along the normal")
     if g.post_shape != 'square':
@@ -329,7 +349,7 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
         V.print_posts(posts)
 
     import gmsh
-    model = None
+    model, upper_share, mirror_refused = None, None, ''
     try:
         gm, groups, r_tool, _ = B.build_model(lay['foot'], lay['dummy'], lay['sim'], brick, dees, posts=posts or None)
         r0, r1 = g.aperture_radii()
@@ -338,8 +358,32 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
               f"r = {r1:g} mm" + ("" if g.dummy_aperture_heights() == g.aperture_heights() else
                                   " (dummy dees {:g} / {:g} mm)".format(*g.dummy_aperture_heights())))
         print("  aperture tool inner radii [mm]: " + ", ".join(f"{k} {v:.3f}" for k, v in sorted(r_tool.items())))
-        B.mesh_and_report(gm, groups, prefix=str(part['msh'].with_suffix('')))
-        model = B.to_electrode_model(gm, groups, B.dee_potential(dees), si_rotation_deg=si_rot)
+        prefix = str(part['msh'].with_suffix(''))
+        if g.mirror_mesh:
+            # the CAD of the whole electrodes first; then only their upper halves are meshed, and the mesh mirrored
+            gm.write(f"{prefix}.step")
+            try:
+                groups, upper_share = B.cut_upper_half(gm, groups)
+                B.mesh_and_report(gm, groups, prefix=prefix, step=False)
+                model = B.mirror_model(B.to_electrode_model(gm, groups, B.dee_potential(dees), si_rotation_deg=si_rot))
+                from PyCentralRegion.gap_fields import mirror_pairs
+                if mirror_pairs(model) is None:
+                    raise B.MirrorRefused("the mirrored mesh does not pass the symmetry test (gap_fields.mirror_pairs)")
+            except Exception as exc:
+                # a mirrored mesh that cannot be made is no reason to lose the geometry: the same electrodes are meshed
+                # whole (the cut has changed the OCC model, so it is built again), and `pcr fields` then solves the
+                # whole mesh, as it did before there was a mirror path
+                mirror_refused = f"{type(exc).__name__}: {exc}"
+                print(f"[build] mirror mesh NOT made ({mirror_refused}): the electrodes are built again and meshed "
+                      f"whole", flush=True)
+                model, upper_share = None, None
+                if getattr(gmsh, 'isInitialized', lambda: True)():
+                    gmsh.finalize()
+                gm, groups, r_tool, _ = B.build_model(lay['foot'], lay['dummy'], lay['sim'], brick, dees,
+                                                      posts=posts or None)
+        if model is None:
+            B.mesh_and_report(gm, groups, prefix=prefix, step=not g.mirror_mesh)
+            model = B.to_electrode_model(gm, groups, B.dee_potential(dees), si_rotation_deg=si_rot)
     finally:
         if getattr(gmsh, 'isInitialized', lambda: True)():
             gmsh.finalize()
@@ -355,7 +399,11 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
               'bounds': lay['bounds'], 'hardware': [q['name'] for q in posts],
               'gap0_hole': dataclasses.asdict(hole) if hole else None,
               'gap_lines': _lines_record(lay['gap_lines']),
-              'mesh': {'nodes': int(len(model.vertices)), 'triangles': int(len(model.triangles)), 'solids': solids},
+              'exit_opening': ({**ol['aperture_centred'], 'sweep_tilt_removed_deg': plane.get('tilt_deg')}
+                               if 'aperture_centred' in ol else None),
+              'mesh': {'nodes': int(len(model.vertices)), 'triangles': int(len(model.triangles)), 'solids': solids,
+                       'mirror': bool(model.params.get('mirror_mesh')), 'upper_volume_share': upper_share,
+                       'mirror_refused': mirror_refused},
               'gmsh': getattr(gmsh, '__version__', ''),
               'geometry': C.to_dict(g), 'machine': C.to_dict(s['machine']), 'inflector': C.to_dict(inf)}
     part['build_json'].write_text(json.dumps(record, indent=1, default=C.json_default))

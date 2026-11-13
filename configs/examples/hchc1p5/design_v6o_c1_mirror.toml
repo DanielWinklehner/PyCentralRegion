@@ -1,0 +1,28 @@
+# design_v6o_c1_cold.toml with the three [geometry] options that make the field build cheap (2026-11-14):
+# - exit_opening "centred": the spiral-inflector housing's exit opening on the median plane (the export has it where
+#   the beam leaves, a ring of R 10 mm centred 0.76 mm below the plane and swept 0.8 deg downward; centred it has the
+#   exported one's exit half height, R 10.76 mm, so it contains it). It is the one feature that keeps these electrodes
+#   from being mirror symmetric about z = 0, and it changes what the beam meets: the larger opening lets more of the
+#   bunch out of the housing (docs/pipeline.md, "Mirror symmetry");
+# - mirror_mesh: the upper half meshed and mirrored, which `pcr fields` then solves as half a model ([fields] symmetry
+#   = "auto"): half the unknowns, a quarter of the matrix, a direct solve, the potential on the levels z >= 0 only;
+# - lc_far_mm: the faces far above and below the channel meshed up to 32 mm (about 30 % fewer triangles).
+# A campaign takes them by naming this file as its base (or by these three lines in its own design file). They change
+# the model, so a campaign's geometries are built with them from its first evaluation on, not switched on halfway.
+#   pcr evaluate --config configs/examples/hchc1p5/design_v6o_c1_mirror.toml --set paths.model3d=<folder>/model3d.pkl
+#       --set paths.fields=<folder>/fields.pkl --out <folder>/run
+
+include = ["design_v6o_c1_cold.toml"]
+
+[run]
+name = "v6o_c1_mirror"
+out_dir = "F:/HCHC1.5/Results/CR/pcr/v6o_c1_mirror/track"
+
+[paths]                                # its own model and field cache: a stage reuses whatever is at its paths
+model3d = "F:/HCHC1.5/Results/CR/pcr/v6o_c1_mirror/geometry/cr_model_v6o_c1_mirror_model3d.pkl"
+fields = "F:/HCHC1.5/Results/CR/pcr/v6o_c1_mirror/geometry/bunch_fields3d_v6o_c1_mirror.pkl"
+
+[geometry]
+exit_opening = "centred"
+mirror_mesh = true
+lc_far_mm = 32.0                       # grows over |z| = lc_far_z0_mm .. lc_far_z1_mm (34 .. 48 mm)

@@ -65,10 +65,14 @@ stack_dz_m = 0.001
 stack_dxy_m = 0.0005        # x-y node spacing of the metal test (columns and slices) and of the field's metal mask
 max_elements = 80000        # refuse larger meshes
 tol = 1e-5                  # GMRES tolerance
-solver = "auto"             # auto | cupy | scipy | strong | dense
+solver = "auto"             # auto | cupy | scipy | strong | dense (a direct LU); auto takes dense for a mirror-symmetric
+                            # mesh, else the GPU when the matrix fits it, else scipy
+symmetry = "auto"           # auto: a mesh that is mirror symmetric about z = 0, triangle for triangle (geometry.mirror_mesh
+                            # builds one), is solved for its upper half and its potential evaluated on z >= 0 only;
+                            # "off": never; "require": fail on any other mesh
 pot_device = "gpu"          # potential evaluation on cpu | gpu
 pot_precision = "single"    # single | double
-pot_chunk = 250000          # points per potential batch
+pot_chunk = 250000          # points per potential batch (on the GPU also held to one short launch)
 pot_check = 3000            # points re-evaluated in double precision as a check
 gpu_fit_safety = 1.05       # GPU memory head-room factor of the potential batches
 

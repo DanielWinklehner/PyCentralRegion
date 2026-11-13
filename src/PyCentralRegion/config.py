@@ -411,9 +411,11 @@ class FieldsConfig:
     max_elements: int = 80000        # refuse larger meshes
     tol: float = 1e-5                # GMRES tolerance
     solver: str = 'auto'             # BEM solver backend: auto | cupy | scipy | strong | dense
+    symmetry: str = 'auto'           # auto: a mesh that is mirror symmetric about z = 0 (geometry.mirror_mesh) is solved
+    #                                  for its upper half and its grid evaluated on z >= 0 only | off | require
     pot_device: str = 'gpu'          # potential evaluation: cpu | gpu
     pot_precision: str = 'single'    # single | double
-    pot_chunk: int = 250000          # points per potential batch
+    pot_chunk: int = 250000          # points per potential batch (on the GPU also held to one short launch)
     pot_check: int = 3000            # points re-evaluated in double precision as a check
     gpu_fit_safety: float = 1.05     # GPU memory head-room factor of the potential batches
 
