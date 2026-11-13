@@ -29,6 +29,12 @@ from PyPATools.particles import ParticleDistribution
 from PyPATools.global_variables import CLIGHT
 from PyPATools.trackers import Tracker, Interaction, Terminator, Recorder
 
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except ImportError:                                   # pragma: no cover
+    HAS_NUMBA = False
+
 
 @dataclass
 class TrackingResult:
@@ -324,6 +330,64 @@ def _rotation_from_to(a, b):
     th = np.arctan2(s, c)
     return np.eye(3) + np.sin(th) * K + (1.0 - np.cos(th)) * (K @ K)
 
+
+if HAS_NUMBA:
+    # NO fastmath: this is ``SpaceChargeKick._kick_numpy`` row by row, the same operations in the same order (NumPy
+    # sums a row's three squares from the left and never contracts a multiply-add; neither does numba without
+    # fastmath), so the two agree bit for bit (tests/test_sc_kick.py) - as ``fast_track3d._sc_kick_point``, the same
+    # arithmetic inside the compiled kernel, does.
+    @njit(cache=True)
+    def _kick_rows(v, mask, E, B, kick_z, qom_dt, c2):
+        """``SpaceChargeKick._kick`` in place: u = gamma v; u += (q/m) (E + v x B) dt; v = u / gamma(u), on the rows
+        of ``mask`` that have a field (v x B only when any of them has a B). Returns whether any row had one."""
+        n = v.shape[0]
+        any_field = False
+        any_b = False
+        for p in range(n):
+            if mask[p]:
+                has_b = B[p, 0] != 0.0 or B[p, 1] != 0.0 or B[p, 2] != 0.0
+                if has_b or E[p, 0] != 0.0 or E[p, 1] != 0.0 or (kick_z and E[p, 2] != 0.0):
+                    any_field = True
+                    if has_b:
+                        any_b = True
+                        break
+        if not any_field:
+            return False
+        for p in range(n):
+            if not mask[p]:
+                continue
+            ex = E[p, 0]
+            ey = E[p, 1]
+            ez = E[p, 2] if kick_z else 0.0
+            bx = B[p, 0]
+            by = B[p, 1]
+            bz = B[p, 2]
+            if not (ex != 0.0 or ey != 0.0 or ez != 0.0 or bx != 0.0 or by != 0.0 or bz != 0.0):
+                continue
+            vx = v[p, 0]
+            vy = v[p, 1]
+            vz = v[p, 2]
+            gamma = 1.0 / np.sqrt(1.0 - ((vx * vx + vy * vy) + vz * vz) / c2)
+            ux = gamma * vx
+            uy = gamma * vy
+            uz = gamma * vz
+            fx = ex
+            fy = ey
+            fz = ez
+            if any_b:
+                fx = ex + (vy * bz - vz * by)
+                fy = ey + (vz * bx - vx * bz)
+                fz = ez + (vx * by - vy * bx)
+            ux = ux + qom_dt * fx
+            uy = uy + qom_dt * fy
+            uz = uz + qom_dt * fz
+            gn = np.sqrt(1.0 + ((ux * ux + uy * uy) + uz * uz) / c2)
+            v[p, 0] = ux / gn
+            v[p, 1] = uy / gn
+            v[p, 2] = uz / gn
+        return True
+
+
 class SpaceChargeKick(Interaction):
     """Space-charge kick of the live bunch from an open-boundary Poisson solve.
 
@@ -576,7 +640,21 @@ class SpaceChargeKick(Interaction):
                   f"max {row[4]:.3e} V/m, rms size {1e3 * sig[0]:.2f} x {1e3 * sig[1]:.2f} x {1e3 * sig[2]:.2f} mm, "
                   f"{1e3 * wall:.1f} ms", flush=True)
 
+    # The kick of the stored field on the rows of a mask. Compiled (``_kick_rows``) when numba is there: the hook
+    # kicks at every solve step itself (the compiled 3D kernel only the steps in between), which is every step of a
+    # run that solves at every step, and the NumPy kick's dozen passes over the bunch then cost about as much as the
+    # kernel and the callback together. ``compiled_kick = False`` selects the NumPy kick, the reference: the two
+    # agree bit for bit.
+    compiled_kick = True
+
     def _kick(self, v, mask, dt):
+        if self.compiled_kick and HAS_NUMBA:
+            if _kick_rows(v, mask, self.E, self.B, self.kick_z, self.q_over_m * dt, CLIGHT ** 2):
+                self.n_kick_steps += 1
+            return
+        self._kick_numpy(v, mask, dt)
+
+    def _kick_numpy(self, v, mask, dt):
         E = self.E[mask]
         B = self.B[mask]
         if not self.kick_z:
