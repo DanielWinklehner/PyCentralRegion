@@ -98,6 +98,22 @@ sc_window_q = 0.002         # particles outside the [q, 1 - q] quantiles per axi
 sc_frame = "bunch"          # "bunch" (grid turned onto the mean horizontal velocity) | "lab"
 sc_gpu = true
 sc_current_ma = 0.0         # 0 = the hand-off file's current
+sc_gpu_pool_gb = 0.0        # > 0: limit of the GPU memory pool of the space-charge solver [GiB]; 0 = the solver's own
+                            # (2 GiB). A train's mesh at 128 nodes needs more (the run says how much)
+# Bunch train (opt-in): the bunch of the run among the bunches of the turns next to it. One bunch is released every
+# machine.harmonic RF periods (one revolution), so at any moment the bunches sit side by side on neighbouring turns;
+# all of them share one space-charge mesh. 0 and 0 = the bunch alone. The outputs describe the run's bunch only, in
+# its own clock, plus a table per bunch (track.json: final.train).
+bunches_ahead = 0           # bunches released before the run's bunch (older: they fly on the turns outside it)
+bunches_behind = 0          # bunches released after it (younger: inside it)
+train_coupled = true        # false = the control of a train run: the run's bunch feels only its own charge, on the
+                            # train's mesh, while the other bunches fly as before (two solves per step). A train run
+                            # and its control differ by the neighbours' forces on the run's bunch
+train_charge = 1.0          # charge of those bunches relative to the run's bunch; 0 = weightless: tracked on the same
+                            # mesh, but nothing feels them and they feel no charge of their own (a cheaper, rougher
+                            # control: without their own space charge they have other sizes, so the mesh differs)
+sc_train_cells_radial = 512 # train: FFT grid nodes across the train (the radial axis of the bunch frame); along the
+                            # bunch and vertically the nodes stay sc_cells / sc_final_cells
 n_tracks = 20000            # particles whose full tracks are stored (final run)
 track_every = 4             # steps between stored track points
 probes_deg = [25.0, 45.0]   # azimuths of the radial probes (final run)

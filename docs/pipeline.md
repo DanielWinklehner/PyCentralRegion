@@ -144,6 +144,46 @@ the hand-off file's unless `track.sc_current_ma` is set.
 | search | 10 000 | 64³ every 5 steps | optimisation; the particle number dominates the error |
 | verification | all (~98 000) | 128³ every step | a design worth building; only z rms is grid-sensitive |
 
+### Bunch train: the neighbouring turns (opt-in)
+
+By default a run tracks one bunch alone. `track.bunches_ahead` and `track.bunches_behind` put it in a train: copies of
+the bunch released one every `machine.harmonic` periods of the tracking RF before and after it. That period is one
+revolution, exactly `track.steps_per_turn` steps, so at any moment the bunches sit side by side on neighbouring turns:
+those released before fly ahead, outside the run's bunch; those released after fly inside it. The bunches in the
+other RF buckets, at other azimuths, are not there.
+
+- **Space charge:** every bunch carries the bunch charge I / f_RF, and all of them deposit on one mesh, laid across
+  the train: `sc_cells` / `sc_final_cells` nodes along the bunch and vertically, `track.sc_train_cells_radial`
+  (512) across the train. Each bunch feels its own field and the others' from the same solve. Measured on one design
+  (the tracks of a single-bunch run, CPU): 64 × 512 × 64 nodes over a train of five resolve a bunch's own field as
+  its own 64³ window does, 128 × 512 × 128 as 128³; the neighbours change the slope of the bunch's own field by a
+  few per cent, and the tails of neighbouring turns interleave at some azimuths, which is why the neighbours are on
+  the same mesh and not on a coarser one.
+- **The control:** `track.train_coupled = false`. The run's bunch then feels only its own charge, on the train's
+  mesh, while the other bunches feel every charge and fly as in the coupled run (two solves per step on the same
+  positions, so on the same mesh). A train run and its control differ by the neighbours' forces on the run's bunch;
+  the control and a run of the bunch alone differ by the mesh. Compare a train with its control, not with the bunch
+  alone: a change of mesh moves the particles too (at 1000 particles on a 32-node mesh more than the neighbours
+  do).
+- **`track.train_charge`** scales the other bunches' charge. At 0 they are weightless: tracked on the same mesh, but
+  nothing feels them and they feel no charge of their own. That is a cheaper control (one solve per step) and a
+  rougher one: without their own space charge the other bunches have other sizes, so the mesh is not the same.
+- **What the run records:** the run's own bunch only, in its own clock (step 0 is its first release), in the layout
+  of a run of the bunch alone: the per-turn statistics, hits, final states, snapshots, tracks and probes, and so the
+  scores. The reference particle, t = 0 and the bunch phase are those of the own bunch. `final.train` in track.json
+  adds a table per bunch: live particles at every logged turn and at the end, metal losses, end energy and radius.
+  Bunch k has as many live particles as bunch 0 had k turns earlier once the train is long enough: that is the check
+  of its length.
+- **How long a train:** the run starts `bunches_ahead` turns early, so the own bunch is born with its outer
+  neighbours in place and gets its inner ones as they are released. On the design measured, the nearest turn on each
+  side gives 83 % of the neighbours' effect on the field slopes, the second 14 %. The bunches ahead fly
+  `bunches_ahead` turns further than the own bunch: they must still be inside the field maps and the loss limits
+  there (`machine.r_max_m`), or the last turns of the own bunch lose their outer neighbour.
+- **Cost:** a train of N bunches tracks N times the particles for `turns + bunches_ahead` turns and solves on a mesh
+  `sc_train_cells_radial / sc_cells` times as large. On the GPU the mesh at 128 nodes holds more than the solver's
+  default memory pool of 2 GiB (`simulate3d.sc_mesh_memory_gb`): set `track.sc_gpu_pool_gb`; the run refuses a mesh
+  that cannot fit instead of skipping solves.
+
 The compiled 3D kernel (`track.fast3d`, numba) runs the whole bunch: release, space-charge kicks, the metal test and
 the probes. It needs:
 - the `boris_rel` pusher;
