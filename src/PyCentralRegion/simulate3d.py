@@ -312,6 +312,7 @@ def install(finder, fields, cav0, volt_scale):
 # ---------------------------------------------------------------------------------------------------------------------
 # tracking
 GREEN_CACHE_BYTES = 0.6e9     # a train mesh's solver keeps Green spectra up to about this size (at least one)
+POOL_MARGIN = 1.1             # the GPU pool must hold this times the arrays of a solve (sc_mesh_memory_gb)
 
 
 def train_mesh(tc, cells):
@@ -333,7 +334,9 @@ def sc_mesh_memory_gb(n_cells, cache=4):
     """GPU memory [GiB] one FFT space-charge solve on ``n_cells`` nodes holds, from its array sizes: on the doubled
     grid the padded charge, its spectrum and the potential, ``cache`` Green spectra and, while a new one is computed,
     the Green function and its spectrum; on the mesh the potential and the field. The FFT plans' work areas are not
-    counted, so this is a lower bound."""
+    counted: measured (2026-11-13, CuPy's pool at its fullest over 40 solves of a breathing train), the pool held 3
+    to 5 % more, 1.23 GiB for the 1.19 of 128^3 or 64 x 512 x 64 with four spectra and 3.41 GiB for the 3.25 of
+    128 x 512 x 128 with one."""
     n = float(np.prod(n_cells))
     return (8.0 * 8.0 * n * (3 + cache + 2) + 8.0 * n * 4) / 2 ** 30
 
@@ -359,12 +362,12 @@ def space_charge_kick(tc, cells, every, current_ma, f_rf, train=False):
             pool.set_limit(size=int(tc.sc_gpu_pool_gb * 2 ** 30))
         limit = pool.get_limit() / 2 ** 30                   # 0: no limit
         if extra:
-            need = sc_mesh_memory_gb(n_cells, extra['cache_size'])
+            need = POOL_MARGIN * sc_mesh_memory_gb(n_cells, extra['cache_size'])
             if 0 < limit < need:
                 raise ConfigError(f"the train's space-charge mesh of {n_cells[0]} x {n_cells[1]} x {n_cells[2]} nodes "
-                                  f"holds about {need:.1f} GiB on the GPU (array sizes; the FFT plans add to it), "
-                                  f"more than the solver's memory pool of {limit:g} GiB: set track.sc_gpu_pool_gb "
-                                  f"(about {math.ceil(1.5 * need)}), or fewer nodes")
+                                  f"needs about {need:.1f} GiB on the GPU, more than the solver's memory pool of "
+                                  f"{limit:g} GiB: set track.sc_gpu_pool_gb (to {math.ceil(need)} or more), or fewer "
+                                  f"nodes")
     return SpaceChargeKick(solver, resolve_every=every, bunch_current_a=current_ma * 1e-3, bunch_frequency_hz=f_rf,
                            kick_z=True, verbose=True, train_coupled=bool(tc.train_coupled))
 

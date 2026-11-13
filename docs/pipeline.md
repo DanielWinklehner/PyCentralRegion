@@ -178,11 +178,20 @@ other RF buckets, at other azimuths, are not there.
   neighbours in place and gets its inner ones as they are released. On the design measured, the nearest turn on each
   side gives 83 % of the neighbours' effect on the field slopes, the second 14 %. The bunches ahead fly
   `bunches_ahead` turns further than the own bunch: they must still be inside the field maps and the loss limits
-  there (`machine.r_max_m`), or the last turns of the own bunch lose their outer neighbour.
+  there (`machine.r_max_m`), or the last turns of the own bunch lose their outer neighbour. On the design measured
+  the model ends after turn 7: a bunch ahead leaves at the radial loss limit during its eighth turn (60 % of it
+  between turns 7.5 and 7.75), so the run's bunch has its full outer neighbour until its turn 6.5 and about a tenth
+  of it at the end. A second bunch ahead adds a neighbour for turns 1 to 5.5 only.
 - **Cost:** a train of N bunches tracks N times the particles for `turns + bunches_ahead` turns and solves on a mesh
-  `sc_train_cells_radial / sc_cells` times as large. On the GPU the mesh at 128 nodes holds more than the solver's
-  default memory pool of 2 GiB (`simulate3d.sc_mesh_memory_gb`): set `track.sc_gpu_pool_gb`; the run refuses a mesh
-  that cannot fit instead of skipping solves.
+  `sc_train_cells_radial / sc_cells` times as large; a control solves twice per step. Measured on the GPU
+  (2026-11-13, RTX 4070 Ti SUPER): one solve of a five-bunch train takes 18 ms on 64 × 512 × 64 nodes (50,000
+  particles) and 127 ms on 128 × 512 × 128 (503,125), against 3 ms and 25 ms for the bunch alone on 64³ and 128³;
+  a search-fidelity run of 7 turns takes 14 s for the bunch alone, 51 s in a train of three (its control 88 s) and
+  105 s in a train of five (124 s).
+- **GPU memory:** 64 × 512 × 64 nodes hold 1.24 GiB, as the bunch alone on 128³ does; 128 × 512 × 128 hold
+  3.41 GiB, more than the solver's default memory pool of 2 GiB, in which every solve of that mesh fails. Set
+  `track.sc_gpu_pool_gb` (4 or more); the run refuses a train mesh that cannot fit its pool
+  (`simulate3d.sc_mesh_memory_gb`) instead of skipping solves.
 
 The compiled 3D kernel (`track.fast3d`, numba) runs the whole bunch: release, space-charge kicks, the metal test and
 the probes. It needs:
