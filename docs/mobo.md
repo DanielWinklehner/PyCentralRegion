@@ -386,7 +386,7 @@ campaign_v6r60o_c1, posts in the loop, search fidelity, one GPU, the kernel cach
 
 | one evaluation | in that campaign | the same code from a shell | new field code, the same model | ... with the three mirror options |
 |---|---|---|---|---|
-| a new geometry (bare model, its phase scan, the post rule, the model with posts, the run, the scores) | 708 s | 364 s | 249 s | 180 s; with the tracking and layout changes of that day 152 s started detached, 159 s from a shell |
+| a new geometry (bare model, its phase scan, the post rule, the model with posts, the run, the scores) | 708 s | 364 s | 249 s | 180 s; with the tracking and layout changes of that day 152 to 167 s (six runs, mean 160 s) |
 | ... of it the two builds / the two field stages / the tracking / the rest | 63 / 410 / 175 / 60 | 29 / 223 / 81 / 31 | 28 / 105 / 85 / 31 | 31 / 36 / 83 / 30 |
 | a cheap follower | 60 s | 28-31 s | | 27 s |
 | a verify run's tracking (100,625 particles, 128³ every step) | 648 s | 388 s | | 277 s |
@@ -395,22 +395,27 @@ campaign_v6r60o_c1, posts in the loop, search fidelity, one GPU, the kernel cach
   and Windows moves a process without a window to the efficiency cores of a hybrid CPU within seconds: every stage
   took about twice as long, in every campaign up to that day. Each `pcr` process now opts out when it starts
   (`run.full_speed`, `mobo.full_speed`; `docs/pipeline.md`, "Run files"), so a detached campaign no longer runs at
-  half speed. With the final code the same evaluation took 152 s detached and 159 s from a shell: single runs eight
-  hours apart, so the 7 s may be the hour or scatter as well as the way of starting. CPU-only stages take the same
-  time either way (`pcr build`, three alternating pairs: 21.0 / 19.8 / 20.0 s from a shell, 20.1 / 19.9 / 19.4 s
-  detached). From a shell on both sides, the tracking and layout changes take 180 s to 159 s.
+  half speed, and the way of starting no longer matters: the final code's evaluation, detached and from a shell in
+  turn, took 165.7 and 158.3 s detached and 166.9 and 157.3 s from a shell (a CPU-only stage alike: `pcr build`,
+  three alternating pairs, 21.0 / 19.8 / 20.0 s from a shell and 20.1 / 19.9 / 19.4 s detached).
+- Runs of the same code differ by more than the way of starting does. The final code's six runs took 152 to 167 s
+  (mean 160 s, standard deviation 5.5 s); the run of the night is the fastest, and the five of the next morning took
+  3 to 11 s longer in the tracking stages for a reason that was not found. The other columns are single runs and
+  carry the same few percent, so read the changes where they act: the post rule and the build with posts took
+  42-43 s before the layout change and 25-27 s in all six runs after it; the tracking change saved about 10 s that
+  night, which is the size of the night-to-morning difference (at the verification fidelity it saves 111 s of 388).
 - The field stages: the GPU solver tests its residual after every product, the potential kernels are built once, and
   with `geometry.exit_opening = "centred"`, `mirror_mesh` and `lc_far_mm` the mesh is solved as half a model
   (`docs/pipeline.md`, "fields").
 - Tracking is then the largest part: 83 of 180 s, of which the bare model's phase scan (5 runs of 4000 particles)
   takes 45 s. More than half of every tracked run is the space-charge solver (`docs/pipeline.md`, "track").
 - A campaign of v6r60o_c1's shape (46 new geometries, 135 followers, 5 verify runs) took 11.8 h; at these times it
-  takes about 3.4 h (estimate: 46 x 152 s + 135 x 27 s + 5 x about 5.5 min).
+  takes about 3.5 h (estimate: 46 x 160 s + 135 x 27 s + 5 x about 5.5 min).
 - The layout and the post rule: an evaluation lays the same electrodes out three times (the bare build, the rule,
   the build with posts), 4.6 s each in the distance from the housing outline, which is now remembered within the
   process (`builder._wall_distance`); the rule's twenty crossing tests share the tracks' segment boxes and test each
   segment of an edge against the nearby track segments only (`post_rule.segment_boxes`, 13.0 -> 8.2 s). Same
-  layouts, the same posts record byte for byte. Of the 152 s: the builds 21, the field stages 36, the tracking 73,
+  layouts, the same posts record byte for byte. Of the fastest run's 152 s: the builds 21, the field stages 36, the tracking 73,
   the rest 22.
 
 The older measurements below were all taken from a shell or inside a campaign as marked, with the code of their day.
