@@ -52,32 +52,49 @@ def offset_polyline(edge, poly, d, what, owner):
     return edge + d * nv
 
 
-def crossings(edge, xyz, live):
+def segment_boxes(xyz, live):
+    """What ``crossings`` needs of the tracks whatever the edge: which record intervals have both ends live, and the
+    x and y range of every track segment, (ok, x_lo, x_hi, y_lo, y_hi), each (S - 1, N). The rule tests twenty
+    polylines against the same tracks: made once, these take four fifths of that time away (2026-11-14: placing the
+    posts of one geometry 12.5 s, the same tests)."""
+    P0, P1 = xyz[:-1, :, :2], xyz[1:, :, :2]
+    return (live[:-1] & live[1:], np.minimum(P0[..., 0], P1[..., 0]), np.maximum(P0[..., 0], P1[..., 0]),
+            np.minimum(P0[..., 1], P1[..., 1]), np.maximum(P0[..., 1], P1[..., 1]))
+
+
+def crossings(edge, xyz, live, boxes=None):
     """Every crossing of the polyline ``edge`` (M, 2) by every particle's live track segment: arrays (particle, record,
-    point (n, 2), edge arclength). Exact segment-segment intersection (as builder.edge_crossings), all at once."""
-    ok = live[:-1] & live[1:]
+    point (n, 2), edge arclength). Exact segment-segment intersection (as builder.edge_crossings), all at once.
+    ``boxes``: ``segment_boxes(xyz, live)`` when it is at hand."""
+    ok, x_lo, x_hi, y_lo, y_hi = boxes if boxes is not None else segment_boxes(xyz, live)
     seg = np.diff(edge, axis=0)
     seg_len = np.linalg.norm(seg, axis=1)
     sl = np.concatenate([[0.0], np.cumsum(seg_len)])
     P0, P1 = xyz[:-1, :, :2], xyz[1:, :, :2]
     lo, hi = edge.min(axis=0) - 1e-9, edge.max(axis=0) + 1e-9
-    near = ok & (np.minimum(P0[..., 0], P1[..., 0]) <= hi[0]) & (np.maximum(P0[..., 0], P1[..., 0]) >= lo[0]) \
-        & (np.minimum(P0[..., 1], P1[..., 1]) <= hi[1]) & (np.maximum(P0[..., 1], P1[..., 1]) >= lo[1])
+    near = ok & (x_lo <= hi[0]) & (x_hi >= lo[0]) & (y_lo <= hi[1]) & (y_hi >= lo[1])
     kk, nn = np.nonzero(near)
     a, r = P0[kk, nn], P1[kk, nn] - P0[kk, nn]
+    # the polyline's box holds a large share of all track segments (an edge runs from the centre to the rim): each of
+    # its segments is tested against the track segments whose own box meets that segment's box only. A crossing lies
+    # in both boxes, so none is lost (the 1e-9 mm margin is far above the rounding of the intersection)
+    bx_lo, bx_hi, by_lo, by_hi = x_lo[kk, nn], x_hi[kk, nn], y_lo[kk, nn], y_hi[kk, nn]
     who, rec, pts, arc = [], [], [], []
     for m in range(len(seg)):
         c, sv = edge[m], seg[m]
-        den = r[:, 0] * sv[1] - r[:, 1] * sv[0]
+        s_lo, s_hi = np.minimum(edge[m], edge[m + 1]) - 1e-9, np.maximum(edge[m], edge[m + 1]) + 1e-9
+        cand = np.nonzero((bx_lo <= s_hi[0]) & (bx_hi >= s_lo[0]) & (by_lo <= s_hi[1]) & (by_hi >= s_lo[1]))[0]
+        am, rm = a[cand], r[cand]
+        den = rm[:, 0] * sv[1] - rm[:, 1] * sv[0]
         good = np.abs(den) > 1e-12
         safe = np.where(good, den, 1.0)
-        d = c - a
+        d = c - am
         t = np.where(good, (d[:, 0] * sv[1] - d[:, 1] * sv[0]) / safe, np.nan)
-        u = np.where(good, (d[:, 0] * r[:, 1] - d[:, 1] * r[:, 0]) / safe, np.nan)
+        u = np.where(good, (d[:, 0] * rm[:, 1] - d[:, 1] * rm[:, 0]) / safe, np.nan)
         hit = np.nonzero(good & (t >= 0) & (t <= 1) & (u >= 0) & (u <= 1))[0]
-        who.append(nn[hit])
-        rec.append(kk[hit])
-        pts.append(a[hit] + t[hit, None] * r[hit])
+        who.append(nn[cand[hit]])
+        rec.append(kk[cand[hit]])
+        pts.append(am[hit] + t[hit, None] * rm[hit])
         arc.append(sl[m] + u[hit] * seg_len[m])
     return np.concatenate(who), np.concatenate(rec), np.concatenate(pts), np.concatenate(arc)
 
@@ -172,12 +189,15 @@ def s_at_radius(edge, r_min):
     return float(sl[-1])
 
 
-def edge_crossings_by_pass(edge, poly, owner, size, xyz, live, phiu, what):
+def edge_crossings_by_pass(edge, poly, owner, size, xyz, live, phiu, what, boxes=None):
     """The survivors' crossings of one edge: (arclengths, passes) at the edge and at the edge moved ``size`` into its
-    electrode. xyz, live, phiu: of the survivors only."""
+    electrode. xyz, live, phiu: of the survivors only; ``boxes``: their ``segment_boxes``, when several edges are
+    tested."""
     off = offset_polyline(edge, poly, size, what, owner)
-    n0, k0, _, s0 = crossings(edge, xyz, live)
-    n1, k1, p1, _ = crossings(off, xyz, live)
+    if boxes is None:
+        boxes = segment_boxes(xyz, live)
+    n0, k0, _, s0 = crossings(edge, xyz, live, boxes)
+    n1, k1, p1, _ = crossings(off, xyz, live, boxes)
     s1 = project_s(edge, p1) if len(p1) else np.zeros(0)
     return (np.concatenate([s0, s1]),
             (1 + np.floor(phiu[np.concatenate([k0, k1]), np.concatenate([n0, n1])] / 360.0)).astype(int))
@@ -199,6 +219,7 @@ def place_posts(rule, edges, xyz, live, survived, size, round_ends=True):
         idx, first, last = np.arange(n_surv), np.argmax(live, axis=0), len(live) - 1 - np.argmax(live[::-1], axis=0)
         if np.nanmedian(phiu[last, idx] - phiu[first, idx]) < 0.0:
             raise NotImplementedError("the beam turns clockwise: the rule numbers the passes of a counterclockwise one")
+    boxes = segment_boxes(xyz, live) if n_surv else None
     for (gap, side), (edge, poly, owner) in edges.items():
         edge = np.asarray(edge, dtype=float)
         what = f"gap {gap} {side}"
@@ -210,7 +231,7 @@ def place_posts(rule, edges, xyz, live, survived, size, round_ends=True):
             rec['skipped'].append('no survivors')
             continue
         try:
-            s_all, pas = edge_crossings_by_pass(edge, poly, owner, size, xyz, live, phiu, what)
+            s_all, pas = edge_crossings_by_pass(edge, poly, owner, size, xyz, live, phiu, what, boxes)
         except RuntimeError as ex:                     # an edge whose inward side cannot be told gets no posts
             rec['skipped'].append(str(ex))
             continue

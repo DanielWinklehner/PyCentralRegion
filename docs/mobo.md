@@ -386,7 +386,7 @@ campaign_v6r60o_c1, posts in the loop, search fidelity, one GPU, the kernel cach
 
 | one evaluation | in that campaign | the same code from a shell | new field code, the same model | ... with the three mirror options |
 |---|---|---|---|---|
-| a new geometry (bare model, its phase scan, the post rule, the model with posts, the run, the scores) | 708 s | 364 s | 249 s | 180 s; started detached 170 s |
+| a new geometry (bare model, its phase scan, the post rule, the model with posts, the run, the scores) | 708 s | 364 s | 249 s | 180 s; started detached, with the tracking and layout changes of that day, 152 s |
 | ... of it the two builds / the two field stages / the tracking / the rest | 63 / 410 / 175 / 60 | 29 / 223 / 81 / 31 | 28 / 105 / 85 / 31 | 31 / 36 / 83 / 30 |
 | a cheap follower | 60 s | 28-31 s | | 27 s |
 | a verify run's tracking (100,625 particles, 128³ every step) | 648 s | 388 s | | 277 s |
@@ -402,7 +402,13 @@ campaign_v6r60o_c1, posts in the loop, search fidelity, one GPU, the kernel cach
 - Tracking is then the largest part: 83 of 180 s, of which the bare model's phase scan (5 runs of 4000 particles)
   takes 45 s. More than half of every tracked run is the space-charge solver (`docs/pipeline.md`, "track").
 - A campaign of v6r60o_c1's shape (46 new geometries, 135 followers, 5 verify runs) took 11.8 h; at these times it
-  takes about 3.6 h (estimate: 46 x 170 s + 135 x 27 s + 5 x about 5.5 min).
+  takes about 3.4 h (estimate: 46 x 152 s + 135 x 27 s + 5 x about 5.5 min).
+- The layout and the post rule: an evaluation lays the same electrodes out three times (the bare build, the rule,
+  the build with posts), 4.6 s each in the distance from the housing outline, which is now remembered within the
+  process (`builder._wall_distance`); the rule's twenty crossing tests share the tracks' segment boxes and test each
+  segment of an edge against the nearby track segments only (`post_rule.segment_boxes`, 13.0 -> 8.2 s). Same
+  layouts, the same posts record byte for byte. Of the 152 s: the builds 21, the field stages 36, the tracking 73,
+  the rest 22.
 
 The older measurements below were all taken from a shell or inside a campaign as marked, with the code of their day.
 

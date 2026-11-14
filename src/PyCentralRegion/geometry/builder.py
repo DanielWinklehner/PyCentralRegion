@@ -889,17 +889,34 @@ def lay_connected_gap_lines(dees: DeeSystem, verbose: bool = True) -> list:
 # =====================================================================================================================
 # 6. chain helpers: distance to the housing, crossings, cuts
 # =====================================================================================================================
+_WALL_DISTANCE_MEMO: dict = {}          # (points, outline) -> their distances: see _wall_distance
+_WALL_DISTANCE_MEMO_MAX = 16384
+
+
 def _wall_distance(pts: np.ndarray, wall: np.ndarray) -> np.ndarray:
-    """Signed distance of each point from the housing outline, + outside, - inside."""
+    """Signed distance of each point from the housing outline, + outside, - inside.
+
+    Remembered per process by its arguments: the layout of one geometry asks for 177,000 points in 1400 calls (4.6 s,
+    one small NumPy expression per point), and an evaluation with posts by rule lays the same electrodes out three
+    times - the bare build, the rule, the build with posts. The answer of a repeated call is the stored one."""
     from matplotlib.path import Path as MplPath
     pts = np.atleast_2d(np.asarray(pts, dtype=float))
+    w = np.asarray(wall)
+    key = (pts.shape, pts.tobytes(), w.shape, w.dtype.str, w.tobytes())
+    known = _WALL_DISTANCE_MEMO.get(key)
+    if known is not None:
+        return known.copy()
     seg = np.roll(wall, -1, axis=0) - wall
     ll = np.maximum(np.einsum('ij,ij->i', seg, seg), 1e-30)
     d = np.empty(len(pts))
     for i, p in enumerate(pts):
         t = np.clip(np.einsum('ij,ij->i', p - wall, seg) / ll, 0.0, 1.0)
         d[i] = np.min(np.hypot(*(wall + t[:, None] * seg - p).T))
-    return np.where(MplPath(wall).contains_points(pts), -d, d)
+    out = np.where(MplPath(wall).contains_points(pts), -d, d)
+    if len(_WALL_DISTANCE_MEMO) >= _WALL_DISTANCE_MEMO_MAX:
+        _WALL_DISTANCE_MEMO.clear()
+    _WALL_DISTANCE_MEMO[key] = out.copy()
+    return out
 
 
 def _densify(chain: np.ndarray, ds: float = 0.05):
