@@ -240,7 +240,7 @@ Where the time of a tracked run goes, measured 2026-11-14 on design 0140 of camp
 |---|---|---|
 | the bunch run | 14.6 s | 277 s |
 | ... compiled kernel (push, fields, metal test, kicks) | 3.1 s | 30 s |
-| ... space-charge solves (PyPATools' FFT solver on the GPU, 5.2 / 31 ms each) | 8.4 s | 196 s |
+| ... space-charge solves (PyPATools' FFT solver on the GPU, 5.2 / 28 ms each) | 8.4 s | 196 s |
 | ... per-step records (turn statistics, probes, tracks) | 2.4 s | 31 s |
 | ... the rest | 0.7 s | 20 s |
 | before the kernel took the solve steps' kicks | 15.1-16.0 s | 388 s |
