@@ -872,7 +872,11 @@ def main(argv=None):
     # recorded before the driver exits
     previous = {s: signal.signal(s, _stop_signal) for s in evaluate.STOP_SIGNALS if s != signal.SIGINT}
     try:
-        campaign = Campaign(load(args.config, args.set))
+        cfg = load(args.config, args.set)
+        if cfg.full_speed:
+            from ..process import keep_full_speed
+            keep_full_speed()
+        campaign = Campaign(cfg)
         if args.cmd == 'optimize':
             return campaign.dry_run() if args.dry_run else campaign.optimize(args.max_evals, args.max_hours)
         if args.cmd == 'optimize-verify':

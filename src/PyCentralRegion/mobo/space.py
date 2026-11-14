@@ -135,6 +135,8 @@ class MoboConfig:
     warm_start: tuple = ()           # points evaluated first: tables {name = physical value}; {} = the base design
     failed_as_infeasible: bool = False   # give failed evaluations to the sampler as infeasible trials
     max_failed_in_a_row: int = 5     # a `pcr optimize` run stops after this many failed evaluations in a row; 0 = never
+    full_speed: bool = True          # Windows: the driver opts out of power throttling (process.keep_full_speed), as
+    #                                  its evaluations do by their own run.full_speed
 
     def __post_init__(self):
         self.fidelities = {k: v if isinstance(v, Fidelity) else from_dict(Fidelity, v, f"[mobo.fidelities.{k}]")

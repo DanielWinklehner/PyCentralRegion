@@ -50,6 +50,17 @@ phases_deg = [-15.0]
 - Paths: everything in `[paths]`, and any key ending in `_path`, `_dir` or `_file` (also inside arrays of tables), is
   resolved relative to the file that sets it. `""` means "not given".
 - No stage reads an environment variable.
+- Full speed on Windows (`run.full_speed = true`, the default; `mobo.full_speed` for the campaign driver). Windows 11
+  manages the speed of every process that does not ask otherwise. A process without a visible window (a campaign
+  started detached, an evaluation the driver starts with a hidden console, a job under the task scheduler) starts on
+  the fast cores of a hybrid CPU and is moved to the efficiency cores within seconds, where every thread of it runs
+  at about half the speed. Each `pcr` command therefore opts its process out once its run file is read
+  (`process.keep_full_speed`: `SetProcessInformation(ProcessPowerThrottling)`, the priority class untouched).
+  Measured 2026-11-14 on an 8 P + 12 E core desktop, the same search-fidelity tracked run: 25 s from a shell with a
+  window, 47 s detached, 22 s detached with the opt-out. Every campaign before that day ran detached without it: the
+  same evaluation of a new geometry took 708 s in its campaign and 364 s from a shell, with the same scores
+  (`F:\HCHC1.5\Results\CR\mobo\dee_field_speedup_2026-11-13\tracking\ctx`). A script of your own that runs detached
+  calls `PyCentralRegion.process.keep_full_speed()` first.
 
 Worked example: `configs/examples/hchc1p5/` (`machine.toml` is the machine, `design_wnop3_rotn3_g0ap.toml` one design
 whose cached model and fields are on disk).
@@ -84,6 +95,67 @@ anything is written.
   holds the model, not a metal test: the tracker builds its own (`track.obstacles`).
 - Solver choices: `fields.solver` (auto | cupy | scipy | strong | dense), potentials on the GPU in single precision
   with `fields.pot_check` points re-evaluated in double precision.
+- The solve tests the mesh for mirror symmetry about z = 0 (`fields.symmetry = "auto"`,
+  `gap_fields.mirror_pairs`: every node and every triangle has its mirror image, a pair at one potential). A mesh
+  that passes is solved as half a model: only the rows of the upper triangles are assembled, the mirror image is
+  folded into them (A_h[k, l] = A[u_k, u_l] + A[u_k, mirror(u_l)]) and the half system is factored directly on the
+  CPU (LAPACK); the charge of an upper triangle is its image's too. The potential is then evaluated on the grid's
+  levels z >= 0 only and copied to their mirror levels, so the field is mirror symmetric (no E_z on the midplane).
+  `geometry.mirror_mesh` builds such meshes (below); any other mesh takes the whole-mesh path, as before.
+  `"off"` never uses the half model, `"require"` fails on a mesh that is not symmetric.
+- The whole-mesh path solves with a Jacobi-preconditioned GMRES, on the GPU when the 8 N² bytes of the matrix fit
+  its free memory (up to about 42,000 triangles on a 16 GB card), else on the CPU. Since 2026-11-14 the GPU solver
+  tests its residual after every matrix-vector product (CuPy's own tests it once per restart cycle of 1000), and it
+  lifts the cap PyPATools' space-charge solver puts on CuPy's memory pool for the time of the solve.
+- The potential kernels are built once per solve and applied to every batch of points (`fields.pot_chunk`, which on
+  the GPU is also held to a number of point-triangle pairs so that one launch stays far below the two seconds after
+  which Windows resets a display GPU's driver). Bempp's own potential operator builds its OpenCL programs for every
+  batch: 2.1-2.4 s each on the GPU, 54 of the 63 s the 24 batches of the grid took. The values are the same to the
+  last bit.
+
+#### Mirror symmetry and the three `[geometry]` options that use it
+
+The electrodes are mirror symmetric about the median plane but for one feature, the spiral-inflector housing's exit
+opening, which the export puts where the beam leaves (v6r60o_c1: a ring of R 10 mm centred at z = -0.76 mm, swept
+0.82 deg downward). Three options, all off by default, make the field build cheap; `design_v6o_c1_mirror.toml` in the
+worked example sets them:
+
+| `[geometry]` | what it does | what it changes |
+|---|---|---|
+| `exit_opening = "centred"` | the opening on the median plane, with the exported one's exit half height (R 10.76 mm here, so it contains the exported opening and the channel bounds stay), swept level | the model: the larger opening no longer clips the top of the bunch. Design 0140, search fidelity: 136 more of 10,000 particles leave the housing, 53 more reach the end, 6.658 mA instead of 6.614 mA |
+| `mirror_mesh = true` | the build cuts every electrode at z = 0 (after checking that its upper half holds half its volume and that its centre of mass lies on the plane), meshes the upper half and mirrors it; `<prefix>.step` stays the whole CAD, `<prefix>.msh` is the upper half | the triangulation only (the lower half's is the mirror image of the upper's instead of gmsh's own); needs `exit_opening = "centred"` and windows / holes centred on the plane |
+| `lc_far_mm = 32.0` | the faces far above and below the channel are meshed up to that size, growing over \|z\| = `lc_far_z0_mm` .. `lc_far_z1_mm` (34 .. 48 mm) | about 30 % fewer triangles; the field in the channel changes by 2e-4 (midplane) to 1.6e-3 (2-6 mm from a plate), median; the tracked result by 0 to 1 particle in 10,000 |
+
+A campaign switches them on in its design file from its first evaluation on: they change the model, and a model
+built without `mirror_mesh` is not mirror symmetric as a mesh, so it keeps the whole-mesh path.
+
+Measured 2026-11-14 on design 0140's geometry of campaign_v6r60o_c1 with its 20 posts, every stage a process of its
+own started from one shell, the old code being the commit before these changes (seconds; the fields stage also
+builds the metal columns, checks the seed orbit and writes the cache):
+
+| `pcr fields` | triangles / unknowns | assembly | solve | potential grid | stage |
+|---|---|---|---|---|---|
+| old code | 44,920 / 44,920 | 11.6 | 44.5 (GMRES, CPU, 134 products) | 60 | 124 |
+| new code, the same model | 44,920 / 44,920 | 11.6 | 45.2 (the same solve) | 12 | 78 |
+| `exit_opening = "centred"`, `mirror_mesh` | 45,938 / 22,969 | 8.3 | 16.4 (LU) | 8 | 40 |
+| ... and `lc_far_mm = 32` | 31,858 / 15,929 | 4.5 | 6.1 (LU) | 6 | 24 |
+| bare model (40,322 triangles, fits the GPU), old code | 40,322 / 40,322 | 9.5 | 30.2 (GPU, 1000 products) | 60 | 107 |
+| bare model, new code | 40,322 / 40,322 | 9.5 | 7.7 (GPU, 56 products) | 11 | 37 |
+| bare model, the three options | 26,416 / 13,208 | 3.4 | 3.7 (LU) | 5 | 19 |
+
+The same run tracked through each field (final current of the injected 8.25 mA):
+
+| model | search fidelity (10,000 particles) | verification fidelity (100,625 particles) |
+|---|---|---|
+| the campaign's own record | 80.160 %, 6.6144 mA | 79.025 %, 6.5208 mA |
+| new code, the same model | 80.160 %, 6.6144 mA (the field cache is the campaign's bit for bit) | 79.025 %, 6.5208 mA |
+| centred opening, mirrored mesh | 80.690 %, 6.6582 mA | 79.707 %, 6.5770 mA |
+| ... and coarse far faces | 80.690 %, 6.6582 mA (1 particle differs in turns 3-6) | 79.719 %, 6.5780 mA (12 particles more) |
+
+The gain of 0.04-0.06 mA is the opening's: centred with the exported one's exit half height, it no longer clips the
+top of the bunch (1.4 % more particles leave the housing). A whole evaluation of a new geometry with posts in the loop
+(bare model, post rule, model with posts, search run, scores) took 364 s with the old code, 249 s with the new code on
+the same model and 180 s with the three options (`docs/mobo.md`, "Costs").
 
 ### The metal test
 
@@ -153,6 +225,34 @@ the probes. It needs:
 
 Every run record of track.json carries `fast_path`: whether the compiled kernel ran and, if not, why. A run that
 cannot use it goes the Python path: same answer, far slower.
+
+The kernel runs in chunks that end where Python has work to do: a space-charge solve, or the last solve's field for
+particles just released (`SpaceChargeKick.refresh`). The kernel applies every space-charge kick itself, also the one
+of a solve step (until 2026-11-14 that one was applied in NumPy, a dozen passes over the particle arrays per solve:
+with a solve every step, a fifth of a verification run). Two runs of the same input agree in every count (alive per
+turn, losses) and to about 1e-13 m in the positions, not to the last bit: the GPU sums the deposited charge in no
+fixed order.
+
+Where the time of a tracked run goes, measured 2026-11-14 on design 0140 of campaign_v6r60o_c1 (from a shell;
+`fast_path` and `space_charge` of track.json hold the same split for every run):
+
+| | search (10,000, 64³ every 5 steps) | verification (100,625, 128³ every step) |
+|---|---|---|
+| the bunch run | 14.6 s | 277 s |
+| ... compiled kernel (push, fields, metal test, kicks) | 3.1 s | 30 s |
+| ... space-charge solves (PyPATools' FFT solver on the GPU, 5.2 / 31 ms each) | 8.4 s | 196 s |
+| ... per-step records (turn statistics, probes, tracks) | 2.4 s | 31 s |
+| ... the rest | 0.7 s | 20 s |
+| before the kernel took the solve steps' kicks | 15.1-16.0 s | 388 s |
+
+The space-charge solver is now more than half of every run. Of its 5.2 ms per solve at the search fidelity, 1.9 ms
+is the Green's function of a new window (238 of 1410 solves; nearly every one is a new combination of the three cell
+sizes, so a larger cache does not help: `FFTPoissonSolver(cache_size)` 4 or 128 recompute 204 or 182 of them), 1.4 ms
+waiting for the GPU at the read-back, 0.8 ms the window's quantiles on the CPU. That is inside PyPATools.
+
+A whole cheap evaluation (`pcr evaluate` on known fields) takes 27 s from a shell: start-up and imports 3 s, the
+system 2.6 s, the bunch 14.6 s, the record files and sections 2 s, the scoring 5 s (`turn_centres` 2.3 s, the virtual
+probes 1.9 s).
 
 The kernel's two builds, serial below 256 particles and parallel from 256 on, are cached on disk
 (`src/PyCentralRegion/__pycache__/fast_track3d._chunk3d_impl-*` and `._chunk3d_par_impl-*`): the first process after an

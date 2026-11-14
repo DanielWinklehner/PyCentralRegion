@@ -381,6 +381,31 @@ evaluation of that geometry builds afresh.
 
 ## Costs
 
+**Since 2026-11-14** (`F:\HCHC1.5\Results\CR\mobo\dee_field_speedup_2026-11-13`; design 0140's geometry of
+campaign_v6r60o_c1, posts in the loop, search fidelity, one GPU, the kernel cached):
+
+| one evaluation | in that campaign | the same code from a shell | new field code, the same model | ... with the three mirror options |
+|---|---|---|---|---|
+| a new geometry (bare model, its phase scan, the post rule, the model with posts, the run, the scores) | 708 s | 364 s | 249 s | 180 s; started detached 170 s |
+| ... of it the two builds / the two field stages / the tracking / the rest | 63 / 410 / 175 / 60 | 29 / 223 / 81 / 31 | 28 / 105 / 85 / 31 | 31 / 36 / 83 / 30 |
+| a cheap follower | 60 s | 28-31 s | | 27 s |
+| a verify run's tracking (100,625 particles, 128³ every step) | 648 s | 388 s | | 277 s |
+
+- The first two columns are the same code and the same evaluation with the same scores. The campaign ran detached,
+  and Windows moves a process without a window to the efficiency cores of a hybrid CPU within seconds: every stage
+  took about twice as long, in every campaign up to that day. Each `pcr` process now opts out when it starts
+  (`run.full_speed`, `mobo.full_speed`; `docs/pipeline.md`, "Run files"), so a detached campaign runs at the shell's
+  speed.
+- The field stages: the GPU solver tests its residual after every product, the potential kernels are built once, and
+  with `geometry.exit_opening = "centred"`, `mirror_mesh` and `lc_far_mm` the mesh is solved as half a model
+  (`docs/pipeline.md`, "fields").
+- Tracking is then the largest part: 83 of 180 s, of which the bare model's phase scan (5 runs of 4000 particles)
+  takes 45 s. More than half of every tracked run is the space-charge solver (`docs/pipeline.md`, "track").
+- A campaign of v6r60o_c1's shape (46 new geometries, 135 followers, 5 verify runs) took 11.8 h; at these times it
+  takes about 3.6 h (estimate: 46 x 170 s + 135 x 27 s + 5 x about 5.5 min).
+
+The older measurements below were all taken from a shell or inside a campaign as marked, with the code of their day.
+
 Measured on the worked example (28 threads, one GPU). The times predate the cached parallel kernel of 2026-11-11: take
 its compile off every evaluation but the first after an edit of `fast_track3d.py`.
 - **A cheap evaluation** (the search fidelity on known fields) takes 95-108 s, median 97 s: the pilot's 20 evaluations

@@ -139,6 +139,10 @@ $campaign = "$repo\configs\examples\hchc1p5\mobo_campaign.toml"
 ```
 
 Planning the budget:
+- since 2026-11-14 a new geometry with posts in the loop takes about 3 min (170 s measured, started detached; 708 s
+  in campaign_v6r60o_c1) with the mirror options of `design_v6o_c1_mirror.toml` and a cheap follower 27 s
+  (`docs/mobo.md`, "Costs"): the processes now keep the fast cores when they run without a window, and the field
+  build is 2 to 6 times faster. The figures below are older, from a shell, with the code of their day;
 - a new geometry's evaluation takes about 4 min on the worked example (build about 20 s, fields about 2 min, then
   the tracking), and the driver follows it with `cheap_per_geometry` cheap evaluations of about 1.6-1.9 min each;
 - the times here include the compile of the tracking kernel, which every evaluation process paid until 2026-11-11:

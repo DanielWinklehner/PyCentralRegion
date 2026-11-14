@@ -455,30 +455,30 @@ class SpaceChargeKick(Interaction):
     def _solve(self, step, r, v, active, t):
         dep = active & self.deposit_mask
         n_dep = int(dep.sum())
-        self._E_keep, self._B_keep, self._had_keep = self.E.copy(), self.B.copy(), self.has_field.copy()
-        self.E[:] = 0.0
-        self.B[:] = 0.0
-        self.has_field[:] = False
         self._c0 = None
         if n_dep < self.min_particles:
+            self.E[:] = 0.0
+            self.B[:] = 0.0
+            self.has_field[:] = False
             self.n_skipped += 1
             return
         t0 = time.perf_counter()
-        E_prev, B_prev, had = self._E_keep, self._B_keep, self._had_keep
+        r_dep = r[dep]
         try:
-            E_dep, B_dep = self.solver.solve_eb(r[dep], self.charges[dep], v[dep])
+            E_dep, B_dep = self.solver.solve_eb(r_dep, self.charges[dep], v[dep])
         except MemoryError as exc:
             # 2026-09-16 04:38: a 152 MiB FFT array failed to allocate while a 39 GB dense BEM LU ran alongside and the
-            # whole 4 h extraction run was lost. Keep the previous per-particle field for this interval and go on.
+            # whole 4 h extraction run was lost. Keep the previous per-particle field for this interval and go on
+            # (the stored field is only cleared below, once the new one is there: nothing to put back).
             self.n_skipped += 1
             self.n_memory_errors = getattr(self, 'n_memory_errors', 0) + 1
-            self.E[:] = E_prev
-            self.B[:] = B_prev
-            self.has_field[:] = had
             if self.verbose:
                 print(f"    SC solve @ step {step}: MemoryError ({exc}); previous field kept "
                       f"({self.n_memory_errors} so far)", flush=True)
             return
+        self.E[:] = 0.0
+        self.B[:] = 0.0
+        self.has_field[:] = False
         self.E[dep] = E_dep
         self.B[dep] = B_dep
         self.has_field[dep] = True
@@ -498,10 +498,8 @@ class SpaceChargeKick(Interaction):
         wall = time.perf_counter() - t0
         self.solve_time += wall
         self.n_solves += 1
-        e_abs = np.linalg.norm(E_dep, axis=1)
-        if not self.kick_z:
-            e_abs = np.hypot(E_dep[:, 0], E_dep[:, 1])
-        sig = r[dep].std(axis=0)
+        e_abs = np.linalg.norm(E_dep, axis=1) if self.kick_z else np.hypot(E_dep[:, 0], E_dep[:, 1])
+        sig = r_dep.std(axis=0)
         row = [int(step), float(t), n_dep, float(e_abs.mean()), float(e_abs.max()), float(wall),
                float(sig[0]), float(sig[1]), float(sig[2])]
         if len(self.log) < self.log_limit:
@@ -535,10 +533,21 @@ class SpaceChargeKick(Interaction):
         self.n_kick_steps += 1
 
     def apply(self, step, r_prev, v_prev, r, v, active, t, dt):
+        if self.refresh(step, r, v, active, t):
+            kick = active & self.kick_mask & self.has_field
+            if np.any(kick):
+                self._kick(v, kick, dt)
+        return r, v, active
+
+    def refresh(self, step, r, v, active, t):
+        """The part of ``apply`` before the kick, which is all that needs the solver: on a solve step the solve, on any
+        other the last solve's field for the particles released since. Returns False when there is nothing to kick
+        (no charge, nothing alive). The compiled 3D kernel calls this on the steps that need it and applies the kick
+        itself, with the arithmetic of ``_kick`` (``fast_track3d._sc_kick_point``)."""
         if self.charges is None or len(self.charges) != len(r):
             raise RuntimeError("SpaceChargeKick.prepare(beam, ...) must be called for this beam first")
         if self.noop or not np.any(active):
-            return r, v, active
+            return False
         if step % self.every == 0:
             self._solve(step, r, v, active, t)
         elif self.move and getattr(self, '_c0', None) is not None:
@@ -564,10 +573,7 @@ class SpaceChargeKick(Interaction):
                 # released since the last solve: the field of the last solve at their position
                 self.E[fresh] = self.solver.gather(r[fresh])
                 self.has_field[fresh] = True
-        kick = active & self.kick_mask & self.has_field
-        if np.any(kick):
-            self._kick(v, kick, dt)
-        return r, v, active
+        return True
 
     # ---------------------------------------------------------------- report
     def report(self) -> dict:

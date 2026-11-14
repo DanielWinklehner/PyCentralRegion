@@ -571,9 +571,9 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
     """Advance ``r``, ``v``, ``active`` (all full-length, mutated in place) over
     steps ``step0 .. step0 + n_sub - 1``.
 
-    ``skip_ab_first``   the first step's push/release AND space-charge kick were
-                        already done (the driver ran the Python solve): start at
-                        the RF thin-gap kick phase.
+    ``skip_ab_first``   the first step's push and release were already done (the
+                        driver ran the Python solve for it): start at the
+                        space-charge kick with the field that solve stored.
     ``stop_after_a_last`` the last step stops right after push/release, so the
                         driver can run the Python solve for it.
 
@@ -872,40 +872,45 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
                 if birth_step[p] == step + 1:
                     active[p] = True
 
-            # ---------------- 3b: SpaceChargeKick, stored field --------------
-            # ``stop_after_a_last`` splits the step between the release and this
-            # kick: the driver runs the Python solve for it and the kick comes
-            # from SpaceChargeKick.apply, so the kernel must NOT kick here too.
-            if sc_on and do_c:
-                nsel = 0
-                any_b = False
-                for p in range(n):
-                    if active[p] and sc_kick_mask[p] and sc_has_field[p]:
-                        ex = sc_E[p, 0]
-                        ey = sc_E[p, 1]
-                        ez = sc_E[p, 2] if sc_kick_z else 0.0
-                        bx = sc_B[p, 0]
-                        by = sc_B[p, 1]
-                        bz = sc_B[p, 2]
-                        if (ex != 0.0 or ey != 0.0 or ez != 0.0
-                                or bx != 0.0 or by != 0.0 or bz != 0.0):
-                            sel[nsel] = p
-                            nsel += 1
-                            if bx != 0.0 or by != 0.0 or bz != 0.0:
-                                any_b = True
-                if nsel > 0:
-                    qom_dt = sc_qom * dt
-                    for a in range(nsel):
-                        p = sel[a]
-                        ez2 = sc_E[p, 2] if sc_kick_z else 0.0
-                        nvx, nvy, nvz = _sc_kick_point(
-                            v[p, 0], v[p, 1], v[p, 2], sc_E[p, 0], sc_E[p, 1], ez2,
-                            sc_B[p, 0], sc_B[p, 1], sc_B[p, 2], any_b, qom_dt)
-                        v[p, 0] = nvx
-                        v[p, 1] = nvy
-                        v[p, 2] = nvz
-                    n_kick += 1
-                    kicked = True
+        # ---------------- 3b: SpaceChargeKick, stored field ------------------
+        # ``stop_after_a_last`` splits the step between the release and this
+        # kick: the driver runs the Python part (``SpaceChargeKick.refresh``:
+        # the solve, or the gather for the particles just released), which
+        # fills sc_E / sc_B / sc_has_field, and the ``skip_ab_first`` re-entry
+        # then kicks here with that field. Until 2026-11-14 the driver's
+        # ``SpaceChargeKick.apply`` did that step's kick in NumPy and the kernel
+        # skipped it: the same arithmetic (``_sc_kick_point``), a dozen passes
+        # over n-row arrays per solve step.
+        if sc_on and do_c:
+            nsel = 0
+            any_b = False
+            for p in range(n):
+                if active[p] and sc_kick_mask[p] and sc_has_field[p]:
+                    ex = sc_E[p, 0]
+                    ey = sc_E[p, 1]
+                    ez = sc_E[p, 2] if sc_kick_z else 0.0
+                    bx = sc_B[p, 0]
+                    by = sc_B[p, 1]
+                    bz = sc_B[p, 2]
+                    if (ex != 0.0 or ey != 0.0 or ez != 0.0
+                            or bx != 0.0 or by != 0.0 or bz != 0.0):
+                        sel[nsel] = p
+                        nsel += 1
+                        if bx != 0.0 or by != 0.0 or bz != 0.0:
+                            any_b = True
+            if nsel > 0:
+                qom_dt = sc_qom * dt
+                for a in range(nsel):
+                    p = sel[a]
+                    ez2 = sc_E[p, 2] if sc_kick_z else 0.0
+                    nvx, nvy, nvz = _sc_kick_point(
+                        v[p, 0], v[p, 1], v[p, 2], sc_E[p, 0], sc_E[p, 1], ez2,
+                        sc_B[p, 0], sc_B[p, 1], sc_B[p, 2], any_b, qom_dt)
+                    v[p, 0] = nvx
+                    v[p, 1] = nvy
+                    v[p, 2] = nvz
+                n_kick += 1
+                kicked = True
 
         if not do_c:
             break
@@ -915,7 +920,7 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
         # `engine.extra_interactions` when use_rf and gap_model == 'thin', so the
         # kick runs AFTER the release and the space-charge kick (it must sit
         # after the `do_c` break, not at the end of the `do_ab` block: on a
-        # space-charge solve step the Python `sc.apply` runs between the two).
+        # space-charge solve step the Python solve runs between the two).
         if cav[0]:
             cav_seg_start = cav[1]
             seg_p1 = cav[2]
@@ -1944,7 +1949,9 @@ def _run_fast3d(finder, args: dict, callback, dt: float, t0: float,
 
     while step < n_steps:
         if mid:
-            sc.apply(step, r, v, r, v, active, t, dt)
+            # the solve (or the gather for particles just released) of this step; its kick is the kernel's first act
+            # on re-entry (phase 3b), with the field stored here
+            sc.refresh(step, r, v, active, t)
             mid = False
             skip_ab = True
         else:

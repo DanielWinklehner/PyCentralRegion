@@ -9,6 +9,11 @@
 name = ""                   # run name; output files carry it
 out_dir = ""                # results folder
 cache_dir = ""              # field-map crops and other reusable caches
+full_speed = true           # Windows: opt the process out of power throttling. A process without a window (a campaign
+                            # started detached, an evaluation the campaign driver starts) is otherwise moved to the
+                            # efficiency cores of a hybrid CPU within seconds and runs at half the speed: the same
+                            # tracked run 47 s instead of 22 s (2026-11-14). The priority is not changed; no effect on
+                            # other systems. false leaves the process to Windows
 
 [paths]                     # relative paths are taken relative to the file that sets them; "" = not given
 bfield_3d = ""              # 3D magnet map (COMSOL text export: x y z Bx By Bz)

@@ -344,6 +344,9 @@ class RunConfig:
     name: str = ''                   # run name; output files carry it
     out_dir: str = ''                # results folder
     cache_dir: str = ''              # field-map crops and other reusable caches
+    full_speed: bool = True          # Windows: opt the process out of power throttling, which moves a process without
+    #                                  a window (a detached campaign, an evaluation of the driver) to the efficiency
+    #                                  cores of a hybrid CPU: half the speed (process.keep_full_speed)
 
 
 @dataclasses.dataclass

@@ -33,7 +33,13 @@ from . import config
 
 
 def _load(path, overrides):
-    return config.load(path, overrides=overrides or [])
+    """The run configuration; with run.full_speed (the default) the process then stays at full speed on Windows
+    whether or not it has a window (``process.keep_full_speed``)."""
+    cfg = config.load(path, overrides=overrides or [])
+    if config.section(cfg, 'run').full_speed:
+        from .process import keep_full_speed
+        keep_full_speed()
+    return cfg
 
 
 def _free_gpu():

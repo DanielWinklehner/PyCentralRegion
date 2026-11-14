@@ -64,6 +64,9 @@ max_failed_in_a_row = 5        # a `pcr optimize` run stops after this many fail
                                # a broken environment or campaign (a physics stack that does not import fails every
                                # evaluation; the preflight only checks that physics_python finds the evaluator), not
                                # bad designs; 0 = never. Running pcr optimize again continues.
+full_speed = true              # Windows: the driver opts out of power throttling, which runs a process without a
+                               # window (a campaign started detached) on the efficiency cores of a hybrid CPU. The
+                               # evaluations do the same by run.full_speed of their run file (defaults/core.toml)
 search_fidelity = "search"     # the fidelity the sampler learns from
 verify_fidelity = "verify"     # the fidelity of pcr optimize-verify
 

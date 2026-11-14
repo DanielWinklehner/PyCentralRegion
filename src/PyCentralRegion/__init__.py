@@ -49,7 +49,7 @@ _EXPORTS = {
 _SUBMODULES = ('accelerated_orbit_finder', 'analysis', 'btrim', 'cavity_optimizer', 'central_region', 'cli',
                'closed_orbit', 'config', 'diagnostics', 'electrodes3d', 'fast_track', 'fast_track3d', 'fields3d',
                'frames', 'gap_fields', 'geometry', 'handoff', 'inflector', 'kinematics', 'machine', 'metal_columns',
-               'mobo', 'polyprism', 'probes', 'rf_cavity', 'seo_finder', 'simulate3d', 'tracking')
+               'mobo', 'polyprism', 'probes', 'process', 'rf_cavity', 'seo_finder', 'simulate3d', 'tracking')
 # the package used to star-import these two modules: their other public names stay reachable
 _STAR_MODULES = ('seo_finder', 'central_region')
 
