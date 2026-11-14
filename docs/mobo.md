@@ -386,7 +386,7 @@ campaign_v6r60o_c1, posts in the loop, search fidelity, one GPU, the kernel cach
 
 | one evaluation | in that campaign | the same code from a shell | new field code, the same model | ... with the three mirror options |
 |---|---|---|---|---|
-| a new geometry (bare model, its phase scan, the post rule, the model with posts, the run, the scores) | 708 s | 364 s | 249 s | 180 s; started detached, with the tracking and layout changes of that day, 152 s |
+| a new geometry (bare model, its phase scan, the post rule, the model with posts, the run, the scores) | 708 s | 364 s | 249 s | 180 s; with the tracking and layout changes of that day 152 s started detached, 159 s from a shell |
 | ... of it the two builds / the two field stages / the tracking / the rest | 63 / 410 / 175 / 60 | 29 / 223 / 81 / 31 | 28 / 105 / 85 / 31 | 31 / 36 / 83 / 30 |
 | a cheap follower | 60 s | 28-31 s | | 27 s |
 | a verify run's tracking (100,625 particles, 128³ every step) | 648 s | 388 s | | 277 s |
@@ -394,8 +394,11 @@ campaign_v6r60o_c1, posts in the loop, search fidelity, one GPU, the kernel cach
 - The first two columns are the same code and the same evaluation with the same scores. The campaign ran detached,
   and Windows moves a process without a window to the efficiency cores of a hybrid CPU within seconds: every stage
   took about twice as long, in every campaign up to that day. Each `pcr` process now opts out when it starts
-  (`run.full_speed`, `mobo.full_speed`; `docs/pipeline.md`, "Run files"), so a detached campaign runs at the shell's
-  speed.
+  (`run.full_speed`, `mobo.full_speed`; `docs/pipeline.md`, "Run files"), so a detached campaign no longer runs at
+  half speed. With the final code the same evaluation took 152 s detached and 159 s from a shell: single runs eight
+  hours apart, so the 7 s may be the hour or scatter as well as the way of starting. CPU-only stages take the same
+  time either way (`pcr build`, three alternating pairs: 21.0 / 19.8 / 20.0 s from a shell, 20.1 / 19.9 / 19.4 s
+  detached). From a shell on both sides, the tracking and layout changes take 180 s to 159 s.
 - The field stages: the GPU solver tests its residual after every product, the potential kernels are built once, and
   with `geometry.exit_opening = "centred"`, `mirror_mesh` and `lc_far_mm` the mesh is solved as half a model
   (`docs/pipeline.md`, "fields").
