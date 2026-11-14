@@ -604,6 +604,19 @@ def vertical_phase_space(z_m, v):
             'alpha_z': float(-C[0, 1] / eps) if eps > 0 else float('nan')}
 
 
+def vertical_extent(z_mm, limit_mm):
+    """How far the same particles reach vertically over the instants of a turn: z_mm (n_instants, n_particles) [mm].
+    z_p95 is the turn mean of the instantaneous 95 % of |z| and z_p95_max its largest instant (a breathing envelope
+    read at one azimuth can sit on a waist: these follow it over the whole turn); z_out is the share of the particles
+    beyond |z| = limit_mm at any of the instants, the part of the bunch a +-limit_mm vertical aperture would meet."""
+    a = np.abs(np.asarray(z_mm, dtype=float))
+    if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] < 3:
+        return {'z_p95': float('nan'), 'z_p95_max': float('nan'), 'z_out': float('nan')}
+    q = np.quantile(a, 0.95, axis=1)
+    return {'z_p95': float(q.mean()), 'z_p95_max': float(q.max()),
+            'z_out': float(np.mean(np.any(a > limit_mm, axis=0)))}
+
+
 def readout_pass_auto(xyz, alive, sense, angle_deg, turns):
     """The pass at the probe at angle_deg [deg] that the bunch crosses last before the end of its `turns`
     revolutions: turns when it starts past the probe (``probes.start_pass`` 1 for most of its particles: the probe's
@@ -977,12 +990,14 @@ def score_run(run, cfg=None):
                 (acceptance); slope, lag_rms, release_rms_surv (compression from the final lag); release_bins,
                 E_peak_phase, E_peak (release_budget); band<q>_*, surv_vs_z, surv_vs_zp (handoff_survival)
       shape     turns: per time-turn k (n_snapshots instants of steps [k spt, (k + 1) spt), all survivors alive;
-                step 0 is the first release) and 'last' (the last spt steps): shape_stats, sig_z (robust), alive_frac,
-                with space charge b_pred, c_pred, rot_pred
+                step 0 is the first release) and 'last' (the last spt steps): shape_stats, sig_z (robust), z_p95,
+                z_p95_max, z_out (vertical_extent at score.z_limit_mm), alive_frac, with space charge b_pred, c_pred,
+                rot_pred
                 (vortex_prediction), M, b_meas, c_meas, rot_meas towards turn k + 1 (one_turn_map, core within
                 map_core_sigma), and with the hand-off phases compress and lag_rms (the turn-mean lag, turn_lag);
                 turn0_part: the shape and prediction over time-turn 0 once the last survivor is born (t_from [turns]);
-                flat: ratio, sig_r, sig_l, s_round_last, halo3, tilt_last, sig_z_last (last turn), ratio_t1, sig_r_t1,
+                flat: ratio, sig_r, sig_l, s_round_last, halo3, tilt_last, sig_z_last, z_p95_last, z_p95_max_last,
+                z_out<limit>_last (last turn), ratio_t1, sig_r_t1,
                 sig_l_t1, s_round_t1, tilt_t1 (first full turn), ratio / sig_r / sig_l / s_round / compress _t<t> for
                 the proxy turns, rot_meas_sum, rot_pred_sum, b/c_meas_mean, b/c_pred_mean, n_trans, halo_born_t<t>;
                 ratio_no_fan, r_release_share (ratio_without_fan)
@@ -1088,6 +1103,7 @@ def score_run(run, cfg=None):
         Cc, d2 = core_covariance(u, cfg.core_q)
         st = shape_stats(Cc, d2, cfg.halo_sigma)
         st['sig_z'] = float(np.mean(robust_sigma(X[..., 2] * 1e3, axis=1)))
+        st.update(vertical_extent(X[..., 2] * 1e3, cfg.z_limit_mm))
         st['alive_frac'] = float(alive[ri].mean())
         if vortex:
             st.update(vortex_prediction(Cc, st['sig_z'], k['Q'] * st['alive_frac'], k['B0'], k['f_rev'], cfg.core_q))
@@ -1115,7 +1131,9 @@ def score_run(run, cfg=None):
     res['turns'] = {str(kk): v for kk, v in turns.items()}
     lt = turns['last']
     res.update({'ratio': lt['ratio'], 'sig_r': lt['sig_r'], 'sig_l': lt['sig_l'], 's_round_last': lt['s_round'],
-                halo_key: lt[halo_key], 'tilt_last': lt['tilt'], 'sig_z_last': lt['sig_z']})
+                halo_key: lt[halo_key], 'tilt_last': lt['tilt'], 'sig_z_last': lt['sig_z'],
+                'z_p95_last': lt['z_p95'], 'z_p95_max_last': lt['z_p95_max'],
+                f"z_out{cfg.z_limit_mm:g}_last": lt['z_out']})
     h_last = np.median(frames['last'][1], axis=0) > h2                  # last-turn halo (median over the instants)
     if ks:
         t1 = turns[ks[0]]

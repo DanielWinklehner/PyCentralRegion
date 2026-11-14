@@ -62,6 +62,20 @@ def test_shape_stats_of_a_gaussian_bunch(sense):
     assert np.exp(rd['R']) == pytest.approx(st['ratio'])
 
 
+def test_vertical_extent_of_a_breathing_bunch():
+    """Heights u_i x s(t) with u_i ~ N(0, 1) and an envelope s = 3, 4, 5 mm over three instants: the instantaneous 95 %
+    of |z| is 1.96 s (mean 7.84, widest 9.80 mm), and a particle passes |z| = 10 mm at some instant when |u| > 2."""
+    rng = np.random.default_rng(3)
+    u = rng.standard_normal(200_000)
+    z = np.outer([3.0, 4.0, 5.0], u)
+    ve = M.vertical_extent(z, 10.0)
+    assert ve['z_p95'] == pytest.approx(1.95996 * 4.0, rel=0.01)
+    assert ve['z_p95_max'] == pytest.approx(1.95996 * 5.0, rel=0.01)
+    assert ve['z_out'] == pytest.approx(0.0455, abs=0.002)
+    assert M.vertical_extent(z, 100.0)['z_out'] == 0.0
+    assert np.isnan(M.vertical_extent(z[:, :2], 10.0)['z_out'])          # too few particles
+
+
 def test_gauss_gradients_round_bunch():
     """A round Gaussian of rms s has the central gradient rho0 / (3 eps0), rho0 = 1 / ((2 pi)^1.5 s^3) per coulomb."""
     s = 2e-3
@@ -386,6 +400,9 @@ def test_score_run_on_a_synthetic_bunch():
     assert bs['pass_index'] >= 0 and bs['offset_mm'] == pytest.approx(
         bs['r_center_mm'] - M.reference_crossings(run.ref_xyz, bs['azimuth_deg'], 1.0)[bs['pass_index']])
     assert get_dotted(sc, 'turns.3.sig_r') == sc['sig_r_t3']
+    # heights N(0, 1 mm), constant per particle: the 95 % of |z| is 1.96 mm at every instant, nobody beyond 10 mm
+    assert sc['z_p95_last'] == pytest.approx(1.96, abs=0.25) and sc['z_p95_max_last'] >= sc['z_p95_last']
+    assert sc['z_out10_last'] == 0.0 and get_dotted(sc, 'turns.last.z_out') == 0.0
     assert json_clean(sc) == json_clean(json_clean(sc))                 # JSON-clean
 
 

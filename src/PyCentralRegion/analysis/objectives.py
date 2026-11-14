@@ -59,6 +59,8 @@ class ScoreConfig:
     core_q: float = 0.95                 # core = this share of the particles (smallest Mahalanobis distance)
     halo_sigma: float = 3.0              # halo<s>: share beyond s sigma of the Gaussian-equivalent core
     halo_born_turns: tuple = (1, 2)      # halo_born_t<t>: share of the last-turn halo already halo at turn t
+    z_limit_mm: float = 10.0             # z_out<limit>_last: share of the survivors beyond |z| = this at any instant
+    #                                      of the last turn (a vertical aperture of +-limit)
     map_core_sigma: float = 2.0          # particles within this many core sigma fit a one-turn map (also the twin's)
     proxy_turns: tuple = (2, 3)          # flat ratio / sig_r / sig_l / s_round / compress / fan keys of these turns
     # per-particle orbit centres (the centre fan)
@@ -139,6 +141,8 @@ METRICS = {
     'T_az': Metric('max', '1', "share of the tracked bunch crossing the readout"),
     'I_2pct_az': Metric('max', 'mA', "current within +-2 % of the median energy at the readout"),
     'I_1pct_best_az': Metric('max', 'mA', "current in the best-placed +-1 % energy window at the readout"),
+    'I_5pct_best_az': Metric('max', 'mA', "current in the best-placed +-5 % energy window at the readout (about the "
+                                          "extraction channel's -6/+4 % acceptance)"),
     'E_med_az': Metric('target', 'MeV', "median energy at the readout: reach the design energy"),
     'E_2pct_best_az': Metric('target', 'MeV', "centre of the best-placed +-2 % window at the readout"),
     'dE_E_robust_az': Metric('min', '1', "robust (MAD) relative energy spread at the readout"),
@@ -147,6 +151,13 @@ METRICS = {
                                                 "best-placed +-2 % window at the readout: the beam to extract"),
     'sig_z_2pct_az': Metric('min', 'mm', "rms height of the particles in that window"),
     'z_p95_az': Metric('min', 'mm', "95 % of |z| of the beam at the readout: what a vertical aperture sees"),
+    # the vertical extent over the whole last turn (metrics.vertical_extent, its n_snapshots instants): free of the
+    # readout's waist (a breathing envelope read at one azimuth; 0107 of campaign_v6r60o_c1: z_p95_az 7.99 mm, 12.2 mm
+    # as the turn mean)
+    'z_out10_last': Metric('min', '1', "share of the survivors beyond |z| = 10 mm (score.z_limit_mm) at any instant "
+                                       "of the last turn: the part of the beam a +-10 mm aperture would meet"),
+    'z_p95_last': Metric('min', 'mm', "95 % of |z| of the survivors, mean over the instants of the last turn"),
+    'z_p95_max_last': Metric('min', 'mm', "95 % of |z| of the survivors at the last turn's widest instant"),
     'az_cover': Metric('info', '1', "share of the final survivors that crossed the readout (1: it sees them all)"),
     # beam quality diagnostics
     'turn_valley_max': Metric('min', '1', "valley share at the worst probe"),

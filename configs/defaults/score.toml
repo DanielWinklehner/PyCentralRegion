@@ -52,6 +52,8 @@ core_q = 0.95               # core: this share of the particles, smallest Mahala
                             # differ from its tables by < 0.5 % (about one particle of a few hundred in a halo share)
 halo_sigma = 3.0            # halo<s>: the share beyond s sigma of the Gaussian-equivalent core
 halo_born_turns = [1, 2]    # halo_born_t<t>: share of the last-turn halo that was already halo at turn t
+z_limit_mm = 10.0           # z_out<limit>_last: share of the survivors beyond |z| = this at any instant of the last
+                            # turn (a +-limit vertical aperture); z_p95_last / z_p95_max_last: the turn's mean / widest
 map_core_sigma = 2.0        # particles within this many core sigma fit a one-turn map (instantaneous and twin)
 proxy_turns = [2, 3]        # flat keys ratio / sig_r / sig_l / s_round / compress / fan of these turns (proxies):
                             # time-turns [t, t + 1) revolutions; the fan keys count revolutions from each particle's
