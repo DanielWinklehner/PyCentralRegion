@@ -65,8 +65,9 @@ class ScoreConfig:
     proxy_turns: tuple = (2, 3)          # flat ratio / sig_r / sig_l / s_round / compress / fan keys of these turns
     # per-particle orbit centres (the centre fan)
     fan_degree: int = 3                  # polynomial in release phase that 'explains' the centres
-    turn_fill: float = 0.8               # a revolution needs this share of the fullest one's records, a fan turn
-    #                                      this share of the survivors with a centre
+    turn_fill: float = 0.8               # a revolution needs this share of the fullest one's records (among the
+    #                                      particles that keep pace: metrics.turn_centres), a fan turn this share of
+    #                                      the survivors with a centre
     # virtual probes (radial half-planes) and turn structure
     probe_angles_deg: tuple = (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0)
     probe_passes: int = 3                # the last this many complete passes

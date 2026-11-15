@@ -450,7 +450,10 @@ def turn_centres(xy, alive, sense, fill=0.8):
     """Orbit centre of every particle in every complete revolution counted from its own start: per revolution the
     least-squares fit r(theta) = a + b (theta - theta_mid) + cx cos(theta) + cy sin(theta) of its live records (the
     radius grows by b per radian as it gains energy). xy (S, n, 2) [m], alive (S, n); a revolution needs fill x the
-    records of the fullest one. Returns (n, K, 2) [mm], NaN where a revolution is incomplete."""
+    records of the fullest one among the particles that keep pace (their fullest revolution at most 1.5 x the median
+    particle's): a survivor that stalls, such as one decelerated and drifting near the centre, logs the rest of the run
+    as one revolution, which would otherwise set a reference no real revolution reaches; its stalled revolution (more
+    than 1 / fill x the reference) is left out. Returns (n, K, 2) [mm], NaN where a revolution is incomplete."""
     rec, n = alive.shape
     first = np.argmax(alive, axis=0)
     ang = np.where(alive, np.arctan2(xy[..., 1], xy[..., 0]), np.nan)
@@ -472,7 +475,9 @@ def turn_centres(xy, alive, sense, fill=0.8):
         for j in range(i, 4):
             ATA[:, i, j] = ATA[:, j, i] = np.bincount(g, weights=cols[i] * cols[j], minlength=n * K)
     ATr = np.stack([np.bincount(g, weights=cols[i] * r, minlength=n * K) for i in range(4)], axis=1)
-    full = cnt >= fill * cnt.max()
+    pmax = cnt.reshape(n, K).max(axis=1)                                     # each particle's fullest revolution
+    ref = pmax[pmax <= 1.5 * np.median(pmax)].max()                         # cnt.max() unless a particle stalled
+    full = (cnt >= fill * ref) & (cnt <= ref / fill)
     sol = np.full((n * K, 4), np.nan)
     sol[full] = np.linalg.solve(ATA[full], ATr[full][..., None])[..., 0]
     return sol[:, 2:].reshape(n, K, 2) * 1e3
