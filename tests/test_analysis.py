@@ -5,6 +5,7 @@ PyPATools), the shared probe rules at their edges, the kinetic energy, the turn 
 and hand-off-index rules, the release-phase budget bins, the operating-point rule, a whole synthetic run through
 score_run, the [machine] fallbacks and the tracked species, a synthetic space-charge twin whose guiding-centre core
 rotates by a known angle per turn, and the summary figure of a score made with other settings."""
+import dataclasses
 import json
 import pickle
 
@@ -15,7 +16,9 @@ from PyCentralRegion.analysis import metrics as M
 from PyCentralRegion.analysis import objectives as O
 from PyCentralRegion.analysis import runs as R
 from PyCentralRegion.analysis import twins as TW
-from PyCentralRegion.config import MachineConfig, get_dotted, json_clean
+from PyCentralRegion.config import get_dotted, json_clean
+
+from machine_fixtures import four_dee_machine
 
 pytest.importorskip('scipy')
 
@@ -331,10 +334,12 @@ def test_pick_operating_point():
             {'v': 1.10, 'phase': -20, 'transmission': 0.609, 'e_final': 3.1, 'de_e': 0.008},
             {'v': 1.20, 'phase': -20, 'transmission': 0.700, 'e_final': 3.2, 'de_e': 0.005},
             {'v': 1.00, 'phase': -30, 'transmission': 0.800, 'e_final': 2.8, 'de_e': 0.001}]
-    pk = M.pick_operating_point(rows, _cfg())
+    pk = M.pick_operating_point(rows, _cfg(pick_e_min_mev=2.9))
     assert pk['best_t'] == 0.612 and pk['winner'] is rows[2] and pk['uncapped_best'] is rows[3] and pk['n_ok'] == 3
     with pytest.raises(ValueError):
-        M.pick_operating_point(rows[3:], _cfg())
+        M.pick_operating_point(rows[3:], _cfg(pick_e_min_mev=2.9))
+    with pytest.raises(ValueError, match='pick_e_min_mev'):                  # the energy is the machine's: no default
+        M.pick_operating_point(rows, _cfg())
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -378,7 +383,8 @@ def _spiral_run(n=600, seed=6, rotate_deg=0.0, offsets=True, phase=True, halo=0.
     return R.RunData(tag=tag, ids=np.arange(n), steps=steps, xyz=xyz, stop_step=stop, birth_step=np.zeros(n, int),
                      n_steps=n_steps, steps_per_turn=SPT, E_mev=3.0 + 0.03 * rng.standard_normal(n), info=info,
                      handoff_ids=np.arange(n), release_phase_deg=-H * np.degrees(g0[:, 1] / 60.0),
-                     handoff_z_m=xyz[0, :, 2], handoff_zp_rad=np.zeros(n), ref_xyz=ref)
+                     handoff_z_m=xyz[0, :, 2], handoff_zp_rad=np.zeros(n), ref_xyz=ref,
+                     handoff_meta={'pypatools_species_name': 'H2_1+'})        # the species: no [machine] default
 
 
 def test_score_run_on_a_synthetic_bunch():
@@ -598,6 +604,7 @@ def test_track_folder_round_trip(tmp_path):
     d = tmp_path / 'design_a'
     d.mkdir()
     _write_run(run, d / R.TRACK_PKL, d / R.TRACK_JSON)
+    (d / R.TRACK_CONFIG).write_text(json.dumps({'machine': {'species': 'H2_1+'}}))   # the species the run was tracked as
     for name in ('probe_45deg.npz', 'probe_-90deg.npz', 'probe_45deg_old.npz'):
         (d / name).write_bytes(b'')
     back = R.load_run(d)
@@ -611,38 +618,46 @@ def test_track_folder_round_trip(tmp_path):
 
 def test_machine_fallbacks(tmp_path):
     """What a run's json does not record (harmonic, loss limits) comes from the [machine] table it was tracked with:
-    a track folder's config.json, the machine argument of a deck run; else the MachineConfig defaults."""
+    a track folder's config.json, the machine argument of a deck run. The machine has no defaults: a run that records
+    neither is refused, naming the key."""
     run = _spiral_run(n=300)
     run.info = {key: v for key, v in run.info.items() if key not in ('harmonic', 'rf_mhz', 'limits')}
+    run.machine = {}
+    with pytest.raises(ValueError, match='records no machine.harmonic'):
+        M.run_constants(run, _cfg())
+    mc = four_dee_machine()
+    run.machine = dataclasses.asdict(mc)
     k = M.run_constants(run, _cfg())
-    mc = MachineConfig()
     assert (k['harmonic'], k['r_max'], k['z_max']) == (mc.harmonic, mc.r_max_m, mc.z_max_m)
     n0 = int(M.run_state(run, _cfg()).surv.sum())
-    run.machine = {'harmonic': 2, 'r_max_m': 0.41}
+    run.machine = {**dataclasses.asdict(mc), 'harmonic': 2, 'r_max_m': 0.41}
     k = M.run_constants(run, _cfg())
     assert k['harmonic'] == 2 and k['f_rf'] == pytest.approx(16e6) and k['f_rev'] == pytest.approx(8e6)
     assert M.run_state(run, _cfg()).surv.sum() == n0 + 1          # the particle at 0.40 m is inside this limit
     d = tmp_path / 'design_b'
     d.mkdir()
     _write_run(run, d / R.TRACK_PKL, d / R.TRACK_JSON)
-    (d / R.TRACK_CONFIG).write_text(json.dumps({'machine': {'r_max_m': 0.41}}))
+    (d / R.TRACK_CONFIG).write_text(json.dumps({'machine': {**dataclasses.asdict(mc), 'r_max_m': 0.41}}))
     assert M.run_constants(R.load_run(d), _cfg())['r_max'] == 0.41
     _write_run(run, tmp_path / R.LEGACY_PKL.format('_v1'), tmp_path / R.LEGACY_JSON.format('_v1'))
-    deck = R.load_run(tmp_path, tag='_v1', machine=MachineConfig(r_max_m=0.41, harmonic=2))
+    deck = R.load_run(tmp_path, tag='_v1', machine=four_dee_machine(r_max_m=0.41, harmonic=2))
     assert deck.machine['r_max_m'] == 0.41 and M.run_constants(deck, _cfg())['harmonic'] == 2
 
 
 def test_tracked_species():
     """The tracker's species: the preset of the run's [machine] species, else the hand-off file's mass and charge
-    state, else the preset of the default species; an unknown name gives NaN (PyPATools would exit)."""
+    state, else the preset of the hand-off's species name; none, or an unknown name, gives NaN (PyPATools would
+    exit)."""
     run = _spiral_run(n=300)
     run.handoff_meta = {'species_mass_mev': 938.272, 'species_charge_state': 1.0}
     assert M.tracked_species(run) == (938.272, 1.0)
     PS = pytest.importorskip('PyPATools.species')
     run.machine = {'species': 'proton'}
     assert M.tracked_species(run) == (pytest.approx(PS.PRESETS['proton']['mass_mev']), 1.0)
-    run.machine, run.handoff_meta = {}, {}
-    assert M.tracked_species(run)[0] == pytest.approx(PS.PRESETS[MachineConfig().species]['mass_mev'])
+    run.machine, run.handoff_meta = {}, {'pypatools_species_name': 'H2_1+'}
+    assert M.tracked_species(run)[0] == pytest.approx(PS.PRESETS['H2_1+']['mass_mev'])
+    run.handoff_meta = {}
+    assert np.isnan(M.tracked_species(run)[0])
     run.machine = {'species': 'no_such_ion'}
     assert np.isnan(M.tracked_species(run)[0])
 

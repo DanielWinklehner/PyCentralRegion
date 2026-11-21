@@ -17,7 +17,9 @@
 
 A stage reuses an output that exists and never overwrites one: point the path elsewhere to recompute. ``--set
 section.key=value`` overrides the files; the value is read as TOML (``--set track.phases_deg=[-15.0]``), else as a
-string. ``python -m PyCentralRegion.cli`` is the same command.
+string. ``--paths FILE`` (with any command) is this computer's paths file, the ``${name}`` disk roots of the run files
+(default: ``$MACHINE_PATHS``, ``$PYCENTRALREGION_PATHS``, ``~/.config/pycentralregion/paths.toml``; see
+``PyCentralRegion.config``). ``python -m PyCentralRegion.cli`` is the same command.
 """
 import argparse
 import copy
@@ -305,8 +307,26 @@ OPTIMIZE_COMMANDS = {'optimize': 'run or continue a MOBO campaign',
                      'optimize-status': 'table of a campaign: evaluations, Pareto set, best values'}
 
 
+def _take_paths_option(argv):
+    """``--paths FILE`` anywhere on the command line: this computer's paths file for this run and the evaluations it
+    starts (``config.use_paths_file``); the rest of argv is returned."""
+    rest, i = [], 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '--paths' or arg.startswith('--paths='):
+            value = arg.split('=', 1)[1] if '=' in arg else (argv[i + 1] if i + 1 < len(argv) else '')
+            if not value:
+                raise SystemExit("pcr: --paths needs a file")
+            config.use_paths_file(value)
+            i += 1 if '=' in arg else 2
+            continue
+        rest.append(arg)
+        i += 1
+    return rest
+
+
 def main(argv=None):
-    argv = sys.argv[1:] if argv is None else list(argv)
+    argv = _take_paths_option(sys.argv[1:] if argv is None else list(argv))
     if argv and argv[0] in OPTIMIZE_COMMANDS:
         # the campaign driver parses its own arguments (`pcr optimize --help`); it runs in a small environment of its
         # own, so nothing of the physics stack is imported on this path

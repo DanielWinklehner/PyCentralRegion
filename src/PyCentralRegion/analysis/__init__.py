@@ -14,8 +14,8 @@ track, and builds probe files from recorded tracks; ``metrics`` holds the metric
 ``objectives`` the ``[score]`` settings (``ScoreConfig``), the table of metrics a campaign may optimise (``METRICS``)
 and ``register_metric`` for user metrics; ``twins`` measures the space-charge vortex from an SC-on / SC-off pair of
 runs; ``plots`` draws a one-page summary figure. The machine (harmonic, loss limits, species) is the run's own: its
-json, hand-off file and the [machine] table it was tracked with (``RunData.machine``), else the ``MachineConfig``
-defaults (``metrics.run_constants``).
+json, hand-off file and the [machine] table it was tracked with (``RunData.machine``; a machine has no defaults:
+``metrics.run_constants``).
 Importing the package needs only numpy; scipy is used by a few metrics, h5py and PyPATools to read hand-off files,
 matplotlib by the figure.
 """

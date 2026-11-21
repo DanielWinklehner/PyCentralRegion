@@ -43,21 +43,21 @@ A campaign file holds `[mobo]` only. It names the run file every evaluation star
 
 ```toml
 [mobo]
-campaign_dir = "E:/results/mobo/my_campaign"   # the whole state of the campaign
+campaign_dir = "${work}/mobo/my_campaign"      # the whole state of the campaign (${work}: a root, docs/pipeline.md)
 base_config_file = "my_design.toml"             # the run file every evaluation starts from
-physics_python = "C:/.../envs/physics/python.exe"
+physics_python = "/path/to/envs/physics/bin/python"   # "" = the driver's own interpreter
 sampler = "gp"
 n_startup = 10            # evaluations with values (warm start included, failed ones not) before the model takes over
 max_evals = 60            # search evaluations of the whole campaign; a rerun continues to it
 cheap_per_geometry = 3    # after every new geometry: this many evaluations on it with only the cheap variables free
-fixed = ["btrim.r_min_m=0.05"]                  # overrides of every evaluation
+fixed = ["track.stop_at_target_energy=false"]   # overrides of every evaluation
 warm_start = [{}]         # {} = the base design itself; other points name variables in physical units
 
 [[mobo.variables]]
 name = "phase"
 target = "track.phases_deg"
-low = -40.0
-high = 0.0
+low = 10.0
+high = 60.0
 as_list = true            # the target is a list: it is set to [value]
 
 [[mobo.objectives]]
@@ -67,7 +67,7 @@ direction = "maximize"
 [[mobo.constraints]]
 metric = "E_med"
 op = ">="
-value = 2.9
+value = 0.75
 
 [mobo.fidelities.search]
 overrides = ["track.n_final=10000", "track.sc_final_cells=64", "track.sc_final_every=5"]
@@ -76,22 +76,13 @@ timeout_min = 30.0
 
 Worked examples:
 - `configs/examples/toy/campaign.toml`: the analytic toy, 30 evaluations in about 8 s (17 s with the GP);
-- `configs/examples/hchc1p5/mobo_pilot.toml`: cheap variables only (RF phase, dee voltage), on the worked example's
-  existing fields, 20 evaluations;
-- `configs/examples/hchc1p5/mobo_campaign.toml`: the full campaign: the beam channel's aperture and the
-  spiral-inflector rotation (geometry) with the RF phase and the dee voltage (cheap); 7 variables, 120
-  evaluations, about 4.5-5 h (see Costs). Its header lists what the first pilot changed and what the loop does
-  not see;
-- `configs/examples/hchc1p5/mobo_slit.toml`: a radial slit for the chosen design, a campaign of its own (cheap: the
-  slit's opening, azimuth and offset at one fixed pass), 20 evaluations;
-- `configs/examples/hchc1p5/mobo_v6o_c1.toml`: the full cold-started optimisation with the v6 field map and the
-  v6o_c1 inflector: the dee opening, the beam channel and every gap line (geometry) with the RF phase and the magnet
-  level (cheap), 38 variables, posts placed by rule in the loop ("Posts in the loop"), three objectives.
+- `configs/examples/demo/campaign.toml`: the demo machine (`python -m PyCentralRegion.demo` makes its inputs): the
+  dee channel's height inside the taper (geometry) and the RF phase (cheap), two objectives and an energy
+  constraint, 12 evaluations of the whole chain on a CPU.
 
-In the pilot and the campaign a first-harmonic magnetic trim is opt-in: the worked example's design has no trim
-coils, so its two variables (`trim_c`, `trim_s`) are commented out. Uncomment them for a what-if, in another
-`campaign_dir`, and label its results "with trim". The second pilot (2026-11-03) ran with them, so its store is read
-only with them uncommented.
+A first-harmonic magnetic trim (`btrim.amplitude_cos_t`, `btrim.amplitude_sin_t`) is a cheap variable a campaign
+can add. Add it only for a machine with trim coils, or label its results "with trim" and run it in a
+`campaign_dir` of its own.
 
 ## Variables
 
@@ -167,7 +158,7 @@ Two knobs are awkward for any sampler in their plain form:
   above, which add to the polar part, have neither a seam nor more than one zero.
 - The slit: `slit.half_width_mm = 0` means no slit, which leaves its other coordinates without effect, next to small
   widths that pass almost no beam; and `slit.pass_index` is an unordered choice, not a scale. Give it a campaign of
-  its own on the chosen design, with the pass fixed and an open slit in every design (`mobo_slit.toml`).
+  its own on the chosen design, with the pass fixed and an open slit in every design.
 
 ## Objectives and constraints
 
@@ -192,19 +183,20 @@ constraint has a value seen, stand-ins are pending trials. The store records why
 never in the Pareto set. The GP learns from their values; TPE ranks infeasible trials by their violation, so for TPE
 the `scored` violation is what steers it away.
 
-The scoring of the 109 earlier 3D runs (2026-11-01) suggests:
+A useful set (the thresholds are the machine's):
 
 | | metric | why |
 |---|---|---|
 | maximise | `I_final` | final current, T × injected current [mA] |
-| minimise | `valley_all` | share of the probe crossings between the turns, the 8 probes (every 45°) pooled. Never one probe alone: the 45° probe flatters. |
+| minimise | `valley_all` | share of the probe crossings between the turns, the 8 probes (every 45°) pooled. Never one probe alone: a single azimuth can flatter. |
 | minimise | `ratio` | aspect ratio of the bunch core at the last turn |
-| constraint | `E_med >= 2.9` | reach the design energy [MeV] |
-| constraint | `turn_sigR <= 3.0` | clean turns, 8 σ at a 24 mm turn separation [mm] |
-| constraint | `dE_E_robust <= 0.013` | the energy-spread floor of `turn_sigR` at R = 330 mm (or `sigR_E <= 3.0`) |
-| constraint | `fan_proj_last <= 2.0` | the centre fan's share of the turn width [mm] |
+| constraint | `E_med >= E` | reach the design energy [MeV]: E a little below `machine.target_energy_mev` |
+| constraint | `turn_sigR <= s` | clean turns: s about an eighth of the turn separation [mm] |
+| constraint | `dE_E_robust <= d` | the energy spread that keeps `turn_sigR` below s at the extraction radius (or `sigR_E <= s`) |
+| constraint | `fan_proj_last <= f` | the centre fan's share of the turn width [mm] |
 
-There is no vortex objective: at this bunch density the vortex cannot shape the beam in 7 turns.
+There is no vortex objective; `analysis.twins.vortex_twin` measures a design's space-charge vortex against a twin
+run without space charge.
 
 ## Fidelities
 
@@ -222,32 +214,22 @@ Let the fidelities differ in resolution only (particles, space-charge grid and i
 
 Score every design at the same turn too. By default a run ends at the turn its reference reaches
 `machine.target_energy_mev`, or after `track.turns`. A design that accelerates more slowly then tracks an extra
-turn, and its end-of-run scores jump with it: in the first pilot, two designs below a dee-voltage scale of about 0.97
-needed an 8th turn. The worked example's campaigns therefore set `track.turns = 7` and
-`track.stop_at_target_energy = false` in `fixed`, so every run tracks exactly 7 turns. The base design reaches 3 MeV
-at its 7th turn, so its run should be the one it had with the stop (array for array at 200 particles without space
-charge, `pcr_validation\fixes_2026-11-02\track`; with GPU space charge expect the same fates). A slow design ends
-below 3 MeV, where the `E_med` constraint judges it: with `E_med >= 2.9` one that ends at 2.9-3.0 MeV stays feasible
-(the pilot's design 0015, dee voltage × 0.95 at -29°, ends its 7th turn near 2.93 MeV: a mean of 2.92 in the pilot's
-run, a median of 2.94 in a 200-particle rerun without space charge); `>= 3.0` asks for the design energy at the 7th
-turn.
+turn, and its end-of-run scores jump with it. A campaign therefore sets `track.stop_at_target_energy = false` in
+`fixed` (the demo campaign does), so every run tracks exactly `track.turns` turns. A slow design then ends below
+the target energy, where the `E_med` constraint judges it: set the constraint a little below the energy the base
+design reaches, so that a design that ends just short of it stays feasible.
 
 | fidelity | particles | SC | one evaluation on known fields |
 |---|---|---|---|
-| search | 10 000 | 64³ every 5 steps | about 1.6-1.9 min (see Costs) |
-| verify | all (~98 000) | 128³ every step | about 7 min |
+| search | 10 000 | 64³ every 5 steps | about 30 s on a full-size model (see Costs) |
+| verify | the whole hand-off bunch | 128³ every step | about 5 min |
 
-On the worked example (-15°) the search fidelity gives T = 50.79 % = 4.080 mA (the warm start), the verify fidelity
-50.57 % = 4.063 mA, with the column test, the default. The deck's slice test (`track.obstacles = "raster"`) gave
-50.40 % = 4.049 mA (the first pilot's warm start) and 50.09 % = 4.024 mA: it puts the channel's faces up to half a
-millimetre off (the level ones half a millimetre low), but for slivers of metal or vacuum thinner than a level (146 in
-the whole model at |z| < 29.5 mm, at 77 nodes at r < 100 mm and at its edge: `docs/pipeline.md`, "The metal test"),
-and so stops, net, 39 and 471 particles more. The deck's slices also lack the ground at z = ±15 mm, which puts the
-ground's faces near those heights off, those on the channel's taper at r = 113-127 mm (|z| = 14-15 mm) at ±15.5 mm, up
-to 1.5 mm into the metal, and six at r = 34 and 55 mm; the particles the columns stop on those taper faces (144 and
-1511), the slices stop too, a median 19 steps later (`docs/pipeline.md`). Every search evaluation tracks the same
-10 000 particles of the hand-off bunch (drawn with `track.seed_final`), so the designs are compared on one sample. A
-sample of 10 000 is worth about ±0.04 mA (±0.5 % in T) by itself, mostly the same for every design.
+The column metal test, the default, and the original design scripts' slice test (`track.obstacles = "raster"`)
+track the same particles until the two tests first stop one differently; the slices put level faces half a
+millimetre off, and on the design compared they passed 0.4-0.5 % less of the beam at both fidelities
+(`docs/pipeline.md`, "Validation of the port"). Every search evaluation tracks the same 10 000 particles of the
+hand-off bunch (drawn with `track.seed_final`), so the designs are compared on one sample. A sample of 10 000 is
+worth about ±0.5 % in T by itself, mostly the same for every design.
 
 A cheaper search over the first turns would need early stand-ins for the final objectives. The candidates are:
 - `sig_r_t3` for `valley_all` (Spearman 0.94 over the earlier runs);
@@ -260,11 +242,11 @@ come from the end of the run, so they are not early stand-ins.
 
 ## Posts in the loop (`[post_rule]`)
 
-Posts on the gap edges between the turns can be worth a milliamp or more (on campaign_connected2's design 0099, 4.50 →
-5.64 mA), but not on every geometry (on the v6o_c1 cold start, radial gap lines at 38°, the rule's 16 posts cost
-0.85 mA: 4.68 → 3.84 mA, each at its best phase, mostly as vertical losses in passes 1-2), and where they fit depends
-on where the beam crosses each gap, which every new geometry moves. With `[post_rule] enabled = true` in the base run
-file, `pcr evaluate` places them by rule for every new geometry, in two passes:
+Posts on the gap edges between the turns can be worth a quarter more current (on one design +25 %), but not on
+every geometry (on another, with radial gap lines, the rule's 16 posts cost 18 %, each design at its best phase,
+mostly as vertical losses in passes 1-2), and where they fit depends on where the beam crosses each gap, which every
+new geometry moves. With `[post_rule] enabled = true` in the base run file, `pcr evaluate` places them by rule for
+every new geometry, in two passes:
 
 1. **the bare pass**: the geometry without posts is built, solved and tracked in `<geometry>/bare/`, with the rule's
    phase scan (`scan_phases_deg`, -45 ... +15° in 15° steps: a scan of `track.n_scan` particles, then the final run at
@@ -292,14 +274,14 @@ needs a folder of its own, as the campaign's geometries have. The scores in `res
 of posts, the fallback, the bare run's best phase, survivors and scores (`I_final_az`, `I_2pct_best_az`, `z_p95_az`,
 `E_med_az`, `T_az`), so what the posts gave can be read off every geometry.
 
-A new geometry costs about three times what it costs without the rule: on the v6o_c1 cold start about 15 min (bare
+A new geometry costs about three times what it costs without the rule: on one full-size design about 15 min (bare
 build 24 s, bare BEM 3 min, the bare scan and final run 4.8 min, the rule 26 s, the build with posts 45 s, its BEM
 4.6 min, the final track 39 s) against about 5 min for a build, its BEM and one track. Cheap followers cost what they
 always did.
 
 The rule needs `geometry.posts` empty and a counterclockwise beam, and gives gap 0 no posts (its hardware is the
 housing exit and the hole plate). It was tested with round posts (`geometry.post_shape = "cylinder"`); square posts
-stop at the edge's bends. It reproduces the placement scripts of the posts tests (`posts_test_0099`) post for post.
+stop at the edge's bends. It reproduces the placement scripts it was ported from post for post.
 
 ## Samplers
 
@@ -311,7 +293,7 @@ optimiser side by side, evaluating their points together; without it, one after 
 proposal then takes about 0.4 s instead of 0.2 s (16-40 evaluations). The two make slightly different proposals from
 the same store (on the toy within 1e-9 in 242 of 264, by up to 3e-4 in the unit cube), and each later proposal follows
 from the scores of the designs before it, so a campaign repeats exactly only in an environment that has greenlet, or
-lacks it, as the original did (`pcr_validation\greenlet_2026-11-03`).
+lacks it, as the original did.
 
 ## Running
 
@@ -381,78 +363,39 @@ evaluation of that geometry builds afresh.
 
 ## Costs
 
-**Since 2026-11-14** (`F:\HCHC1.5\Results\CR\mobo\dee_field_speedup_2026-11-13`; design 0140's geometry of
-campaign_v6r60o_c1, posts in the loop, search fidelity, one GPU, the kernel cached):
+**The demo** (`configs/examples/demo/`, a desktop CPU, no GPU): a new geometry's evaluation takes about 2 min
+(118 s: the build 20 s, the fields 32 s, the tracking 39 s with a three-phase scan of 1000 particles and a final
+run of 4000, start-up and scores the rest).
 
-| one evaluation | in that campaign | the same code from a shell | new field code, the same model | ... with the three mirror options |
+**A full-size four-dee model** (measured 2026-11-14 on one design with 20 posts placed in the loop, search
+fidelity, one GPU, the kernel cached):
+
+| one evaluation | detached, before the full-speed opt-out | from a shell | new field code, the same model | ... with the three mirror options |
 |---|---|---|---|---|
 | a new geometry (bare model, its phase scan, the post rule, the model with posts, the run, the scores) | 708 s | 364 s | 249 s | 180 s; with the tracking and layout changes of that day 152 to 167 s (six runs, mean 160 s) |
 | ... of it the two builds / the two field stages / the tracking / the rest | 63 / 410 / 175 / 60 | 29 / 223 / 81 / 31 | 28 / 105 / 85 / 31 | 31 / 36 / 83 / 30 |
 | a cheap follower | 60 s | 28-31 s | | 27 s |
 | a verify run's tracking (100,625 particles, 128³ every step) | 648 s | 388 s | | 277 s |
 
-- The first two columns are the same code and the same evaluation with the same scores. The campaign ran detached,
-  and Windows moves a process without a window to the efficiency cores of a hybrid CPU within seconds: every stage
-  took about twice as long, in every campaign up to that day. Each `pcr` process now opts out when it starts
-  (`run.full_speed`, `mobo.full_speed`; `docs/pipeline.md`, "Run files"), so a detached campaign no longer runs at
-  half speed, and the way of starting no longer matters: the final code's evaluation, detached and from a shell in
-  turn, took 165.7 and 158.3 s detached and 166.9 and 157.3 s from a shell (a CPU-only stage alike: `pcr build`,
-  three alternating pairs, 21.0 / 19.8 / 20.0 s from a shell and 20.1 / 19.9 / 19.4 s detached).
-- Runs of the same code differ by more than the way of starting does. The final code's six runs took 152 to 167 s
-  (mean 160 s, standard deviation 5.5 s); the run of the night is the fastest, and the five of the next morning took
-  3 to 11 s longer in the tracking stages for a reason that was not found. The other columns are single runs and
-  carry the same few percent, so read the changes where they act: the post rule and the build with posts took
-  42-43 s before the layout change and 25-27 s in all six runs after it; the tracking change saved about 10 s that
-  night, which is the size of the night-to-morning difference (at the verification fidelity it saves 111 s of 388).
-- The field stages: the GPU solver tests its residual after every product, the potential kernels are built once, and
-  with `geometry.exit_opening = "centred"`, `mirror_mesh` and `lc_far_mm` the mesh is solved as half a model
+- The first two columns are the same code and the same evaluation with the same scores. Windows moves a process
+  without a window to the efficiency cores of a hybrid CPU within seconds, where every stage took about twice as
+  long. Each `pcr` process now opts out when it starts (`run.full_speed`, `mobo.full_speed`; `docs/pipeline.md`,
+  "Run files"), so the way of starting no longer matters: the final code's evaluation, detached and from a shell in
+  turn, took 165.7 and 158.3 s detached and 166.9 and 157.3 s from a shell.
+- Runs of the same code differ by a few per cent (six runs: 152 to 167 s, standard deviation 5.5 s).
+- The field stages: the GPU solver tests its residual after every product, the potential kernels are built once,
+  and with `geometry.exit_opening = "centred"`, `mirror_mesh` and `lc_far_mm` the mesh is solved as half a model
   (`docs/pipeline.md`, "fields").
 - Tracking is then the largest part: 83 of 180 s, of which the bare model's phase scan (5 runs of 4000 particles)
   takes 45 s. More than half of every tracked run is the space-charge solver (`docs/pipeline.md`, "track").
-- A campaign of v6r60o_c1's shape (46 new geometries, 135 followers, 5 verify runs) took 11.8 h; at these times it
-  takes about 3.5 h (estimate: 46 x 160 s + 135 x 27 s + 5 x about 5.5 min).
+- A campaign of 46 new geometries, 135 cheap followers and 5 verify runs takes about 3.5 h at these times
+  (46 x 160 s + 135 x 27 s + 5 x about 5.5 min).
 - The layout and the post rule: an evaluation lays the same electrodes out three times (the bare build, the rule,
-  the build with posts), 4.6 s each in the distance from the housing outline, which is now remembered within the
-  process (`builder._wall_distance`); the rule's twenty crossing tests share the tracks' segment boxes and test each
-  segment of an edge against the nearby track segments only (`post_rule.segment_boxes`, 13.0 -> 8.2 s). Same
-  layouts, the same posts record byte for byte. Of the fastest run's 152 s: the builds 21, the field stages 36, the tracking 73,
-  the rest 22.
-
-The older measurements below were all taken from a shell or inside a campaign as marked, with the code of their day.
-
-Measured on the worked example (28 threads, one GPU). The times predate the cached parallel kernel of 2026-11-11: take
-its compile off every evaluation but the first after an edit of `fast_track3d.py`.
-- **A cheap evaluation** (the search fidelity on known fields) takes 95-108 s, median 97 s: the pilot's 20 evaluations
-  (`mobo_pilot.toml`, 2026-11-02) took 33 min. Of that:
-  - every evaluation process compiled the parallel 3D tracking kernel first, about 65 s (136-169 s on 2026-11-11).
-    Its cache was off because the serial and the parallel build of the kernel shared one numba cache entry (numba 0.64
-    does not key it on `parallel`), so each loaded the other's build. Since 2026-11-11 the parallel build has a cache
-    file of its own: the first process after an edit of `fast_track3d.py` compiles both builds (209 s on CPU), every
-    later one loads them. A cheap follower of the v6r60o_c1 tests (g0287 at the search fidelity, on the GPU) then
-    takes 28-29 s instead of 204-221 s, its bunch track 15 s instead of 180-197 s, with the same fates
-    (`F:\HCHC1.5\Results\CR\mobo\warmup_fix_2026-11-11`);
-  - tracking the 10 000 particles takes 17-22 s after that, 11-16 s of it the space-charge solves;
-  - start-up, the system and the reference particle, the record files and the scoring take the other 13-14 s.
-- **A new geometry** adds the build, about 20 s, and its fields: 233 s on the full-chain check of 2026-11-02 (the
-  3D BEM solve 52 s, the field grid 59 s, and 122 s for the slices of the metal test, which the fields stage no
-  longer cuts: the metal columns that replace them take under a second), so about 2 min now (derived, not yet timed
-  as a whole), 485 s in the design deck's run of the same geometry (314 s of it the slices). A new geometry's search
-  evaluation therefore takes about 4 min.
-- **Verify tracking** of every particle with SC 128³ every step takes 6.5-7 min (397 s on the full-chain check, 429 s
-  in the port validation), a verify evaluation on known fields about 7 min in all.
-- **A campaign** of 120 evaluations with `cheap_per_geometry = 3` (30 geometries): 30 × 4 + 90 × 1.6 min, about
-  4.5 h.
-- **The column test**, the default since 2026-11-02 (the pilot ran the deck's slices): one search evaluation has been
-  timed with it, the warm start outside a campaign (`pcr_validation\metal_columns_2026-11-02\gpu\warm_search_columns`):
-  114 s, its kernel phase (the compile included) 80 s against the pilot's 66.5-70.6 s (67.4 s for the same warm
-  start). Its verify twin's kernel phase was 12 s longer than the full-chain check's as well (98.5 s against 86.5 s),
-  though the verify runs step about ten times the particles, so the extra is a fixed cost per process, the compile,
-  not the test's stepping. The compile time varies from run to run: the CPU runs of that evening with 2000 and 4000
-  particles (`metal_columns_2026-11-02\track`), on the same parallel kernel as the evaluations, spent 71-96 s in that
-  phase with either test, the code from before the column test 83 s (`raster_head_2000`), and repeats differ by up to
-  9 s. If it stays near 80 s, a cheap evaluation takes about 1.9 min and the campaign about 5 h. Its verify tracking
-  took 396 s, as long as the full-chain check's 397 s. (Since the cached parallel kernel of 2026-11-11 only the first
-  process after an edit of `fast_track3d.py` pays the compile.)
+  the build with posts); the distance from the housing outline is remembered within the process
+  (`builder._wall_distance`), and the rule's crossing tests share the tracks' segment boxes
+  (`post_rule.segment_boxes`).
+- The tracking kernel's two builds are cached on disk: only the first process after an edit of `fast_track3d.py`
+  compiles them (about 3.5 min); every later one loads them in under a second.
 
 ## The toy campaign
 

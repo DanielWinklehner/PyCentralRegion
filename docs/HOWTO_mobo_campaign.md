@@ -1,18 +1,19 @@
 # HOWTO: run a MOBO campaign on the 3D model
 
 How to run a campaign, from a dry run to the verified Pareto set and the RF check of the chosen design. The driver
-itself is described in [mobo.md](mobo.md). The commands are Windows PowerShell; the paths are those of the worked
-example (HCHC-1.5), so change them for another machine.
+itself is described in [mobo.md](mobo.md). The commands are Windows PowerShell; the worked example is the demo
+machine's campaign (`configs/examples/demo/campaign.toml`), and a campaign of your own machine runs the same way
+([machine.md](machine.md)).
 
 ## 0. Before you start
 
-- One GPU, one campaign: nothing else should use the GPU while a campaign runs.
+- One GPU, one campaign: nothing else should use the GPU while a campaign runs. (The demo needs no GPU.)
 - Two Python environments:
-  - the driver's: numpy, scipy, optuna >= 5, torch (CPU) and greenlet, here `pcr-mobo` (greenlet since 2026-11-02,
-    after the first pilot, whose proposals were made without it; [mobo.md](mobo.md), "Samplers");
-  - the physics one: numba, PyPATools, bempp, gmsh, cupy, here `accel-dev-env`.
-  The driver starts every evaluation with the physics interpreter named in `[mobo] physics_python`.
-- Free disk. On the worked example:
+  - the driver's: numpy, scipy, optuna >= 5, torch (CPU) and greenlet ([mobo.md](mobo.md), "Samplers");
+  - the physics one: numba, PyPATools, bempp, gmsh, cupy.
+  The driver starts every evaluation with the physics interpreter named in `[mobo] physics_python` (empty: its own
+  interpreter, which then needs both sets, as the demo does).
+- Free disk. On a full-size four-dee model:
 
   | item | size |
   |---|---|
@@ -25,14 +26,17 @@ example (HCHC-1.5), so change them for another machine.
 Every session starts with:
 
 ```powershell
-$repo = "D:\Dropbox (Personal)\Code\Python\PyCentralRegion"
+$repo = "$HOME\code\PyCentralRegion"
 $env:PYTHONPATH = "$repo\src"           # the driver's source; the driver also puts it first on the evaluations' PYTHONPATH
-$env:CONDA_PREFIX = "C:\Users\Daniel\anaconda3\envs\pcr-mobo"
+$env:CONDA_PREFIX = "$HOME\miniforge3\envs\pcr-mobo"
 $py = "$env:CONDA_PREFIX\python.exe"
+$env:MACHINE_PATHS = "$HOME\machines\paths.toml"   # this computer's disk roots, for run files that use ${name}
 ```
 
 `& $py -m PyCentralRegion.cli` is the `pcr` command. The driver's environment needs no install of the package:
-`PYTHONPATH` points at the source tree, and the evaluations run the same code.
+`PYTHONPATH` points at the source tree, and the evaluations run the same code. The demo's files use no root, so it
+needs no paths file; a machine whose run files name `${inputs}` or `${work}` does
+(`configs/examples/paths.example.toml`).
 
 ## 1. The toy campaign: the driver end to end (seconds, no GPU)
 
@@ -50,8 +54,14 @@ It writes `$repo\output\mobo_toy` (git ignores `output\`). Delete that folder to
 
 ## 2. Check the real campaign without running it
 
+The demo's inputs first (once, about a minute):
+
 ```powershell
-$campaign = "$repo\configs\examples\hchc1p5\mobo_pilot.toml"
+& $py -m PyCentralRegion.demo
+```
+
+```powershell
+$campaign = "$repo\configs\examples\demo\campaign.toml"
 & $py -m PyCentralRegion.cli optimize $campaign --dry-run
 ```
 
@@ -68,22 +78,22 @@ for cmd.exe; in PowerShell put `--%` after the interpreter: `& <python> --% -m P
 Before the first real run, check the campaign file:
 - `campaign_dir`: a new folder. An existing one is continued, not overwritten.
 - `physics_python`: the physics interpreter.
-- The fidelities: `[mobo.fidelities.search]`, e.g. 10 000 particles and SC 64³ every 5 steps. Let the fidelities
-  differ in resolution only (particles, SC grid and interval), not in `track.turns`.
-- The turn every design is scored at: `track.turns = 7` with `track.stop_at_target_energy = false` in `fixed`, as
-  in the worked example's campaigns. Without it a run ends at the turn its reference reaches
-  `machine.target_energy_mev`, so a slower design tracks an extra turn and its end-of-run scores jump.
+- The fidelities: `[mobo.fidelities.search]`, e.g. 10 000 particles and SC 64³ every 5 steps on a full-size model.
+  Let the fidelities differ in resolution only (particles, SC grid and interval), not in `track.turns`.
+- The turn every design is scored at: `track.turns` with `track.stop_at_target_energy = false` in `fixed`, as the
+  demo campaign does. Without it a run ends at the turn its reference reaches `machine.target_energy_mev`, so a slower
+  design tracks an extra turn and its end-of-run scores jump.
 - `timeout_min`: about 3× an evaluation, so that a hung evaluation cannot stall the campaign.
 - The variables' ranges. For the dee aperture (`python -m PyCentralRegion.geometry.build bounds <base run toml>`
   prints the bounds; `geometry.options.check_bounds` holds the first three at build time):
   - every height <= 2 × (`geometry.plate_half_gap_mm` - `geometry.dee_wall_mm`), so the dee plates fit the gap
-    (40 mm on the worked example); where `geometry.plate_profile_mm` narrows the gap (a pole nose and its own
-    taper), at each radius with the half gap there. To keep every point of the box buildable, give the taper by its
-    start (`aperture_taper_start_mm`) with a lower bound no further in than where the nose's taper begins, the inner
-    height below the nose's bound and the outer one below the outer gap's: a taper at least as long as the nose's
-    rise to the outer bound then never cuts into it (the v6o_c1 campaign, `mobo_v6o_c1.toml`, does this);
+    (16 mm on the demo); where `geometry.plate_profile_mm` narrows the gap (a pole nose and its own taper), at each
+    radius with the half gap there. To keep every point of the box buildable, give the taper by its start
+    (`aperture_taper_start_mm`) with a lower bound no further in than where the nose's taper begins, the inner height
+    below the nose's bound and the outer one below the outer gap's: a taper at least as long as the nose's rise to
+    the outer bound then never cuts into it;
   - the inner heights >= 2 × the spiral-inflector housing exit's half height, so the channel clears the exit
-    (21.48 mm on the worked example);
+    (10 mm on the demo);
   - the channel heights at the housing exit's outermost radius (dees and dummy dees) >= the same bound, so the channel
     clears the exit over its whole span; this binds only for an inverted taper that starts inside the exit;
   - every height > 0 and < 2 × `geometry.half_height_mm`, and the taper inside 0 < r0 < r1 < 1000 mm
@@ -92,46 +102,34 @@ Before the first real run, check the campaign file:
   The driver refuses before anything runs a range whose corners break the last bullet. A range beyond the first three
   makes evaluations fail at the build instead of exploring designs.
 
-## 3. Pilot: cheap variables on existing fields (35-40 min)
+## 3. A pilot: cheap variables on existing fields
 
-`mobo_pilot.toml` optimises RF phase and dee voltage on the fields of `design_wnop3_rotn3_g0ap`, every run 7 turns. A
-first-harmonic trim (by its two Cartesian components) is opt-in: the design has no trim coils, so its two variables
-are commented out (the second pilot, of 2026-11-03, ran with them; its store needs them uncommented). No geometry is
-built, so every evaluation is about 1.6-1.9 min of tracking and scoring (95-108 s in the first pilot of 2026-11-02,
-with the deck's slice test, 33 min for its 20 evaluations; 114 s in the one run timed with the column test, the
-default). That first pilot varied the trim by amplitude and azimuth and stopped every run at 3 MeV; its report
-(`E:\HCHC1.5\Results\CR\pcr_validation\mobo\pilot_analysis\pilot_report.md`) is why the file now does neither, and
-so it has a new `campaign_dir`.
+A first campaign with cheap variables only (the RF phase `track.phases_deg`, the dee voltage `track.volt_scale`) on
+the base design's existing model and fields needs no build: every evaluation is tracking and scoring. It shows how the
+scores and the constraints behave before any geometry is varied, at a fraction of the cost. Leave the geometry
+variables out and point the base run file's `paths.model3d` and `paths.fields` at the design's model and fields
+(`pcr build` and `pcr fields` make them once).
 
 ```powershell
 & $py -m PyCentralRegion.cli optimize $campaign
 ```
 
 The driver logs every evaluation as it starts and ends. The first evaluation is the warm start, the design as
-tracked. With the column test, the default, it gives 4.080 mA (T = 50.79 % of 8.03 mA at the search fidelity; the
-same run made outside a campaign:
-`E:\HCHC1.5\Results\CR\pcr_validation\metal_columns_2026-11-02\gpu\warm_search_columns`). The first pilot gave it
-4.049 mA (50.40 %) with the deck's slice test, which puts the channel's faces up to half a millimetre off, but for
-slivers thinner than a level and the ground's faces near z = ±15 mm (on the channel's taper up to 1.5 mm, into the
-metal: the deck's slices lack the ground at z = ±15 mm); add `'track.obstacles="raster"'` to `fixed` to repeat that
-run. The base design reaches 3 MeV at its 7th turn, so 7 turns
-should give it the run it had with the stop (array for array in a 200-particle check without space charge).
+tracked: at the same fidelity it gives the design's own run. A first-harmonic trim (`btrim.amplitude_cos_t`,
+`btrim.amplitude_sin_t`) is a cheap variable too; add it only for a machine with trim coils, or label the results
+"with trim".
 
 ## 4. The campaign with geometry variables
 
-`mobo_campaign.toml` adds to the pilot's variables the beam channel's aperture (inner and outer height, taper centre
-and length) and the spiral-inflector rotation (`kind = "geometry"`): 7 variables (9 with the opt-in trim), 120
-evaluations. For another design, start from it or from the pilot's file. Read its header first: it lists what the
-loop does not see, among them
-that the gap-0 hole does not follow the inflector rotation (at the ends of the ±3° range the bunch, flown straight
-from the hand-off plane as `gap0_hole` places the hole, meets gap 0's edge 4.7 / 0.6 mm from the hole's centre,
-against 2.2 mm at the base, where the tracked bunch meets it 1.1 mm from the centre).
+The demo campaign varies the dee channel's height inside the taper (`kind = "geometry"`: every new value is an
+electrode build and its BEM fields) and the RF phase (cheap: a re-track on that geometry's fields), with two objectives
+(`I_final`, `dE_E_robust`) and an energy constraint, 12 evaluations. For a machine of your own, start from it and add
+the geometry variables your design needs ([mobo.md](mobo.md), "Useful targets").
 
 Every new geometry is built and solved under `<campaign_dir>\geometries\<key>\`. The first evaluation, the warm start,
-rebuilds the base design there (about 4 min; the build equals the design deck's model bit for bit).
+rebuilds the base design there.
 
 ```powershell
-$campaign = "$repo\configs\examples\hchc1p5\mobo_campaign.toml"
 & $py -m PyCentralRegion.cli optimize $campaign --dry-run
 ```
 ```powershell
@@ -139,40 +137,27 @@ $campaign = "$repo\configs\examples\hchc1p5\mobo_campaign.toml"
 ```
 
 Planning the budget:
-- since 2026-11-14 a new geometry with posts in the loop takes about 2.7 min (152 to 167 s in six runs; 708 s
-  in campaign_v6r60o_c1) with the mirror options of `design_v6o_c1_mirror.toml` and a cheap follower 27 s
-  (`docs/mobo.md`, "Costs"): the processes now keep the fast cores when they run without a window, and the field
-  build is 2 to 6 times faster. The figures below are older, from a shell, with the code of their day;
-- a new geometry's evaluation takes about 4 min on the worked example (build about 20 s, fields about 2 min, then
-  the tracking), and the driver follows it with `cheap_per_geometry` cheap evaluations of about 1.6-1.9 min each;
-- the times here include the compile of the tracking kernel, which every evaluation process paid until 2026-11-11:
-  about 65 s of the first pilot's 1.6 min (in the one search evaluation with the column test its kernel phase, the
-  compile included, took 80 s), 136-169 s by 2026-11-11. Since then the parallel kernel is cached on disk like the
-  serial one: only the first evaluation after an edit of `fast_track3d.py` compiles it (about 3.5 min), every later
-  one loads it, so take the compile off the other evaluations (a cheap follower of the v6r60o_c1 tests: 28-29 s
-  instead of about 3.5 min; `docs/mobo.md`, "Costs");
+- a new geometry costs a build and a BEM solve on top of the tracking: on the demo about 2 min on a desktop CPU
+  (build 20 s, fields 32 s, tracking 39 s with a three-phase scan); on a full-size model with posts placed in the
+  loop about 2.7 min, with the mirror options ([mobo.md](mobo.md), "Costs");
+- the driver follows it with `cheap_per_geometry` cheap evaluations: a re-track on the same fields (about 30 s at the
+  search fidelity on a full-size model);
+- only the first evaluation process after an edit of `fast_track3d.py` compiles the tracking kernel (about 3.5 min);
+  every later one loads it from the cache;
 - with `cheap_per_geometry = 3`, a quarter of the evaluations build a geometry;
-- `n_startup` evaluations come before the model takes over: at least 2 × the number of variables + 1
-  (`mobo_campaign.toml`: 20, the warm start and 19 random designs, which are the base and 4 random geometries with
-  their cheap followers; `mobo_pilot.toml`: 9);
+- `n_startup` evaluations come before the model takes over: at least 2 × the number of variables + 1;
 - designs of one flat channel (`ap_inner` = `ap_outer`) share one geometry whatever the taper's place, so they build
   once;
-- `mobo_campaign.toml`: 30 × 4 min + 90 × 1.6-1.9 min, about 4.5-5 h for its 120 evaluations (`--max-hours 10` runs
-  it to the end, with room for evaluations twice as slow as the first pilot's). The 1.6 min are the first pilot's,
-  with the deck's slice test; the 1.9 min the one search evaluation timed with the column test (`docs/mobo.md`,
-  "Costs").
+- the campaign then costs about (geometries × new-geometry time) + (followers × cheap time), plus the verify runs.
 
-A radial slit comes after, in a campaign of its own on the design this one chooses: `mobo_slit.toml` varies the slit's
-opening, azimuth and offset at one fixed pass (one campaign per pass), 20 evaluations of about 1.6-1.9 min. Its
-header says how to point it at a campaign's design.
+A radial slit comes after, in a campaign of its own on the design this one chooses: vary the slit's opening, azimuth
+and offset at one fixed pass (one campaign per pass), with an open slit in every design ([mobo.md](mobo.md),
+"Variables").
 
-`mobo_v6o_c1.toml` is the full optimisation from a cold start: the dee opening, the beam channel and all eight
-connected gap lines (36 geometry variables) with the RF phase and the magnet level (cheap), three objectives, and
-posts placed by rule in every new geometry's first evaluation (`[post_rule]` in its base run file
-`design_v6o_c1_cold.toml`; `docs/mobo.md`, "Posts in the loop"). That first evaluation builds, solves and tracks the
-geometry twice, bare and with its posts, so it takes several times a plain one (its header gives the measured times).
-Run it detached for a set number of hours (`--max-hours`) and stop it from the outside when needed: running the same
-command again continues it.
+With `[post_rule] enabled = true` in the base run file, posts are placed by rule in every new geometry's first
+evaluation ([mobo.md](mobo.md), "Posts in the loop"). That first evaluation builds, solves and tracks the geometry
+twice, bare and with its posts, so it takes several times a plain one. Run such a campaign detached for a set number
+of hours (`--max-hours`) and stop it from the outside when needed: running the same command again continues it.
 
 `--max-hours` bounds one run of the driver. `max_evals` bounds the whole campaign (`--max-evals N` overrides it);
 running the same command again continues to it. `--set key=value` overrides any key of the campaign file for one run,
@@ -204,8 +189,8 @@ e.g. `--set mobo.seed=3`.
 
 ## 6. Verify the Pareto set
 
-The search fidelity ranks designs; the verify fidelity tracks every particle with SC 128³ every step, about 7 min an
-evaluation:
+The search fidelity ranks designs; the verify fidelity tracks every particle of the hand-off bunch with a finer
+space-charge solve (on a full-size model 128³ every step, about 5 min of tracking an evaluation):
 
 ```powershell
 & $py -m PyCentralRegion.cli optimize-verify $campaign --pareto
@@ -217,13 +202,13 @@ evaluation:
 Each re-evaluation is stored next to its original (`0012.verify`), so `optimize-status` shows both. A re-evaluation
 that failed or was interrupted runs again with the same command; its earlier folder is kept as
 `0012.verify.attempt1`. Judge the designs by the verify scores, and read the shift between the fidelities: a design
-that only looks good at 10 000 particles is noise (the search noise can even put a design that misses a constraint
-into the search Pareto set).
+that only looks good at the search fidelity is noise (the search noise can even put a design that misses a
+constraint into the search Pareto set).
 
 ## 7. Check the chosen design
 
 1. **Run it on its own** from its run file: `evals\<id>\command.txt` lists every override. Write them into a design
-   file next to the worked example and track it with `pcr track` at the verify fidelity. Look at:
+   file next to the base design and track it with `pcr track` at the verify fidelity. Look at:
    - the final current [mA];
    - the energy spectrum (a split peak);
    - the turn structure at the eight virtual probes (`turns`, `turn_*` and `probes` in `score.json`; panel (c) of
@@ -231,13 +216,14 @@ into the search Pareto set).
      `analysis.runs.load_probe(<run.out_dir>\probe_<a>deg.npz)['R']` for a recorded probe, or
      `analysis.runs.virtual_probe(run, a)['R']` for any azimuth.
 2. **RF frequency.** The central-region electrodes are part of the dee capacitance, so a new aperture taper, windows
-   or posts shift the cavity's resonance. f_RF must stay h × f_rev = 4 × 8.1914 MHz = 32.77 MHz (f_rev 8.191375 MHz
-   in track.json), inside the tuner's range.
+   or posts shift the cavity's resonance. f_RF must stay h × f_rev (`rf_mhz`, `f_rev_mhz` in track.json), inside the
+   tuner's range.
    1. Take the chosen geometry's CAD: `pcr build` writes `<prefix>.step` beside the model
       (`<campaign_dir>\geometries\<key>\model3d.step`): five solids, dee0..dee3 and the ground with the
       spiral-inflector housing fused in, in mm, in the machine frame (origin on the axis, z = 0 the median plane).
    2. Put them into the full cavity model (COMSOL) in place of the old central region.
-   3. Solve its eigenfrequency, and compare it with the design that was tuned (the worked example's).
+   3. Solve its eigenfrequency, and compare it with the design that was tuned.
    Field maps and tracking assume the design frequency: a design the tuner cannot bring back to it is not a design.
-3. **Energy spread against turn separation.** A spread above about 1.3 % (dE/E robust) makes turns wider than 3 mm
-   at the extraction radius, whatever the current says.
+3. **Energy spread against turn separation.** The energy spread widens the turns at the extraction radius, whatever
+   the current says: compare `dE_E_robust` (and `sigR_E`, `turn_sigR` in score.json) with what the extraction
+   accepts.

@@ -9,3 +9,5 @@
 /src/PyCentralRegion.egg-info/
 __pycache__/
 *.pyc
+
+/configs/examples/demo/inputs/

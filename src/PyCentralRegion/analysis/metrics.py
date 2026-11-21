@@ -25,7 +25,7 @@ from collections import namedtuple
 
 import numpy as np
 
-from ..config import MachineConfig, get_dotted
+from ..config import get_dotted
 from ..kinematics import CLIGHT, kinetic_energy_mev
 from ..probes import beam_sense, crossing_direction, crossing_fraction, interpolate, start_pass
 from .objectives import METRICS, ScoreConfig
@@ -563,7 +563,7 @@ def crossing_velocity(xyz, alive, steps, dt_step, k, j, f, r_max=np.inf, z_max=n
     on a circle of omega dt per record interval its |v| is good to ~(omega dt)^4, 1e-8 at 4 of 1000 steps per turn -
     else the chord over the record interval, the mean velocity between the two records, whose |v| is low by
     (omega dt)^2 / 24 with omega the local bending rate: 3e-5 at the turn's mean curvature, about 7e-5 (1.4e-4 in the
-    energy) at 0 deg in the HCHC-1.5 runs, where the orbit bends 1.6 times harder."""
+    energy) where the orbit bends 1.6 times harder than on average (on a hill)."""
     k, j, u = np.asarray(k), np.asarray(j), np.asarray(f, dtype=float)
     steps = np.asarray(steps)
     S = len(steps)
@@ -831,6 +831,8 @@ def pick_operating_point(rows, cfg=None):
     pick_t_tol (absolute) of it the smallest dE/E wins. Returns winner, best_t, uncapped_best (the best transmission
     without the voltage cap) and n_ok; ValueError when no capped point reaches the energy."""
     cfg = cfg or ScoreConfig()
+    if not cfg.pick_e_min_mev > 0.0:
+        raise ValueError("score.pick_e_min_mev is not set: the final energy the bunch must reach is the machine's")
     reach = [r for r in rows if r['e_final'] >= cfg.pick_e_min_mev and r['transmission'] > 0]
     ok = [r for r in reach if r['v'] <= cfg.pick_v_max + 1e-9]
     if not ok:
@@ -883,17 +885,21 @@ def campaign_summary(scores, paths):
 # ---------------------------------------------------------------------------------------------------------------------
 # one run
 def machine_value(run, key):
-    """A [machine] setting of the run: its recorded table (``runs.RunData.machine``: the config it was tracked with),
-    else the ``config.MachineConfig`` default."""
-    return run.machine[key] if key in run.machine else getattr(MachineConfig(), key)
+    """A [machine] setting of the run: its recorded table (``runs.RunData.machine``: the config it was tracked with).
+    The machine's properties have no defaults: a ValueError when the run records none (a deck run loaded without
+    its machine: ``load_run(..., machine=)``)."""
+    if key not in run.machine:
+        raise ValueError(f"the run {run.tag!r} records no machine.{key}: load it with its [machine] table "
+                         f"(load_run(..., machine=section(cfg, 'machine')))")
+    return run.machine[key]
 
 
 def tracked_species(run):
     """(mass [MeV / c^2], charge state Z) of the tracked ions. The tracker pushes, and records E_mev with, the
     PyPATools preset of its [machine] species (``machine.make_design``; a hand-off file's species_mass_mev only turns
     its momenta into velocities), so: that preset when the run records its [machine] table, else the hand-off file's
-    species_mass_mev and species_charge_state, else the preset of its pypatools_species_name or of the default
-    [machine] species; NaN mass when none is known."""
+    species_mass_mev and species_charge_state, else the preset of its pypatools_species_name; NaN mass when none is
+    known."""
     meta = run.handoff_meta or {}
     if 'species' not in run.machine and meta.get('species_mass_mev') is not None:
         return float(meta['species_mass_mev']), float(meta.get('species_charge_state', 1.0))
@@ -901,7 +907,7 @@ def tracked_species(run):
         from PyPATools.species import PRESETS, IonSpecies
     except ImportError:
         return float('nan'), 1.0
-    name = str(run.machine.get('species') or meta.get('pypatools_species_name') or MachineConfig().species)
+    name = str(run.machine.get('species') or meta.get('pypatools_species_name') or '')
     if name not in PRESETS:                          # IonSpecies exits the interpreter on a name it does not know
         return float('nan'), 1.0
     sp = IonSpecies(name)
@@ -935,8 +941,9 @@ def run_constants(run, cfg):
     else:
         b0 = isochronous_field(f_rev, mass, zq)
     q = (fj.get('space_charge') or {}).get('bunch_charge_c') or (i0 * 1e-3 / f_rf if np.isfinite(i0) else np.nan)
-    return {'r_max': float(lim.get('r_max_m', machine_value(run, 'r_max_m'))),
-            'z_max': float(lim.get('z_max_m', machine_value(run, 'z_max_m'))), 'harmonic': h, 'f_rf': f_rf,
+    r_max = lim['r_max_m'] if 'r_max_m' in lim else machine_value(run, 'r_max_m')
+    z_max = lim['z_max_m'] if 'z_max_m' in lim else machine_value(run, 'z_max_m')
+    return {'r_max': float(r_max), 'z_max': float(z_max), 'harmonic': h, 'f_rf': f_rf,
             'f_rev': f_rev, 'mass_mev': mass, 'charge_state': zq, 'B0': b0, 'I0': i0, 'I0_from': i0_from,
             'Q': float(q), 'sc_on': bool(fj.get('sc', scj.get('on', False))) and bool(run.sc_recorded)}
 

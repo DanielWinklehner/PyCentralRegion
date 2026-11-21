@@ -2,12 +2,8 @@
 solve it allows (the upper triangles' rows with the mirror image folded in) against the whole mesh's, the potential
 evaluated on the levels z >= 0 only (fields3d.bem_field3d), the GMRES that tests its residual after every product, the
 potential kernels built once, and the builder options that make such a mesh (exit_opening, mirror_mesh, lc_far_mm).
-Small hand-made meshes on the CPU; the last test builds the worked example when its input files are on this machine
-(about 25 s), else it skips."""
-import contextlib
-import io
+Small hand-made meshes on the CPU."""
 import signal
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -16,9 +12,6 @@ from PyCentralRegion import config as C
 
 pytest.importorskip('PyPATools')
 from PyCentralRegion import gap_fields as G                      # noqa: E402
-
-REPO = Path(__file__).resolve().parents[1]
-EXAMPLES = REPO / 'configs' / 'examples' / 'hchc1p5'
 
 
 @pytest.fixture(autouse=True)
@@ -391,66 +384,3 @@ def test_mirror_model_closes_the_upper_half():
         B.mirror_model(below, verbose=False)
 
 
-def test_the_worked_example_builds_a_mirrored_mesh(tmp_path):
-    """The worked example with its exit opening centred, its mesh mirrored and its far faces coarse: every electrode's
-    upper half holds half its volume, the mesh passes mirror_pairs and the column test, it has a third fewer triangles,
-    and the CAD file is the whole model's. Without exit_opening = 'centred' the same electrodes are refused."""
-    pytest.importorskip('PyCentralRegion.geometry.builder')
-    pytest.importorskip('gmsh')
-    from PyCentralRegion.geometry import build as GB
-    from PyCentralRegion.metal_columns import ColumnObstacles
-    cfg_path = EXAMPLES / 'design_v6o_c1_cold.toml'
-    if not cfg_path.exists():
-        pytest.skip("the worked example is not in this checkout")
-
-    def build(name, extra):
-        model = tmp_path / name / 'model3d.pkl'
-        cfg = C.load(cfg_path, overrides=extra + ['geometry.plot_dees=false', f'paths.model3d="{model.as_posix()}"'])
-        pc = C.section(cfg, 'paths')
-        if not all(Path(p).exists() for p in (pc.seed, pc.housing_outline, pc.handoff, pc.housing_step)):
-            pytest.skip("the design's input files are not on this machine")
-        log = io.StringIO()
-        with contextlib.redirect_stdout(log):
-            GB.build(cfg)
-        import pickle
-        with open(model, 'rb') as fh:
-            return pickle.load(fh), log.getvalue(), model
-
-    plain, _, _ = build('plain', [])
-    assert G.mirror_pairs(plain) is None and not plain.params.get('mirror_mesh')
-    sym, txt, path = build('sym', ['geometry.exit_opening="centred"', 'geometry.mirror_mesh=true',
-                                   'geometry.lc_far_mm=32.0'])
-    assert sym.params['mirror_mesh'] is True and G.mirror_pairs(sym) is not None
-    assert "exit opening centred" in txt and "mirror mesh: every electrode cut at the median plane" in txt
-    assert sym.n_elements < 0.8 * plain.n_elements               # the far faces are coarse
-    ColumnObstacles.from_model(sym, spacing=5e-4, extent=sym.extent() + 0.005, odd='raise')
-    import json
-    rec = json.loads(path.with_name('model3d_build.json').read_text())
-    assert rec['mesh']['mirror'] is True and rec['exit_opening']['shape'] == 'round'
-    assert all(abs(v - 0.5) < 1e-4 for v in rec['mesh']['upper_volume_share'].values())
-    assert path.with_name('model3d.step').stat().st_size > 0.8 * (tmp_path / 'plain' / 'model3d.step').stat().st_size
-    cfg = C.load(cfg_path, overrides=['geometry.plot_dees=false', f'paths.model3d="{(tmp_path / "x" / "m.pkl").as_posix()}"'])
-    cfg['geometry']['mirror_mesh'] = True
-    with pytest.raises(C.ConfigError, match="exit_opening = 'centred'"):
-        C.section(cfg, 'geometry')
-    # a mirrored mesh that cannot be made costs the speed, not the geometry: the electrodes are built again and meshed whole
-    from PyCentralRegion.geometry import builder as B
-
-    def refuse(gmsh, groups, verbose=True):
-        raise B.MirrorRefused("not mirror symmetric about the median plane: dee3 (a test)")
-    real = B.cut_upper_half
-    B.cut_upper_half = refuse
-    try:
-        whole, txt, path = build('refused', ['geometry.exit_opening="centred"', 'geometry.mirror_mesh=true'])
-    finally:
-        B.cut_upper_half = real
-    assert "mirror mesh NOT made (MirrorRefused: not mirror symmetric about the median plane: dee3 (a test))" in txt
-    assert not whole.params.get('mirror_mesh') and G.mirror_pairs(whole) is None
-    rec = json.loads(path.with_name('model3d_build.json').read_text())
-    assert rec['mesh']['mirror'] is False and 'dee3 (a test)' in rec['mesh']['mirror_refused']
-    assert whole.n_elements > 0.9 * plain.n_elements             # the whole electrodes' mesh, the far faces as fine
-    ColumnObstacles.from_model(whole, spacing=5e-4, extent=whole.extent() + 0.005, odd='raise')
-    mirror = C.section(C.load(EXAMPLES / 'design_v6o_c1_mirror.toml'), 'geometry')          # the example that sets them
-    assert (mirror.exit_opening, mirror.mirror_mesh, mirror.lc_far_mm) == ('centred', True, 32.0)
-    paths = C.section(C.load(EXAMPLES / 'design_v6o_c1_mirror.toml'), 'paths')
-    assert paths.model3d != C.section(C.load(cfg_path), 'paths').model3d

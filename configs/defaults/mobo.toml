@@ -1,8 +1,7 @@
 # Defaults of the [mobo] section: a multi-objective Bayesian optimisation campaign (pcr optimize).
 # A campaign file holds [mobo] only and names the run TOML every evaluation starts from (base_config_file); see
-# configs/examples/toy/campaign.toml (runs in seconds), configs/examples/hchc1p5/mobo_pilot.toml (cheap variables on
-# existing fields), configs/examples/hchc1p5/mobo_campaign.toml (geometry and cheap variables) and
-# configs/examples/hchc1p5/mobo_slit.toml (a slit for the chosen design).
+# configs/examples/toy/campaign.toml (an analytic evaluator: runs in seconds) and configs/examples/demo/campaign.toml
+# (a geometry and a cheap variable of the demo machine, the whole physics chain per evaluation).
 # tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/mobo/space.py.
 #
 #   pcr optimize        campaign.toml [--max-evals N] [--max-hours H] [--dry-run]   run or continue the campaign

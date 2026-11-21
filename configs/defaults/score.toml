@@ -1,12 +1,12 @@
 # Defaults of the [score] section: the scoring of 3D bunch-tracking runs (PyCentralRegion.analysis, `pcr score`).
-# The values reproduce the 3D campaign's run scoring of 2026-11-01, so new scores compare with its tables.
+# The values are the run scoring the package has used since 2026-11-01, so new scores compare with older tables.
 # Score keys that carry a number take it from here: halo3 from halo_sigma, I_2pct from energy_windows, acc90 from
 # acceptance_levels, valley_rad20 and best_slit.20 from slit_budgets, ratio_t3 / sig_r_t3 / compress_t3 from
 # proxy_turns (change one and the key changes with it). The metrics an optimizer may use are listed in
 # PyCentralRegion.analysis.objectives.METRICS.
 # The machine is not set here: the harmonic and the loss limits come from the run's track.json, else the [machine]
 # table of its config.json; the species from that table, else the hand-off file (analysis.metrics.run_constants). A run
-# of the original design deck takes the table load_legacy_run is given, else the [machine] defaults.
+# of the original design deck takes the table load_legacy_run is given; without one, scoring stops on the missing key.
 # tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/analysis/objectives.py.
 
 [score]
@@ -86,6 +86,7 @@ twin_boot = 200             # paired bootstrap resamples for the statistical err
 twin_boot_seed = 1          # their random seed
 
 # operating point of a dee-voltage x RF-phase bunch grid (analysis.pick_operating_point)
-pick_e_min_mev = 2.9        # the bunch must reach this final energy
+pick_e_min_mev = 0.0        # the bunch must reach this final energy [MeV] (the machine's: no default; the pick
+                            # refuses 0)
 pick_t_tol = 0.005          # within this (absolute) transmission of the best, the smallest dE/E wins
 pick_v_max = 1.10           # cap on the dee-voltage scale (wall power grows as V^2)

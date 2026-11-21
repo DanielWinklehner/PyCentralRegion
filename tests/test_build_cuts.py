@@ -1,31 +1,12 @@
 """The builder's cuts that must remove metal (geometry.builder._cut_removing). A fuzzy OCC boolean can hand back its
 object untouched; on 2026-11-03 that left dees and the star ground whole whenever the channel taper ended beyond
 ~150 mm, and a retry at a smaller tolerance could leave a sealed void of the tool's shape instead of a channel. The
-first test uses boxes; the second builds and meshes two such designs (about 15 s each) when their input files are on
-this machine, else it skips."""
-import contextlib
-import io
-import signal
-from pathlib import Path
-
+tests use boxes and stand-ins for the builder; the real builds of the designs whose cuts once failed are checked where
+those designs live, with their machine's configs. conftest.py puts back the SIGINT handler gmsh takes."""
 import numpy as np
 import pytest
 
 from PyCentralRegion import config as C
-
-REPO = Path(__file__).resolve().parents[1]
-EXAMPLES = REPO / 'configs' / 'examples' / 'hchc1p5'
-
-
-@pytest.fixture(autouse=True)
-def sigint_handler_kept():
-    """gmsh.initialize() sets SIGINT to SIG_DFL and gmsh 4.15's finalize() does not put the old handler back (it keeps
-    it in a local), so after a build in this process the next SIGINT ends pytest from the thread that raised it: the
-    Ctrl+C tests of test_mobo raise one from a timer thread, and the whole run hung in that exit. Each test here leaves
-    the handler it found."""
-    handler = signal.getsignal(signal.SIGINT)
-    yield
-    signal.signal(signal.SIGINT, handler)
 
 
 def test_a_cut_that_must_remove_metal(monkeypatch):
@@ -96,34 +77,6 @@ def test_a_cut_that_must_remove_metal(monkeypatch):
         gmsh.model.remove()
         if started:
             gmsh.finalize()
-
-
-@pytest.mark.parametrize('design, overrides', [
-    # the connected cold start with the taper over r 100-150 mm: at 0.05 mm dee3 and the ground came out whole
-    ('design_connected_cold.toml', ['geometry.aperture_taper_center_mm=125', 'geometry.aperture_taper_length_mm=50']),
-    # the jogged design with the taper over r 100-263 mm: the ground's retry at 0.02 mm left a void, 0.01 mm cuts it
-    ('design_wnop3_rotn3_g0ap.toml', ['geometry.aperture_taper_center_mm=181.5',
-                                      'geometry.aperture_taper_length_mm=163']),
-], ids=['connected_t150', 'jogged_t263'])
-def test_a_long_channel_taper_is_cut(tmp_path, design, overrides):
-    """A design whose channel taper ends beyond 150 mm builds with every solid hollowed: a build that left one whole
-    fails (_cut_removing), and the channel splits the star ground into its two plates."""
-    pytest.importorskip('PyCentralRegion.geometry.builder')
-    from PyCentralRegion.geometry import build as GB
-    cfg_path = EXAMPLES / design
-    if not cfg_path.exists():
-        pytest.skip("the worked example is not in this checkout")
-    model = tmp_path / 'model3d.pkl'
-    cfg = C.load(cfg_path, overrides=overrides + [f'paths.model3d="{model.as_posix()}"'])
-    pc = C.section(cfg, 'paths')
-    if not all(Path(p).exists() for p in (pc.seed, pc.housing_outline, pc.handoff, pc.housing_step)):
-        pytest.skip("the design's input files are not on this machine")
-    log = io.StringIO()
-    with contextlib.redirect_stdout(log):
-        GB.build(cfg)
-    txt = log.getvalue()
-    notes = [ln for ln in txt.splitlines() if 'removed no metal' in ln]
-    assert "channel cut -> 2 solid(s)" in txt and model.exists(), "\n".join(notes)
 
 
 def test_a_fuse_that_must_keep_its_tools(monkeypatch):
@@ -319,36 +272,3 @@ def test_a_fuse_that_does_not_count_starts_the_model_again(monkeypatch):
     assert len(calls) == 1
 
 
-def test_a_post_block_split_at_a_bend_is_fused(tmp_path):
-    """Eval 0003 of a connected campaign with posts by the between-band rule: at 0.05 mm the fuse into dee0 dropped both
-    pieces of gap 1's block, split at a bend of the gap line, which the builder's own check caught and stopped the
-    build. It builds now (about 30 s, when the design's input files are on this machine, else it skips)."""
-    pytest.importorskip('PyCentralRegion.geometry.builder')
-    from PyCentralRegion.geometry import build as GB
-    cfg_path = EXAMPLES / 'design_connected_cold.toml'
-    if not cfg_path.exists():
-        pytest.skip("the worked example is not in this checkout")
-    r1 = (104.5, 108.5, 110.5, 112.0, 120.5, 130.5, 148.5, 157.0)
-    r2 = (159.5, 156.0, 153.5, 156.0, 168.0, 179.5, 196.0, 202.0)
-    posts = [(1, 'dee', 58.584, 22.457), (1, 'dee', 67.009, 13.361), (1, 'dummy', 84.694, 19.095),
-             (1, 'dummy', 92.316, 15.117), (2, 'dee', 80.691, 11.988), (2, 'dummy', 96.915, 13.157),
-             (3, 'dee', 78.366, 10.163), (3, 'dummy', 92.84, 10.579), (4, 'dummy', 86.118, 11.091)]
-    model = tmp_path / 'model3d.pkl'
-    overrides = ['machine.dee_opening_deg=32.547930952023954', 'geometry.aperture_inner_mm=26.0',
-                 'geometry.aperture_outer_mm=32.0', 'geometry.aperture_taper_center_mm=120.0',
-                 'geometry.aperture_taper_length_mm=40.0', 'geometry.post_shape="cylinder"',
-                 'geometry.posts=[' + ', '.join(f'{{gap={g}, side="{s}", s_mm={m}, length_mm={n}}}'
-                                                for g, s, m, n in posts) + ']', f'paths.model3d="{model.as_posix()}"']
-    for g, (a, b) in enumerate(zip(r1, r2)):
-        overrides += [f'geometry.gap_line.{g}.r1_mm={a}', f'geometry.gap_line.{g}.f1=0.0',
-                      f'geometry.gap_line.{g}.r2_mm={b}'] + ([f'geometry.gap_line.{g}.f0=0.0'] if g else [])
-    cfg = C.load(cfg_path, overrides=overrides)
-    pc = C.section(cfg, 'paths')
-    if not all(Path(p).exists() for p in (pc.seed, pc.housing_outline, pc.handoff, pc.housing_step)):
-        pytest.skip("the design's input files are not on this machine")
-    log = io.StringIO()
-    with contextlib.redirect_stdout(log):
-        GB.build(cfg)
-    txt = log.getvalue()
-    notes = [ln for ln in txt.splitlines() if 'the fuse into' in ln]
-    assert model.exists() and "into dee0 -> 1 solid(s)" in txt, "\n".join(notes)

@@ -10,9 +10,11 @@ from PyCentralRegion import config as C
 from PyCentralRegion.frames import rotation_z, wrap_deg
 from PyCentralRegion.machine import check_supported, rotate_z, seed_orbit
 
+from machine_fixtures import DEMO_DIR, demo_machine
+
 
 def test_supported_layout():
-    mc = C.section_class('machine')()
+    mc = demo_machine()
     check_supported(mc)
     with pytest.raises(NotImplementedError, match='n_dees = 3'):
         check_supported(dataclasses.replace(mc, n_dees=3, dee_center_angles_deg=(30.0, 150.0, 270.0)))
@@ -23,7 +25,8 @@ def test_supported_layout():
 
 
 def test_supported_layout_from_a_run_file(tmp_path):
-    (tmp_path / 'r.toml').write_text('[machine]\nn_dees = 2\ndee_center_angles_deg = [0.0, 180.0]\n')
+    (tmp_path / 'r.toml').write_text(f'include = ["{(DEMO_DIR / "machine.toml").as_posix()}"]\n'
+                                     '[machine]\nn_dees = 2\ndee_center_angles_deg = [0.0, 180.0]\n')
     with pytest.raises(NotImplementedError):
         check_supported(C.section(C.load(tmp_path / 'r.toml'), 'machine'))
 

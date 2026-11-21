@@ -58,7 +58,7 @@ ex07 = _common.load_example('07_bem_gap_verification.py')
 # Vertical structure of the cavity centre, full heights [m] vs radius: the profile measured on the vacuum CAD of
 # a 4-dee cavity (dee aperture 26 -> 50 mm, dee height 66 -> 90 mm, hill gap 34 -> 48 mm, valley floors at
 # +-55 mm), cropped to r <= 250 mm, |z| <= 60 mm. Describe your own cavity with a HeightProfiles of its own.
-PROFILES = HeightProfiles.iba(r_cut=0.25, z_cut=0.06)
+PROFILES = HeightProfiles.reference_cavity(r_cut=0.25, z_cut=0.06)
 R_SEAM = (PROFILES.r_cut - 0.06, PROFILES.r_cut - 0.03)     # composite: 3D inside R_SEAM[0], 2D outside [m]
 R_CMP = 0.20                  # midplane comparison radius [m]
 SPACING = 0.002               # comparison grid [m]

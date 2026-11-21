@@ -1,0 +1,63 @@
+# A small MOBO campaign on the demo design (design.toml): the dee channel's height inside the taper (a geometry
+# variable: every new value is an electrode build and its BEM fields) and the RF phase (cheap: a re-track on that
+# geometry's fields). On a desktop CPU an evaluation of a new geometry took about 2 min (build 20 s, fields 32 s,
+# tracking 39 s, start-up and scores the rest), a cheap one is the tracking and scores only; the 12 evaluations
+# take about 15 min (estimated, not timed).
+#   python -m PyCentralRegion.demo                                       # the inputs, once
+#   pcr optimize        configs/examples/demo/campaign.toml --dry-run    # the first evaluation's command
+#   pcr optimize        configs/examples/demo/campaign.toml              # runs until max_evals; a rerun continues
+#   pcr optimize-status configs/examples/demo/campaign.toml
+#   pcr optimize-verify configs/examples/demo/campaign.toml --pareto     # every particle of the hand-off
+# The driver needs optuna (the "tpe" sampler); the evaluations run in this interpreter (physics_python = "").
+
+[mobo]
+campaign_dir = "../../../output/demo/campaign"
+base_config_file = "design.toml"
+sampler = "tpe"
+seed = 0
+n_startup = 5                  # the warm start and 4 random designs before the sampler's model takes over
+max_evals = 12
+cheap_per_geometry = 2
+fixed = ["track.stop_at_target_energy=false"]    # every design scored at the design's 7th turn
+warm_start = [{ap_inner = 14.0, phase = 35.0}]   # the design as it is, at the phase its own run picks
+
+# --- geometry: the channel's full height inside the taper. Bounds: >= 2 x the housing exit's half height (5 mm) and
+# <= 2 x (plate_half_gap_mm - dee_wall_mm) = 2 x (13 - 5) = 16 mm (`python -m PyCentralRegion.geometry.build bounds
+# configs/examples/demo/design.toml` prints them)
+[[mobo.variables]]
+name = "ap_inner"
+target = "geometry.aperture_inner_mm"
+low = 10.5
+high = 16.0
+kind = "geometry"
+
+# --- cheap: the RF phase of the bunch centre [deg]
+[[mobo.variables]]
+name = "phase"
+target = "track.phases_deg"
+low = 10.0
+high = 60.0
+as_list = true
+
+# --- objectives and constraints
+[[mobo.objectives]]
+metric = "I_final"             # T x injected current [mA]
+direction = "maximize"
+
+[[mobo.objectives]]
+metric = "dE_E_robust"         # robust relative energy spread at the end
+direction = "minimize"
+
+[[mobo.constraints]]
+metric = "E_med"               # median final energy [MeV]
+op = ">="
+value = 0.75
+
+# --- fidelities: resolution only
+[mobo.fidelities.search]       # the design's own: 4000 particles, SC 32^3 every 5 steps
+overrides = []
+timeout_min = 15.0
+
+[mobo.fidelities.verify]       # every particle of the hand-off, SC 64^3 every step
+overrides = ["track.n_final=0", "track.n_tracks=20000", "track.sc_final_cells=64", "track.sc_final_every=1"]
+timeout_min = 60.0

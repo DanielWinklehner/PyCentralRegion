@@ -3,6 +3,8 @@ shared writers: TOML literals, files written whole, JSON of numpy values."""
 import dataclasses
 import importlib.util
 import json
+import os
+import re
 import tomllib
 from pathlib import Path
 
@@ -38,8 +40,10 @@ def test_unknown_key_fails(tmp_path):
 
 
 def test_int_to_float_and_include_loop(tmp_path):
-    cfg = C.load(_write(tmp_path / 'r.toml', '[machine]\ndee_opening_deg = 40\n'))
-    assert isinstance(C.section(cfg, 'machine').dee_opening_deg, float)
+    cfg = C.load(_write(tmp_path / 'r.toml', '[magnet]\nscale = 2\n'))
+    assert isinstance(C.section(cfg, 'magnet').scale, float)
+    with pytest.raises(C.ConfigError, match='species, harmonic.*no default.*machine file'):
+        C.section(C.load(_write(tmp_path / 'm.toml', '[machine]\ndee_opening_deg = 40\n')), 'machine')
     _write(tmp_path / 'a.toml', 'include = ["b.toml"]\n')
     _write(tmp_path / 'b.toml', 'include = ["a.toml"]\n')
     with pytest.raises(C.ConfigError, match='include loop'):
@@ -61,6 +65,81 @@ def test_array_index_overrides_and_paths(tmp_path):
 
 def _lists(x):
     return [_lists(v) for v in x] if isinstance(x, (list, tuple)) else x
+
+
+def _no_paths_env(monkeypatch, tmp_path):
+    """No paths file from this computer: the environment variables unset, the default file somewhere empty."""
+    for var in C.PATHS_ENV:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(C, 'PATHS_FILE', tmp_path / 'no_home' / 'paths.toml')
+
+
+def test_roots_from_the_paths_file(tmp_path, monkeypatch):
+    """``${name}`` roots (the shared paths-file format): in paths, includes and overrides; ``${pcr}`` built in; ``$$``
+    a literal ``$``; [meta] and other packages' tables ignored; a run file without roots never reads a paths file."""
+    _no_paths_env(monkeypatch, tmp_path)
+    data, disk = tmp_path / 'disk' / 'maps', tmp_path / 'disk'
+    data.mkdir(parents=True)
+    _write(disk / 'shared.toml', '[track]\nturns = 3\n')
+    paths_file = _write(tmp_path / 'paths.toml',
+                        f"[meta]\nname = 'test'\n[roots]\nmaps = '{data}'\ndisk = '{disk.as_posix()}'\n"
+                        f"[spyral_inflector]\nwhatever = 1\n")
+    run = _write(tmp_path / 'run.toml',
+                 'include = ["${pcr}/configs/defaults/core.toml", "${disk}/shared.toml"]\n'
+                 '[paths]\nseed = "${maps}/seed.pkl"\n[run]\ncache_dir = "${disk}/cache"\nname = "a$$b ${disk}x"\n')
+    cfg = C.load(run, overrides=['paths.handoff="${maps}/h.h5"'], paths_file=paths_file)
+    assert Path(cfg['paths']['seed']) == (data / 'seed.pkl').resolve()
+    assert Path(cfg['run']['cache_dir']) == (disk / 'cache').resolve()
+    assert Path(cfg['paths']['handoff']) == data / 'h.h5'
+    assert cfg['run']['name'] == os.path.normpath(f"a$b {disk}x")
+    assert cfg['track']['turns'] == 3 and 'machine' in cfg        # both includes were read
+    assert C.source_tree() == DEFAULTS.parents[1]
+    plain = _write(tmp_path / 'plain.toml', '[paths]\nseed = "seed.pkl"\n[run]\nname = "cost $5"\n')
+    cfg = C.load(plain, paths_file=tmp_path / 'missing.toml')
+    assert cfg['paths']['seed'].endswith('seed.pkl') and cfg['run']['name'] == 'cost $5'
+    # the search: MACHINE_PATHS before PYCENTRALREGION_PATHS before ~/.config/pycentralregion/paths.toml
+    other = _write(tmp_path / 'other.toml', f"[roots]\nmaps = '{tmp_path}'\ndisk = '{disk}'\n")
+    monkeypatch.setenv('PYCENTRALREGION_PATHS', str(other))
+    assert Path(C.load(run)['paths']['seed']) == (tmp_path / 'seed.pkl').resolve()
+    monkeypatch.setenv('MACHINE_PATHS', str(paths_file))
+    assert Path(C.load(run)['paths']['seed']) == (data / 'seed.pkl').resolve()
+    monkeypatch.delenv('MACHINE_PATHS')
+    monkeypatch.delenv('PYCENTRALREGION_PATHS')
+    monkeypatch.setattr(C, 'PATHS_FILE', paths_file)
+    assert Path(C.load(run)['paths']['seed']) == (data / 'seed.pkl').resolve()
+    # pcr --paths FILE (anywhere on the line) becomes MACHINE_PATHS, which the evaluations it starts inherit
+    from PyCentralRegion import cli
+    assert cli._take_paths_option(['show', '--paths', str(other), 'run.toml', '--set', 'a.b=1']) == \
+        ['show', 'run.toml', '--set', 'a.b=1']
+    assert os.environ['MACHINE_PATHS'] == str(other.resolve())
+    assert cli._take_paths_option([f'--paths={paths_file}', 'optimize', 'c.toml']) == ['optimize', 'c.toml']
+    assert os.environ['MACHINE_PATHS'] == str(paths_file.resolve())
+    with pytest.raises(C.ConfigError, match='no such file'):
+        cli._take_paths_option(['--paths', str(tmp_path / 'missing.toml')])
+
+
+def test_roots_fail_clearly(tmp_path, monkeypatch):
+    _no_paths_env(monkeypatch, tmp_path)
+    run = _write(tmp_path / 'run.toml', '[paths]\nseed = "${maps}/seed.pkl"\n')
+    with pytest.raises(C.ConfigError, match='no paths file was found.*MACHINE_PATHS.*PYCENTRALREGION_PATHS'):
+        C.load(run)
+    with pytest.raises(C.ConfigError, match='does not exist'):
+        C.load(run, paths_file=tmp_path / 'missing.toml')
+    absolute = (tmp_path / 'r').as_posix()
+    other = _write(tmp_path / 'p1.toml', f"[roots]\nresults = '{absolute}'\n")
+    with pytest.raises(C.ConfigError, match=r"no root 'maps' in the paths file .*p1\.toml.*results"):
+        C.load(run, paths_file=other)
+    with pytest.raises(C.ConfigError, match='built in'):
+        C.load(run, paths_file=_write(tmp_path / 'p2.toml', f"[roots]\npcr = '{absolute}'\nmaps = '{absolute}'\n"))
+    with pytest.raises(C.ConfigError, match='absolute path'):          # roots are absolute and name no other root
+        C.load(run, paths_file=_write(tmp_path / 'p3.toml', "[roots]\nmaps = 'relative/maps'\n"))
+    with pytest.raises(C.ConfigError, match='absolute path'):
+        C.load(run, paths_file=_write(tmp_path / 'p4.toml', f"[roots]\nmaps = '${{results}}/m'\nresults = '{absolute}'\n"))
+    with pytest.raises(C.ConfigError, match='top level'):
+        C.load(run, paths_file=_write(tmp_path / 'p5.toml', f"maps = '{absolute}'\n"))
+    bad = _write(tmp_path / 'bad.toml', '[paths]\nseed = "${1maps}/seed.pkl"\n')
+    with pytest.raises(C.ConfigError, match='is not a root'):
+        C.load(bad, paths_file=other)
 
 
 def test_toml_value_reads_back():
@@ -135,18 +214,24 @@ def _importable(name):
 
 @pytest.mark.parametrize('name', sorted(C.SECTIONS))
 def test_documented_defaults_match_dataclasses(name):
-    """Every section's dataclass defaults are written out in configs/defaults/*.toml, with the same values."""
+    """Every section's dataclass defaults are written out in configs/defaults/*.toml, with the same values; a key
+    without a default (the machine's properties) is listed there as a comment, never with a value."""
     if not _importable(name):
         pytest.skip(f"[{name}] module not present")
-    documented = {}
+    documented, text = {}, ''
     for f in sorted(DEFAULTS.glob('*.toml')):
         with open(f, 'rb') as fh:
             documented.update(tomllib.load(fh))
+        text += f.read_text(encoding='utf-8')
     assert name in documented, f"[{name}] is not documented in {DEFAULTS}"
     cls = C.section_class(name)
-    defaults = C.to_dict(cls())
+    fields = dataclasses.fields(cls)
+    required = [f.name for f in fields if C._default_of(f) is dataclasses.MISSING]
+    defaults = {f.name: C.to_dict(C._default_of(f)) for f in fields if f.name not in required}
     table = documented[name]
-    assert set(table) == {f.name for f in dataclasses.fields(cls)}
+    assert set(table) == set(defaults)
+    for key in required:
+        assert re.search(rf'^# {key} = ', text, re.M), f"[{name}] {key} (no default) is not listed in {DEFAULTS}"
     for key, value in table.items():
         if isinstance(value, float) or isinstance(defaults[key], float):
             assert value == pytest.approx(defaults[key]), key

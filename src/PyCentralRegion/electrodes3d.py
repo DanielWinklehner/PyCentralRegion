@@ -14,8 +14,8 @@ them with gmsh, and returns an ``ElectrodeModel`` that
     so a dee that is lower / narrower toward the center is one radial profile
     each (``HeightProfiles``). Inside the crop a dee is normally TWO plates
     (they join only beyond the crop). Optional edge BARS: aperture-closing
-    walls along an interval of a gap chain (the IBA-style tip bars that keep
-    the fringe field out of the dee between beam crossings).
+    walls along an interval of a gap chain (tip bars that keep the fringe
+    field out of the dee between beam crossings).
   * GROUND: hill wedges with the hill gap h_g(r), the scroll / central post as
     a full-height solid, grounded POSTS (vertical cylinders), and the valley
     ROOF (liner / valley floor at +-valley_height/2) over everything that is
@@ -97,8 +97,8 @@ class HeightProfiles:
     r_cut: float = 0.250
 
     @classmethod
-    def iba(cls, r_cut: float = 0.250, z_cut: float = 0.060) -> 'HeightProfiles':
-        """The IBA PDR cavity center as measured on the COMSOL vacuum CAD
+    def reference_cavity(cls, r_cut: float = 0.250, z_cut: float = 0.060) -> 'HeightProfiles':
+        """A four-dee cavity centre as measured on its COMSOL vacuum CAD
         (dee aperture 26 -> 50 mm, dee height 66 -> 90 mm, hill gap 34 -> 48
         mm between r ~ 0.15 and 0.25 m, valley floors at +-55 mm)."""
         return cls(dee_aperture=np.array([[0.00, 0.026], [0.148, 0.026], [0.247, 0.050], [1.0, 0.050]]),
@@ -441,7 +441,7 @@ def auto_bars(model2d: ElectrodeModel, design_or_cavities, trajectory,
               tip: bool = True, ground: bool = True, tip_width: float = 0.003,
               beam_halfwidth: float = 0.0, margin_inner: Optional[float] = None,
               min_length: Optional[float] = None) -> List[Bar]:
-    """Bars between the beam crossings, IBA style, from a reference trajectory.
+    """Bars between the beam crossings, from a reference trajectory.
 
     A bar goes on every interval of a gap chain (dee wedges and, with
     ``ground``, hill wedges) that stays farther than ``margin + beam_halfwidth``

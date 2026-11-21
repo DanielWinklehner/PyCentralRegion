@@ -39,7 +39,7 @@ from .options import GeometryConfig, channel_height_mm
 MM = 1000.0                 # metres -> millimetres
 
 OPT = GeometryConfig()      # the options of the current build: configure() sets them
-MACHINE = MachineConfig()
+MACHINE = None             # [machine] of the current build: configure() sets it (a machine has no defaults)
 INFLECTOR = InflectorConfig()
 EXIT_SPEC_FILE = ''
 _EXIT_SPEC = {}
@@ -58,9 +58,15 @@ def configure(geometry: GeometryConfig = None, machine: MachineConfig = None, in
     ``exit_plane_spec_file`` overrides geometry.exit_plane_spec_file (``build`` resolves its default from the housing
     outline's folder). Refused, changing nothing: a machine the builder does not model (``machine.check_supported``)
     and a geometry.r_max_mm beyond the cavity radius the gap lines end at (the dees would stop short of the model's
-    edge)."""
+    edge). Called without arguments it goes back to the unconfigured state (the default options, no machine)."""
     global OPT, MACHINE, INFLECTOR, EXIT_SPEC_FILE
-    geometry, machine = geometry or GeometryConfig(), machine or MachineConfig()
+    if geometry is None and machine is None and inflector is None and exit_plane_spec_file is None:
+        OPT, MACHINE, INFLECTOR, EXIT_SPEC_FILE = GeometryConfig(), None, InflectorConfig(), ''
+        _EXIT_SPEC.clear()
+        return
+    if not isinstance(machine, MachineConfig):
+        raise ConfigError("the electrode builder needs the run's [machine] (a MachineConfig): a machine has no defaults")
+    geometry = geometry or GeometryConfig()
     check_supported(machine)
     if geometry.r_max_mm > float(machine.r_max_cavity_m) * MM + 1e-9:
         raise ConfigError(f"geometry.r_max_mm = {geometry.r_max_mm:g} mm lies beyond [machine] r_max_cavity_m = "
@@ -329,7 +335,7 @@ def exit_radius_mm(ol: dict) -> float:
 def centre_exit_aperture(ol: dict) -> dict:
     """The housing outline with its exit aperture centred on the median plane (geometry.exit_opening = 'centred').
 
-    The export puts the opening where the beam leaves the inflector, which is not on z = 0 (v6r60o_c1: a ring of
+    The export puts the opening where the beam leaves the inflector, which is not on z = 0 (in one export a ring of
     R 10 mm centred at z = -0.76 mm), and that one opening is all that keeps these electrodes from being mirror
     symmetric about the median plane. Centred, the opening keeps the exit half height h (the largest |z| the exported
     one reaches), so it contains the exported opening and the channel bounds stay what they were: a round ring keeps
@@ -2387,8 +2393,15 @@ def _build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: 
     if brick is not None and star:
         say("housing solid (star: merged into the ground after the channel cut, exit opening cut after that)")
     elif brick is not None:
-        ch_s = _occ_polygon(occ, brick['near'][:, :2], 0.0)
-        occ.remove([(2, ch_s)], recursive=True)
+        # the design deck made (and dropped) the channel's median-plane footprint here; kept because OCC numbers what
+        # follows after it, but only where it is a polygon: an emitting plane that stands exactly vertical (a generated
+        # hand-off; an export's is tilted by its levelling residual) has a line for a footprint
+        near_xy = np.asarray(brick['near'], dtype=float)[:, :2]
+        nxt = np.roll(near_xy, -1, axis=0)
+        if np.linalg.norm(nxt - near_xy, axis=1).min() > 1e-9 and \
+                abs(float(np.sum(near_xy[:, 0] * nxt[:, 1] - nxt[:, 0] * near_xy[:, 1]))) > 1e-12:
+            ch_s = _occ_polygon(occ, near_xy, 0.0)
+            occ.remove([(2, ch_s)], recursive=True)
 
         def recess():
             # the prism starts `back` mm upstream of the emitting plane (see beam_channel); any polygon (a round exit

@@ -16,6 +16,23 @@ its dataclass (imported only when asked for, so this module needs nothing beyond
 Paths: in the ``[paths]`` section, and for any key ending in ``_path``, ``_dir`` or ``_file`` anywhere, a relative
 path is taken relative to the file that sets it. An empty string means "not given".
 
+Roots: a string of a run file (an include, a path, an override value) may name a disk root, ``${name}/...``, so that a
+run file names no drive and runs unchanged on another computer. The roots are this computer's, in its paths file, the
+format every package of the chain reads (``configs/examples/paths.example.toml``)::
+
+    [roots]                       # absolute paths; TOML literal strings keep Windows backslashes as they are
+    inputs = 'E:\\data'
+    work = '/mnt/results'
+
+The paths file is the first of: ``load(paths_file=)`` (``pcr --paths FILE``), the environment variables
+``MACHINE_PATHS`` and ``PYCENTRALREGION_PATHS``, ``~/.config/pycentralregion/paths.toml``. It is read only when a run
+file names a root; an unknown name is an error that says which file was read (or where the search looked). ``$$`` is a
+literal ``$``; a string with a root is normalised for the platform after the substitution. Tables other than
+``[roots]`` belong to people (``[meta]``) or to other packages and are ignored. One root is built in: ``${pcr}``, the
+PyCentralRegion source tree this module is part of, so that run files kept elsewhere include its defaults as
+``include = ["${pcr}/configs/defaults/core.toml"]``. A path without a root works as before (absolute, or relative to
+its file), so run files written with drive letters keep loading.
+
 What the stages share to write values and files out lives here too: ``toml_value`` (the TOML literal that
 ``parse_override`` reads back), ``write_atomic`` (a file written whole under its temporary name ``part_path``, then
 renamed by ``commit_part``) and the JSON conversions of numpy values ``json_default`` and ``json_clean``.
@@ -26,12 +43,17 @@ import importlib
 import json
 import math
 import os
+import re
 import sys
 import tomllib
 import typing
 from pathlib import Path
 
 PATH_SUFFIXES = ('_path', '_dir', '_file')
+PATHS_ENV = ('MACHINE_PATHS', 'PYCENTRALREGION_PATHS')            # this computer's paths file, in this order ...
+PATHS_FILE = Path.home() / '.config' / 'pycentralregion' / 'paths.toml'   # ... else this one
+ROOT_REF = re.compile(r'\$(?:(\$)|\{([A-Za-z_][A-Za-z0-9_]*)\}|(\{[^}]*\}?))')   # $$ | ${name} | a malformed ${...}
+BUILTIN_ROOTS = ('pcr',)
 
 # section name -> 'module:Class' of its dataclass
 SECTIONS = {
@@ -57,33 +79,147 @@ class ConfigError(ValueError):
 
 # ---------------------------------------------------------------------------------------------------------------------
 # loading
-def load(path, overrides=()):
-    """Read a TOML run file (with its includes) and apply ``key=value`` overrides. Returns a plain nested dict."""
+def load(path, overrides=(), paths_file=None):
+    """Read a TOML run file (with its includes) and apply ``key=value`` overrides. Returns a plain nested dict.
+    ``${name}`` roots come from ``paths_file``, else from this computer's paths file (see the module docstring)."""
     path = Path(path).resolve()
-    cfg = _load_file(path, ())
+    roots = Roots(paths_file)
+    cfg = _load_file(path, (), roots)
     for item in overrides:
         keys, value = parse_override(item)
-        set_dotted(cfg, keys, value)
+        set_dotted(cfg, keys, roots.expand(value, f"override {item!r}"))
     cfg['_source'] = str(path)
     return cfg
 
 
-def _load_file(path, seen):
+def use_paths_file(path):
+    """Make ``path`` this process's paths file (``pcr --paths``), and that of the processes it starts: it becomes
+    ``MACHINE_PATHS``, the first place the search looks."""
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise ConfigError(f"--paths {path}: no such file")
+    os.environ[PATHS_ENV[0]] = str(path)
+    return path
+
+
+def find_paths_file(paths_file=None):
+    """This computer's paths file: (path or None, the places looked at, in order)."""
+    if paths_file:
+        return Path(paths_file).expanduser(), [f"paths_file={paths_file}"]
+    looked = []
+    for var in PATHS_ENV:
+        value = os.environ.get(var, '')
+        looked.append(f"${var}" + (f" = {value}" if value else " (not set)"))
+        if value:
+            return Path(value).expanduser(), looked
+    looked.append(str(PATHS_FILE))
+    return (PATHS_FILE, looked) if PATHS_FILE.is_file() else (None, looked)
+
+
+def _load_file(path, seen, roots=None):
     if path in seen:
         raise ConfigError(f"include loop: {' -> '.join(map(str, seen + (path,)))}")
+    roots = roots or Roots()
     with open(path, 'rb') as fh:
         try:
             data = tomllib.load(fh)
         except tomllib.TOMLDecodeError as ex:
             raise ConfigError(f"{path}: {ex}") from None
+    data = roots.expand(data, str(path))
     _resolve_paths(data, path.parent, in_paths=False)
     includes = data.pop('include', [])
     if isinstance(includes, str):
         includes = [includes]
     base = {}
     for inc in includes:
-        base = merge(base, _load_file((path.parent / inc).resolve(), seen + (path,)))
+        base = merge(base, _load_file((path.parent / inc).resolve(), seen + (path,), roots))
     return merge(base, data)
+
+
+def source_tree():
+    """The PyCentralRegion source tree this module belongs to (the ``${pcr}`` root): the folder that holds ``src/``
+    and ``configs/``. None for an installed copy, which carries no ``configs/``."""
+    root = Path(__file__).resolve().parents[2]
+    return root if (root / 'configs' / 'defaults').is_dir() else None
+
+
+class Roots:
+    """The ``${name}`` roots of run files: the built-in ``pcr`` (``source_tree``) and the ``[roots]`` table of this
+    computer's paths file (``find_paths_file``), read when a run file first names a root it must hold. Roots are
+    absolute paths (after ``~``); they are not checked for existence here."""
+
+    def __init__(self, paths_file=None):
+        self.paths_file = paths_file
+        self.file = None
+        self._table = None
+
+    def table(self, where=''):
+        if self._table is None:
+            self.file, looked = find_paths_file(self.paths_file)
+            if self.file is None or not self.file.is_file():
+                raise ConfigError(f"{where}: names a root, but " + (
+                    f"the paths file {self.file} does not exist" if self.file is not None else
+                    "no paths file was found (looked at: " + '; '.join(looked) + ")") +
+                    ". A paths file maps root names to this computer's folders, [roots] name = 'absolute path' "
+                    "(configs/examples/paths.example.toml): pass it with pcr --paths FILE or set MACHINE_PATHS")
+            try:
+                data = tomllib.loads(self.file.read_text(encoding='utf-8'))
+            except tomllib.TOMLDecodeError as ex:
+                raise ConfigError(f"{self.file}: {ex}") from None
+            loose = sorted(k for k, v in data.items() if not isinstance(v, dict))
+            if loose:
+                raise ConfigError(f"{self.file}: {', '.join(loose)} at the top level; a paths file holds [roots] "
+                                  f"(and tables named after a package, for that package)")
+            table = data.get('roots', {})
+            bad = sorted(k for k, v in table.items() if not isinstance(v, str) or not v or '${' in v
+                         or not Path(os.path.expanduser(v)).is_absolute())
+            if bad:
+                raise ConfigError(f"{self.file}: [roots] {', '.join(bad)}: a root is an absolute path (after ~), "
+                                  f"not empty and naming no other root")
+            clash = sorted(set(table) & set(BUILTIN_ROOTS))
+            if clash:
+                raise ConfigError(f"{self.file}: [roots] {', '.join(clash)} is built in and cannot be redefined")
+            self._table = {k: os.path.expanduser(v) for k, v in table.items()}
+        return self._table
+
+    def get(self, name, where=''):
+        if name == 'pcr':
+            root = source_tree()
+            if root is None:
+                raise ConfigError(f"{where}: ${{pcr}} is the PyCentralRegion source tree, but this copy of the package "
+                                  f"({Path(__file__).resolve().parent}) has no configs/ beside it: use a checkout "
+                                  f"(PYTHONPATH=<checkout>/src or pip install -e)")
+            return str(root)
+        table = self.table(where)
+        if name not in table:
+            raise ConfigError(f"{where}: no root {name!r} in the paths file {self.file} "
+                              f"(it has {', '.join(sorted(table)) or 'none'})")
+        return table[name]
+
+    def expand(self, value, where=''):
+        """``value`` (a string, or a dict / list of them, as TOML reads it) with every ``${name}`` replaced by its root
+        and ``$$`` by ``$``; a string that named a root is then normalised for the platform (``os.path.normpath``)."""
+        if isinstance(value, str):
+            if '$' not in value:
+                return value
+            named = []
+
+            def sub(m):
+                if m.group(1):
+                    return '$'
+                if m.group(3) is not None:
+                    raise ConfigError(f"{where}: {value!r}: '${m.group(3)}' is not a root (${{name}} with an "
+                                      f"identifier for a name; $$ for a literal $)")
+                named.append(m.group(2))
+                return self.get(m.group(2), where)
+
+            out = ROOT_REF.sub(sub, value)
+            return os.path.normpath(out) if named else out
+        if isinstance(value, dict):
+            return {k: self.expand(v, where) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self.expand(v, where) for v in value]
+        return value
 
 
 def _resolve_paths(node, folder, in_paths):
@@ -208,6 +344,11 @@ def from_dict(cls, data, where=''):
     unknown = sorted(set(data) - set(fields))
     if unknown:
         raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}; known: {', '.join(fields)}")
+    missing = [n for n, f in fields.items() if n not in data and _default_of(f) is dataclasses.MISSING]
+    if missing:
+        raise ConfigError(f"{where}: {', '.join(missing)} not set; these keys have no default"
+                          + (" (the machine's properties: set them in the machine file the run includes, see "
+                             "docs/machine.md)" if cls is MachineConfig else ""))
     hints = typing.get_type_hints(cls)
     kwargs = {}
     for name, value in data.items():
@@ -364,24 +505,26 @@ class PathsConfig:
 
 @dataclasses.dataclass
 class MachineConfig:
-    species: str = 'H2_1+'           # PyPATools species name
-    harmonic: int = 4                # RF harmonic h
-    n_dees: int = 4                  # dees (4-fold symmetric machines are supported)
-    dee_shape: str = 'radial'        # 'radial' (gap lines from straight segments); 'spiral' is not supported yet
-    dee_center_angles_deg: tuple = (45.0, 135.0, 225.0, 315.0)
-    dee_opening_deg: float = 42.0    # angular width of every dee
-    dee_voltage_kv: float = 65.0     # dee voltage the electrode model is built (and the BEM normalised) at
-    design_voltage_kv: float = 60.0  # dee voltage of the 1D gap model the seed geometry was optimized with
-    gap_width_m: float = 0.01        # nominal gap width of the dee-system template
-    gap_angle_deg: float = 2.5       # gap width law: max(gap_width_min, r * gap_angle)
-    gap_width_min_m: float = 6.5e-3
-    r_min_m: float = 0.005           # inner end of the gap lines
-    r_max_cavity_m: float = 0.37     # outer end of the gap lines
-    r_max_m: float = 0.38            # tracking: particles beyond this radius are lost
-    z_max_m: float = 0.030           # tracking: particles beyond |z| are lost
-    target_energy_mev: float = 3.0   # tracking: a run ends at the turn its reference reaches it (see [track])
-    n_turns_design: int = 6          # turns of the seed optimization (rebuilds its dee system)
-    skip_turns_design: int = 1
+    """The machine's properties. None has a default: a run sets every one, usually in a machine file its designs
+    include (docs/machine.md); a missing one is a ConfigError naming it."""
+    species: str                     # PyPATools species name
+    harmonic: int                    # RF harmonic h
+    n_dees: int                      # dees (4-fold symmetric machines are supported)
+    dee_shape: str                   # 'radial' (gap lines from straight segments); 'spiral' is not supported yet
+    dee_center_angles_deg: tuple     # azimuth of every dee's centre line [deg]
+    dee_opening_deg: float           # angular width of every dee
+    dee_voltage_kv: float            # dee voltage the electrode model is built (and the BEM normalised) at
+    design_voltage_kv: float         # dee voltage of the 1D gap model the seed geometry was optimized with
+    gap_width_m: float               # nominal gap width of the dee-system template
+    gap_angle_deg: float             # gap width law: max(gap_width_min, r * gap_angle)
+    gap_width_min_m: float
+    r_min_m: float                   # inner end of the gap lines
+    r_max_cavity_m: float            # outer end of the gap lines
+    r_max_m: float                   # tracking: particles beyond this radius are lost
+    z_max_m: float                   # tracking: particles beyond |z| are lost
+    target_energy_mev: float         # tracking: a run ends at the turn its reference reaches it (see [track])
+    n_turns_design: int              # turns of the seed optimization (rebuilds its dee system)
+    skip_turns_design: int
 
 
 @dataclasses.dataclass

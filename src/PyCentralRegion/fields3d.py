@@ -137,7 +137,7 @@ def field_from_crop(crop: dict, scaling: float = 1.0, label: str = '3D map', bac
 # ============================================================================
 def load_rf_quarter_map(path, r_max: float, cache: Optional[os.PathLike] = None, n_xy: int = 1264, n_z: int = 31,
                         spacing: float = 0.002, z0: float = -0.030, verbose: bool = True) -> dict:
-    """The IBA cavity eigenmode export: 1264 x 1264 x 31 nodes, x fastest then
+    """A cavity eigenmode export of this layout: 1264 x 1264 x 31 nodes, x fastest then
     y then z, x = y = 0..2526 mm, z = -30..30 mm at 2 mm, columns Ex Ey Ez
     (arbitrary amplitude), NaN in metal. Cropped to x, y <= r_max [m]
     (arrays (nx, ny, nz)) and cached as npz when ``cache`` is given."""

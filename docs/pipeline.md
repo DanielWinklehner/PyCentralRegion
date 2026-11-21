@@ -27,7 +27,7 @@ include = ["machine.toml"]          # relative to this file; the including file 
 
 [run]
 name = "my_design"
-out_dir = "E:/results/my_design"
+out_dir = "${work}/my_design"          # ${work}: a root of this computer's paths file
 
 [paths]
 seed = "optimized_cavity_geometry.pkl"   # relative paths: relative to the file that sets them
@@ -49,6 +49,11 @@ phases_deg = [-15.0]
   `pcr evaluate` into `result.json`.
 - Paths: everything in `[paths]`, and any key ending in `_path`, `_dir` or `_file` (also inside arrays of tables), is
   resolved relative to the file that sets it. `""` means "not given".
+- Roots: `${name}` in any string is a disk root of this computer, read from its paths file (`[roots]`, absolute
+  paths; `configs/examples/paths.example.toml`). The file is `--paths FILE`, else `$MACHINE_PATHS`, else
+  `$PYCENTRALREGION_PATHS`, else `~/.config/pycentralregion/paths.toml`; `${pcr}` is the package's source tree
+  and `$$` a literal `$`. Run files that use no root need no paths file, and absolute paths work as before.
+  Keeping the drive letters in one file per computer lets the same run files run on every computer.
 - No stage reads an environment variable.
 - Full speed on Windows (`run.full_speed = true`, the default; `mobo.full_speed` for the campaign driver). Windows 11
   manages the speed of every process that does not ask otherwise. A process without a visible window (a campaign
@@ -57,13 +62,13 @@ phases_deg = [-15.0]
   at about half the speed. Each `pcr` command therefore opts its process out once its run file is read
   (`process.keep_full_speed`: `SetProcessInformation(ProcessPowerThrottling)`, the priority class untouched).
   Measured 2026-11-14 on an 8 P + 12 E core desktop, the same search-fidelity tracked run: 25 s from a shell with a
-  window, 47 s detached, 22 s detached with the opt-out. Every campaign before that day ran detached without it: the
-  same evaluation of a new geometry took 708 s in its campaign and 364 s from a shell, with the same scores
-  (`F:\HCHC1.5\Results\CR\mobo\dee_field_speedup_2026-11-13\tracking\ctx`). A script of your own that runs detached
-  calls `PyCentralRegion.process.keep_full_speed()` first.
+  window, 47 s detached, 22 s detached with the opt-out; a whole evaluation of a new geometry took 708 s detached
+  without it and 364 s from a shell, with the same scores. A script of your own that runs detached calls
+  `PyCentralRegion.process.keep_full_speed()` first.
 
-Worked example: `configs/examples/hchc1p5/` (`machine.toml` is the machine, `design_wnop3_rotn3_g0ap.toml` one design
-whose cached model and fields are on disk).
+Worked example: `configs/examples/demo/` (`machine.toml` is the machine, `design.toml` one design, `campaign.toml` a
+campaign over it). `python -m PyCentralRegion.demo` generates its inputs; setting up a machine of your own:
+[machine.md](machine.md).
 
 ## Stages
 
@@ -91,7 +96,8 @@ anything is written.
   particles feel the field up to the surface. A solid that is not closed is left out of this mask where a vertical
   line crosses it an odd number of times, with a warning and the count in the cache (`stack['odd_columns']`): those
   nodes keep their BEM values, which no point in vacuum reads.
-- The cache keeps the layout of the design deck's `bunch_fields3d<tag>.pkl`, so deck caches track here unchanged. It
+- The cache keeps the layout of the original design scripts' `bunch_fields3d<tag>.pkl`, so their caches track here
+  unchanged. It
   holds the model, not a metal test: the tracker builds its own (`track.obstacles`).
 - Solver choices: `fields.solver` (auto | cupy | scipy | strong | dense), potentials on the GPU in single precision
   with `fields.pot_check` points re-evaluated in double precision.
@@ -116,20 +122,20 @@ anything is written.
 #### Mirror symmetry and the three `[geometry]` options that use it
 
 The electrodes are mirror symmetric about the median plane but for one feature, the spiral-inflector housing's exit
-opening, which the export puts where the beam leaves (v6r60o_c1: a ring of R 10 mm centred at z = -0.76 mm, swept
-0.82 deg downward). Three options, all off by default, make the field build cheap; `design_v6o_c1_mirror.toml` in the
-worked example sets them:
+opening, which the export puts where the beam leaves (in one export a ring of R 10 mm centred at z = -0.76 mm, swept
+0.82 deg downward). Three options, all off by default, make the field build cheap; a design file sets them in its
+`[geometry]`:
 
 | `[geometry]` | what it does | what it changes |
 |---|---|---|
-| `exit_opening = "centred"` | the opening on the median plane, with the exported one's exit half height (R 10.76 mm here, so it contains the exported opening and the channel bounds stay), swept level | the model: the larger opening no longer clips the top of the bunch. Design 0140, search fidelity: 136 more of 10,000 particles leave the housing, 53 more reach the end, 6.658 mA instead of 6.614 mA |
+| `exit_opening = "centred"` | the opening on the median plane, with the exported one's exit half height (R 10.76 mm in that export, so it contains the exported opening and the channel bounds stay), swept level | the model: the larger opening no longer clips the top of the bunch. On the design measured below, at the search fidelity: 136 more of 10,000 particles leave the housing, 53 more reach the end |
 | `mirror_mesh = true` | the build cuts every electrode at z = 0 (after checking that its upper half holds half its volume and that its centre of mass lies on the plane), meshes the upper half and mirrors it; `<prefix>.step` stays the whole CAD, `<prefix>.msh` is the upper half | the triangulation only (the lower half's is the mirror image of the upper's instead of gmsh's own); needs `exit_opening = "centred"` and windows / holes centred on the plane |
 | `lc_far_mm = 32.0` | the faces far above and below the channel are meshed up to that size, growing over \|z\| = `lc_far_z0_mm` .. `lc_far_z1_mm` (34 .. 48 mm) | about 30 % fewer triangles; the field in the channel changes by 2e-4 (midplane) to 1.6e-3 (2-6 mm from a plate), median; the tracked result by 0 to 1 particle in 10,000 |
 
 A campaign switches them on in its design file from its first evaluation on: they change the model, and a model
 built without `mirror_mesh` is not mirror symmetric as a mesh, so it keeps the whole-mesh path.
 
-Measured 2026-11-14 on design 0140's geometry of campaign_v6r60o_c1 with its 20 posts, every stage a process of its
+Measured 2026-11-14 on one design's geometry with 20 posts, every stage a process of its
 own started from one shell, the old code being the commit before these changes (seconds; the fields stage also
 builds the metal columns, checks the seed orbit and writes the cache):
 
@@ -143,16 +149,16 @@ builds the metal columns, checks the seed orbit and writes the cache):
 | bare model, new code | 40,322 / 40,322 | 9.5 | 7.7 (GPU, 56 products) | 11 | 37 |
 | bare model, the three options | 26,416 / 13,208 | 3.4 | 3.7 (LU) | 5 | 19 |
 
-The same run tracked through each field (final current of the injected 8.25 mA):
+The same run tracked through each field (transmission to the end):
 
 | model | search fidelity (10,000 particles) | verification fidelity (100,625 particles) |
 |---|---|---|
-| the campaign's own record | 80.160 %, 6.6144 mA | 79.025 %, 6.5208 mA |
-| new code, the same model | 80.160 %, 6.6144 mA (the field cache is the campaign's bit for bit) | 79.025 %, 6.5208 mA |
-| centred opening, mirrored mesh | 80.690 %, 6.6582 mA | 79.707 %, 6.5770 mA |
-| ... and coarse far faces | 80.690 %, 6.6582 mA (1 particle differs in turns 3-6) | 79.719 %, 6.5780 mA (12 particles more) |
+| the campaign's own record | 80.160 % | 79.025 % |
+| new code, the same model | 80.160 % (the field cache is the campaign's bit for bit) | 79.025 % |
+| centred opening, mirrored mesh | 80.690 % | 79.707 % |
+| ... and coarse far faces | 80.690 % (1 particle differs in turns 3-6) | 79.719 % (12 particles more) |
 
-The gain of 0.04-0.06 mA is the opening's: centred with the exported one's exit half height, it no longer clips the
+The gain of 0.5-0.7 % of the beam is the opening's: centred with the exported one's exit half height, it no longer clips the
 top of the bunch (1.4 % more particles leave the housing). A whole evaluation of a new geometry with posts in the loop
 (bare model, post rule, model with posts, search run, scores) took 364 s with the old code, 249 s with the new code on
 the same model and 180 s with the three options (`docs/mobo.md`, "Costs").
@@ -161,29 +167,23 @@ the same model and 180 s with the three options (`docs/mobo.md`, "Costs").
 
 `track.obstacles` chooses how the tracker decides that a particle is in metal:
 - `"columns"` (default): at every node of an x-y grid (`fields.stack_dxy_m`, 0.5 mm) the heights at which the vertical
-  line through it enters and leaves metal, cut from the model's triangles (`metal_columns`; 0.25 s for the worked
-  example). A point is tested in the column of its nearest node: exact in z, good to half a node spacing in x and y.
-  A model with a solid that is not closed is refused (a line crossing it an odd number of times); `"raster"` tracks
-  it. On 2026-11-02 that was two of the design deck's 127 models, both post-optimizer geometries whose ground is open
-  in one or two columns, and none of the 17 built by `pcr build`.
-- `"raster"`: the design deck's test, the solids' plane sections on z levels (`fields.stack_z_half_m`,
+  line through it enters and leaves metal, cut from the model's triangles (`metal_columns`; 0.25 s for a model of
+  40,000 triangles). A point is tested in the column of its nearest node: exact in z, good to half a node spacing in
+  x and y. A model with a solid that is not closed is refused (a line crossing it an odd number of times); `"raster"`
+  tracks it. No model built by `pcr build` has been refused so far.
+- `"raster"`: the original design scripts' test, the solids' plane sections on z levels (`fields.stack_z_half_m`,
   `fields.stack_dz_m`: 1 mm apart) tested at the nearest level, so a face acts at the half millimetre next to it: a
-  channel's full height is seen in 2 mm steps, and a face on a level acts 0.5 mm off. A deck cache (or one written
-  before 2026-11-02) carries its slices; for any other cache they are cut at the start of the run (2-5 min on the
-  worked example: 121 s on the full-chain check, 314 s in the design deck's run of the same model).
-  Use it to compare with deck runs: the regression baseline (`pcr_validation\track`) was tracked with it.
+  channel's full height is seen in 2 mm steps, and a face on a level acts 0.5 mm off. A cache of those scripts (or
+  one written before 2026-11-02) carries its slices; for any other cache they are cut at the start of the run (2-5 min
+  for a full-size model). Use it to compare with runs of those scripts.
 - `"mesh"`: the triangles themselves on the GPU (Warp BVH), with a crossing test per step. The compiled kernel
   cannot carry it, so the run takes the Python path.
 
 The plane sections (`electrodes3d.loops_from_mesh`) are cut edge by edge since 2026-11-02 and come out closed whatever
-lies in or near the plane. Before, the segment ends were chained on a 1e-6 m merge grid: where a vertex lay 1.7e-8 m
-below z = ±15 mm on the ground's nearly level taper, crossings that were not neighbours fused, and the ground's whole
-section there was dropped: the deck's slices (and the caches written until then) have no ground at those two levels,
-so they put the ground's faces on the channel's taper, at |z| = 14-15 mm for r = 113-127 mm, at ±15.5 mm, 0.5-1.5 mm
-into the metal (1.5 mm at r = 113 mm), and six more of the ground's faces near z = ±15 mm (at r = 34 and 55 mm) up to
-1.45 mm off. Elsewhere (at |z| < 29.5 mm) a face is at most half a millimetre off, but for 253 faces of slivers (146
-metal or vacuum intervals thinner than a level, at 77 nodes), at r < 100 mm and at the model's edge
-(`metal_columns_2026-11-02\check_taper_faces`).
+lies in or near the plane. Before, the segment ends were chained on a 1e-6 m merge grid: where a vertex lay a few
+1e-8 m off a level on a nearly level face, crossings that were not neighbours fused and a solid's whole section on
+that level was dropped. Slices cut before then (and the caches written until then) can lack a solid on such a level,
+which puts its faces there up to a level spacing into the metal.
 A vertex within 1e-12 m of the plane lies in it (`SECTION_Z_TOL_M`), and a face in the plane belongs to the solid
 above it: the model's faces carry rounding of either sign at their nominal heights (up to 1e-17 m), which would
 otherwise decide a cut at a face's own height (the `sections` views at 16 mm, a stack whose levels fall on faces).
@@ -214,7 +214,7 @@ the hand-off file's unless `track.sc_current_ma` is set.
 | fidelity | particles | SC grid / interval | use |
 |---|---|---|---|
 | search | 10 000 | 64³ every 5 steps | optimisation; the particle number dominates the error |
-| verification | all (~98 000) | 128³ every step | a design worth building; only z rms is grid-sensitive |
+| verification | the whole hand-off bunch | 128³ every step | a design worth building; only z rms is grid-sensitive |
 
 ### Bunch train: the neighbouring turns (opt-in)
 
@@ -239,7 +239,7 @@ other RF buckets, at other azimuths, are not there.
   do). Measured on one design: at search fidelity the mesh alone changes the turn width by -3 to -4 %, at
   verification fidelity by -0.8 % and every other score by less than 1 %.
 - **What to expect** (one design, a train of five against its control, the same at search and at verification
-  fidelity): the final current does not change (0.000 ± 0.002 mA of 6.5 mA with every particle), 0.1 % of the
+  fidelity): the final current does not change (by 0.00 ± 0.03 % of the beam with every particle), 0.1 % of the
   bunch is lost in turn 2 instead of turn 7, the bunch is 6 % longer, turn separation over turn width drops by
   1.2 %, and the vertical size grows by about 1 % averaged over a turn at unchanged emittance (3 % at one azimuth:
   the breathing of the envelope shifts, so compare turn means, not one readout).
@@ -291,7 +291,7 @@ with a solve every step, a fifth of a verification run). Two runs of the same in
 turn, losses) and to about 1e-13 m in the positions, not to the last bit: the GPU sums the deposited charge in no
 fixed order.
 
-Where the time of a tracked run goes, measured 2026-11-14 on design 0140 of campaign_v6r60o_c1 (from a shell;
+Where the time of a tracked run goes, measured 2026-11-14 on the design above (7 turns; from a shell;
 `fast_path` and `space_charge` of track.json hold the same split for every run):
 
 | | search (10,000, 64³ every 5 steps) | verification (100,625, 128³ every step) |
@@ -325,7 +325,7 @@ Outputs in `run.out_dir`:
 - `probe_<angle>deg.npz`: every crossing of every particle: position, velocity, time, pass, direction;
 - `config.json`.
 
-The layout is the deck's `bunch_simulation3d<tag>.json` / `_data.pkl`, so the analysis reads both.
+The layout is the original design scripts' `bunch_simulation3d<tag>.json` / `_data.pkl`, so the analysis reads both.
 
 ### Obstacles that cost no BEM
 
@@ -350,96 +350,22 @@ new field:
 
 ### Validation of the port
 
-Every record is in `E:\HCHC1.5\Results\CR\pcr_validation\`.
+The package replaces a set of machine-specific design scripts (the design deck). On one of that machine's designs:
+- `pcr build` builds the deck's model bit for bit: the same vertices, triangles and potentials, a byte-identical
+  `.msh`, and a `.step` that differs only in its header's time stamp (this needs the deck's gap-width floor exactly as
+  it computed it, `6.5 * 1e-3`; a rounded value gives the same metal with a few ground triangles meshed differently).
+- `pcr track` reproduces the deck's tracking particle for particle on the same cached fields: bit-identical without
+  space charge and with it on the CPU (4000 particles, 64³ every 5 steps); on the GPU the same fates, tracks and probe
+  crossings, positions within 1e-13 m (the GPU sums the deposited charge in no fixed order).
+- `pcr score` gives the deck's scores exactly, but for the halo and vortex-prediction keys (at most 1.5e-4
+  relative): the port uses the exact core-variance factor, 0.842330 for `score.core_q` = 0.95, where the deck used
+  0.8423.
+- The column metal test (the default since 2026-11-02) against the deck's slices, on the same fields: the runs are the
+  same until the two tests first stop a particle differently; at the campaign's two fidelities the columns then let
+  0.4-0.5 % more of the beam through, because the slices put level faces half a millimetre off (most of the
+  difference at the channel's upper outer face).
 
-`pcr build` replaces the design deck's electrode builder. The worked example's `design_wnop3_rotn3_g0ap.toml` builds
-the deck's 2026-10-31 model bit for bit (`geometry\`): the same vertices, triangles and potentials (20,974 nodes,
-41,936 triangles), a byte-identical `.msh`, and a `.step` that differs only in its header's time stamp. The build takes
-17-18 s. This needs the deck's gap-width floor 6.5 * 1e-3 = 0.006500000000000001 m, which the example's
-`machine.toml` sets; 0.0065 gives the same metal with 8 more ground triangles.
-
-`pcr score` replaces the run scoring of 2026-11-01 (`analysis\`): on the every-particle run of the design (`p128`),
-T, I_final (4.0239 mA), valley_all, ratio, E_med, dE_E_robust, turn_sigR, W_eff and ratio_t3 equal the original
-scores exactly; the halo and vortex-prediction keys differ by at most 1.5e-4 relative, because the port uses the
-exact core-variance factor (0.842330 for `score.core_q` = 0.95) where the campaign used 0.8423.
-
-`pcr track` replaces the design deck's 3D tracking script. On the deck's cached `_wnop3_rotn3_g0ap` fields at -15 deg
-it reproduces the deck particle for particle (records and scripts in `track\`):
-
-| run | agreement | T, final current |
-|---|---|---|
-| no SC, every particle | bit-identical | 55.22 % = 4.436 mA |
-| 4000 particles, SC 64³ / 5, CPU | bit-identical | 49.43 % = 3.970 mA |
-| the same on the GPU | same fates, positions within 9e-14 m | 49.43 % = 3.970 mA |
-| every particle, SC 128³ / 1, GPU | same fates, tracks and probe crossings; within 5e-14 m | 50.09 % = 4.024 mA |
-
-The port's verification run took 429 s, the deck's 510 s.
-
-These runs used the deck's slices, `track.obstacles = "raster"` since the column test became the default
-(2026-11-02); set it to repeat them. With the slices of the deck's cache, the code of 2026-11-02 (commit 5f09492)
-tracks the runs of the commit before it array for array, at 200 and at 2000 particles without space charge, and the
-4000-particle CPU run of the table above with space charge (`metal_columns_2026-11-02\`; the 2000- and
-4000-particle runs tracked again at 5f09492 itself, `check_rerun_5f09492`). Only the wall and space-charge solve
-times, the stored outlines and the records the older code did not write differ. The model's sections in
-`track_data.pkl` are the same lines, their points in another order and with the points back that the merge grid had
-fused (up to 0.34 µm off its lines), and the ground's section at z = 15 mm is now present; the inflector housing's
-outline is the same, traced the other way round. The new records are `fields.metal_test` and, against the run of
-2026-11-01, `fast_path`, `tracks.handoff_ids`, `stop_at_target_energy` and the trim's `amplitude_cos_t` /
-`amplitude_sin_t`.
-The column test gives the same run on the Python path and in the compiled kernel, bit for bit.
-
-The column test against the slices, 7 turns at -15°, on the same fields, every column run at 5f09492 (the CPU ones
-tracked again with it, array for array):
-
-| run | slices | columns |
-|---|---|---|
-| no SC, 200 particles | 55.50 % = 4.458 mA | 55.50 % = 4.458 mA |
-| no SC, 2000 particles | 54.55 % = 4.382 mA | 55.25 % = 4.438 mA |
-| SC 64³ / 5 on the CPU, 4000 particles | 49.43 % = 3.970 mA | 49.43 % = 3.970 mA |
-| SC 64³ / 5 on the GPU, 10 000 particles (the MOBO search fidelity) | 50.40 % = 4.049 mA | 50.79 % = 4.080 mA |
-| SC 128³ / 1 on the GPU, every particle (the MOBO verify fidelity) | 50.09 % = 4.024 mA | 50.57 % = 4.063 mA |
-
-The slices put both channel faces half a millimetre low, at -13.5 / +12.5 mm inside r = 100 mm and -16.5 / +15.5 mm
-beyond 140 mm, where the columns see the model's ±13 and ±16 mm. Of the 2000 particles without space charge, 17 are
-stopped only by the slices, 16 of them between z = 15.5 and 16 mm, and 3 only by the columns, at z = -16.0 mm. In the
-4000-particle CPU run with space charge 22 and 22 are, nearly all at the same two faces: the same transmission in
-that run, other particles; at the rates of the GPU runs below, 27-32 and 11-13 would be expected there.
-
-At the campaign's two fidelities, search and verify, the column runs (`metal_columns_2026-11-02\gpu\`) track the same
-particles over the same steps (7090 and 7138) as the slice runs, the first pilot's warm start and the full-chain check,
-both tracked at commit 18c4695 and stopped at 3 MeV, after those steps (the full-chain check on its rebuilt model and
-fields, equal to the deck's array for array). Up to the first stops that differ (steps 25 and 59) the two runs of a
-pair are the same run: the particles alive in both hold the same records bit for bit through step 28 and 60
-(`check_loss_history`), so the code of the two commits tracks them alike until the tests part them; with the slices,
-the 4000-particle CPU run above is that of 2026-11-01 array for array. The slices stop 67 and 787 particles that the
-columns let through: 64 and 750 at the upper outer face (+16 mm, which they put at +15.5), the rest on faces that are
-not level, which the slices put at the half level between the two levels nearest to them, here 0.13-0.50 mm into the
-vacuum: the channel's taper (these stops at r = 135-140 mm) and faces of dee 0 and the ground near r = 75 mm,
-|z| = 8-10 mm. The columns stop 28 and 316 that the slices let through, all at the lower faces (-16 and -13 mm, which
-the slices put at -16.5 and -13.5) but for one verify stop on the taper (-15.37 mm, which they put at -15.5). The
-survivors differ by the balance, 39 and 471 (5079 against 5040, 49 538 against 49 067), of which the level faces
-account for a net 36 and 435 (64 - 28 and 750 - 315; `check_one_test_stops`, `check_band_faces`).
-
-Every particle that one test alone stops is stopped where the other test reads vacuum, a median 0.004 mm past the
-stopping test's face. The two runs' paths part a little: with space charge every particle feels the others, and the
-runs lose a particle at different steps from step 25 (search) and 59 (verify) on, near the hand-off. Of the particles
-both runs lose, 3091 and 30 524 are lost at different steps, a median 17 steps apart, nearly all of them stopped first
-by one test where the other reads vacuum. Among them are the 87 and 932 that the columns stop nearest the ±15 mm
-level, where the deck's slices lack the ground there (with it they would read metal at those stops), 83 and 907 of
-them on the channel's taper (these stops at r = 117-127 mm), where the slices put the ground's faces 0.5-1.2 mm into
-the metal; the slices stop all of them too, a median 17 steps later. On the same faces the columns stop another 61 and
-604 nearest the ±14 mm level (r = 113-120 mm), where the slices put the faces 1.0-1.5 mm into the metal (1.5 mm at
-r = 113 mm, where the taper's face is at |z| = 14 mm; "The metal test", `check_taper_faces`), a millimetre further
-than they would with the ground, and read vacuum there, with the ground or without; the slices stop these a median 25
-and 23 steps later, and all 144 and 1511 a median 19. By the end of the run the paths are a median 0.04 and 0.05 mm
-apart. Of the particles one test alone stops that both runs track (95 and 233), the other run's particle reaches the
-stopping test's metal in the same half vertical oscillation in 91 and 215 cases (74 and 168 within 4 steps of the
-stop), a median 0.2 mm deep, where its own test reads vacuum. The other 4 and 18 stay short of it, 21 of them by
-0.006-0.14 mm and one by 0.0003 mm, which the records still resolve: interpolated from every other record, that path
-is 0.00017 mm off next to its closest approach, so from all of them about 0.00002 mm (0.00009 mm even if the error
-only fell as the spacing, and on that assumption 0.00014 mm from how far the closest approach itself moves when every
-other record is left out; `check_band_entry_resolution`). For those 4 and 18 the other run's path, parted by the stops
-that differed earlier, decides, not the local difference between the tests (`check_loss_history`, `check_band_entry`).
-The scores move with the stops, `valley_all` and `ratio` about as much as between the two fidelities: `valley_all`
-0.0695 / 0.0691 (search / verify) with the columns against 0.0698 / 0.0694 with the slices, `ratio` 2.459 / 2.471
-against 2.446 / 2.458; `E_med` is the same to 0.2 keV (it rises 2.5-2.8 keV from search to verify).
+The detailed records, with that machine's numbers, are kept with its configurations. `tests/test_demo.py` runs the
+whole chain (build, fields, track with space charge, score) on the demo machine; a change that moves a physics result
+is checked by evaluating a design before and after it at a fixed fidelity on the CPU (`track.sc_gpu = false`, whose
+runs repeat bit for bit) and comparing the two `result.json`.

@@ -87,7 +87,7 @@ class ScoreConfig:
     twin_boot: int = 200                 # paired bootstrap resamples of the errors (0: none)
     twin_boot_seed: int = 1              # their random seed
     # operating point of a voltage x phase bunch grid (pick_operating_point)
-    pick_e_min_mev: float = 2.9          # the bunch must reach this final energy
+    pick_e_min_mev: float = 0.0          # the bunch must reach this final energy [MeV]; 0 = not set (the pick refuses)
     pick_t_tol: float = 0.005            # within this (absolute) transmission of the best, the smallest dE/E wins
     pick_v_max: float = 1.10             # cap on the dee-voltage scale (wall power grows as V^2)
 
@@ -153,8 +153,8 @@ METRICS = {
     'sig_z_2pct_az': Metric('min', 'mm', "rms height of the particles in that window"),
     'z_p95_az': Metric('min', 'mm', "95 % of |z| of the beam at the readout: what a vertical aperture sees"),
     # the vertical extent over the whole last turn (metrics.vertical_extent, its n_snapshots instants): free of the
-    # readout's waist (a breathing envelope read at one azimuth; 0107 of campaign_v6r60o_c1: z_p95_az 7.99 mm, 12.2 mm
-    # as the turn mean)
+    # readout's waist (a breathing envelope read at one azimuth; in one design z_p95_az 7.99 mm, 12.2 mm as the turn
+    # mean)
     'z_out10_last': Metric('min', '1', "share of the survivors beyond |z| = 10 mm (score.z_limit_mm) at any instant "
                                        "of the last turn: the part of the beam a +-10 mm aperture would meet"),
     'z_p95_last': Metric('min', 'mm', "95 % of |z| of the survivors, mean over the instants of the last turn"),

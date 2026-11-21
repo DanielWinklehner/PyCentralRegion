@@ -9,7 +9,7 @@ what it reads and writes, and how long it takes; `python examples/NN_name.py --h
 ## Running
 
 ```
-python examples/01_find_static_orbits.py --resources D:/path/to/inputs --out D:/path/to/results
+python examples/01_find_static_orbits.py --resources path/to/inputs --out path/to/results
 ```
 
 * `--resources DIR`: the folder with the input files below (default `<repo>/resources`). The input files are

@@ -37,8 +37,8 @@ class BTrimConfig:
     phase_deg: float = 0.0           # azimuth of the maximum [deg]
     amplitude_cos_t: float = 0.0     # the same harmonic as Cartesian components b_c cos(theta) + b_s sin(theta) [T],
     amplitude_sin_t: float = 0.0     # added to the polar part (the coordinates to optimise: no seam, one zero)
-    r_min_m: float = 0.05            # full amplitude between r_min_m and r_max_m ...
-    r_max_m: float = 0.135
+    r_min_m: float = 0.0             # full amplitude between r_min_m and r_max_m [m] (the machine's: 0 = not set, a
+    r_max_m: float = 0.0             # trim with an amplitude refuses it) ...
     edge_m: float = 0.01             # ... falling to 0 over edge_m on either side
 
 
@@ -66,7 +66,7 @@ def profile(r, bt):
     """b(r), b'(r), b''(r) [T, T/m, T/m^2] of the trim's radial profile, at the amplitude of the ``resolved`` trim."""
     if bt.edge_m <= 0 or bt.r_min_m < bt.edge_m or bt.r_max_m <= bt.r_min_m:
         raise ConfigError(f"[btrim] needs 0 < edge_m <= r_min_m < r_max_m (got edge {bt.edge_m}, r_min {bt.r_min_m}, "
-                          f"r_max {bt.r_max_m})")
+                          f"r_max {bt.r_max_m}); the radii are the machine's and have no default")
     r = np.asarray(r, dtype=float)
     e = bt.edge_m
     s1, d1, dd1 = _smoothstep((r - (bt.r_min_m - e)) / e)

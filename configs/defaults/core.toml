@@ -26,25 +26,26 @@ housing_outline = ""        # housing outline at the midplane (.txt), read by th
 model3d = ""                # 3D electrode model (.pkl); written by `pcr build`
 fields = ""                 # BEM field cache (.pkl); written by `pcr fields`
 
-[machine]
-species = "H2_1+"           # PyPATools species name
-harmonic = 4                # RF harmonic h
-n_dees = 4                  # number of dees; 4-fold symmetric machines are supported
-dee_shape = "radial"        # "radial": gap lines made of straight segments; "spiral" is not supported yet
-dee_center_angles_deg = [45.0, 135.0, 225.0, 315.0]
-dee_opening_deg = 42.0      # angular width of every dee
-dee_voltage_kv = 65.0       # dee voltage the electrode model is built (and the BEM field normalised) at
-design_voltage_kv = 60.0    # dee voltage of the 1D gap model the seed geometry was optimized with
-gap_width_m = 0.01          # nominal gap width of the dee-system template
-gap_angle_deg = 2.5         # gap width law: max(gap_width_min_m, r * gap_angle_deg)
-gap_width_min_m = 0.0065
-r_min_m = 0.005             # inner end of the gap lines
-r_max_cavity_m = 0.37       # outer end of the gap lines
-r_max_m = 0.38              # tracking: particles beyond this radius are lost
-z_max_m = 0.030             # tracking: particles beyond |z| are lost
-target_energy_mev = 3.0     # tracking: a run ends at the turn its reference reaches it (track.stop_at_target_energy)
-n_turns_design = 6          # turns of the seed optimization (used to rebuild its dee system)
-skip_turns_design = 1
+[machine]                   # the machine's properties: none has a default, every run sets them all (a machine file its
+                            # designs include: docs/machine.md); configs/examples/demo/machine.toml is one
+# species = "proton"        # PyPATools species name ("proton", "H2_1+", "4He_2+", ...)
+# harmonic = 4              # RF harmonic h
+# n_dees = 4                # number of dees; 4-fold symmetric machines are supported
+# dee_shape = "radial"      # "radial": gap lines made of straight segments; "spiral" is not supported yet
+# dee_center_angles_deg = [45.0, 135.0, 225.0, 315.0]   # azimuth of every dee's centre line
+# dee_opening_deg = 40.0    # angular width of every dee
+# dee_voltage_kv = 20.0     # dee voltage the electrode model is built (and the BEM field normalised) at
+# design_voltage_kv = 20.0  # dee voltage of the 1D gap model the seed geometry was optimized with
+# gap_width_m = 0.008       # nominal gap width of the dee-system template
+# gap_angle_deg = 2.5       # gap width law: max(gap_width_min_m, r * gap_angle_deg)
+# gap_width_min_m = 0.005
+# r_min_m = 0.005           # inner end of the gap lines
+# r_max_cavity_m = 0.13     # outer end of the gap lines
+# r_max_m = 0.14            # tracking: particles beyond this radius are lost
+# z_max_m = 0.012           # tracking: particles beyond |z| are lost
+# target_energy_mev = 0.8   # tracking: a run ends at the turn its reference reaches it (track.stop_at_target_energy)
+# n_turns_design = 6        # turns of the seed optimization (used to rebuild its dee system)
+# skip_turns_design = 1
 
 [magnet]
 sign = 1.0                  # multiplies the map (its Bz sign vs the tracker's convention)

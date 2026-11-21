@@ -17,7 +17,7 @@ legacy
     deck. The hand-off file is the one its log ``<results_dir>/logs/s4_run<tag>.log`` names ("[inflector] hand-off
     <name>.h5"), looked up in results_dir and in the folders given; the probe files are
     ``<results_dir>/probe<tag>_<a>deg.npz``. The deck records no loss limits: they come from the [machine] table the
-    loader is given (default ``config.MachineConfig``).
+    loader is given (``machine=``; the machine's properties have no defaults).
 
 The pickle's ``['final']['tracks']``: ids (N,) indices into the tracked bunch; steps (S,) the recorded step numbers;
 xyz (S, N, 3) [m] (a slot before birth or after a loss holds whatever the tracker left there); stop_step (N,) the
@@ -70,7 +70,7 @@ class RunData:
     ghost_step: Optional[np.ndarray] = None
     info: dict = field(default_factory=dict)  # the run json
     machine: dict = field(default_factory=dict)     # the [machine] table the run was tracked with: what the json
-    #                                                 does not record (metrics.machine_value: else the defaults)
+    #                                                 does not record (metrics.machine_value; no defaults)
     sc_recorded: bool = False            # the pickle's final record carries a space-charge log
     pkl_final: dict = field(default_factory=dict)   # scalars of the pickle's final record (phase, n, transmission)
     handoff: str = ''                    # hand-off file
@@ -297,8 +297,8 @@ def load_legacy_run(results_dir, tag, handoff=None, handoff_dirs=(), beam='', se
     """A run of the original design deck in results_dir. The hand-off file: the argument, else the one its log names
     (``legacy_handoff``). beam: a label or a mapping from hand-off file to label (``beam_label``). seed: the bunch's
     sampling seed (the deck records none; default the tracker's). machine: the [machine] table (a dict or a
-    ``config.MachineConfig``) for what the deck's json does not record, the loss limits above all; default the
-    MachineConfig defaults."""
+    ``config.MachineConfig``) for what the deck's json does not record, the loss limits above all (without it, scoring
+    needs them from the json)."""
     results_dir = Path(results_dir)
     js = results_dir / LEGACY_JSON.format(tag)
     info = json.loads(js.read_text()) if js.exists() else {}

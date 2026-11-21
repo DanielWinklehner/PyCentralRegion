@@ -1,16 +1,14 @@
 """MOBO driver: unit cube, config checks, store and resume (the search space fixed by the store, interrupted warm
 starts run again), the campaign lock, constraints and failures, geometry batches and cache, the geometry key (the
 designs of one flat channel share one), the samplers' pinning, process trees (time limit, Ctrl+C - also while an
-evaluation starts -, time budget, a killed driver), verify / status / dry run, the example campaigns' first
-evaluations, and a toy campaign through real subprocesses that ends near the toy's front.
+evaluation starts -, time budget, a killed driver), verify / status / dry run, the demo campaign's first evaluation,
+and a toy campaign through real subprocesses that ends near the toy's front.
 
 Tests that need optuna skip without it (the physics environment has none); the GP tests also need torch and a
 working bounded L-BFGS-B."""
-import dataclasses
 import functools
 import hashlib
 import importlib.util
-import itertools
 import json
 import math
 import os
@@ -20,7 +18,6 @@ import subprocess
 import sys
 import threading
 import time
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -33,11 +30,7 @@ from PyCentralRegion.mobo import driver, evaluate, space, store, toy
 ROOT = Path(__file__).resolve().parents[1]
 TOY = ROOT / 'configs' / 'examples' / 'toy' / 'campaign.toml'
 BASE = TOY.with_name('base.toml')
-PILOT = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_pilot.toml'
-CAMPAIGN = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_campaign.toml'
-SLIT = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_slit.toml'
-CONNECTED = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_connected.toml'
-V6O_C1 = ROOT / 'configs' / 'examples' / 'hchc1p5' / 'mobo_v6o_c1.toml'
+DEMO = ROOT / 'configs' / 'examples' / 'demo' / 'campaign.toml'
 SRC = Path(PyCentralRegion.__file__).resolve().parents[1]          # subprocesses import what the tests import
 HV_FRONT = (2.0 / 3.0) * (1.0 - (1.0 - toy.I_MAX) ** 1.5)
 # a smaller toy problem for the convergence test: the RF phase, a log-scaled trim and a continuous geometry variable
@@ -684,162 +677,22 @@ def test_verify_status_and_dry_run(tmp_path, subprocess_env, capsys):
     assert driver.main(['optimize-verify', str(TOY), *sets, '--ids', 'nope']) == 1
 
 
-def test_pilot_config_dry_run(capsys):
-    """The pilot's first evaluation (its warm start, the design as tracked) needs neither optuna nor the GPU."""
-    cfg = driver.load(PILOT)
-    if not Path(cfg.physics_python).is_file():
-        pytest.skip('the pilot names a physics interpreter of the machine it runs on')
-    assert [(v.name, v.kind) for v in cfg.variables] == [('phase', 'cheap'), ('volt', 'cheap')]   # the trim: opt-in
-    assert cfg.sampler == 'gp' and [o.metric for o in cfg.objectives] == ['I_final', 'valley_all', 'ratio']
-    assert cfg.n_startup >= 2 * len(cfg.variables) + 1
+def test_demo_campaign_dry_run(tmp_path, capsys):
+    """The demo campaign (configs/examples/demo/campaign.toml): a geometry variable and the phase, its first evaluation
+    the design as it is, built into the campaign's geometry cache. Needs neither optuna nor the generated inputs."""
+    cfg = driver.load(DEMO, [f'mobo.campaign_dir={C.toml_value(str(tmp_path / "camp"))}'])
+    assert [(v.name, v.kind) for v in cfg.variables] == [('ap_inner', 'geometry'), ('phase', 'cheap')]
+    assert [o.metric for o in cfg.objectives] == ['I_final', 'dE_E_robust']
+    assert [c.label() for c in cfg.constraints] == ['E_med>=0.75'] and cfg.n_startup >= 2 * len(cfg.variables) + 1
     camp = driver.Campaign(cfg)
-    if camp.store.log.exists():
-        pytest.skip('the pilot campaign has started')
     assert camp.dry_run() == 0
-    out = capsys.readouterr().out
-    cmd = out.strip().splitlines()[-1]                         # the command (the log above it lists the fidelities)
-    for item in ('track.phases_deg=[-15.0]', 'track.volt_scale=1.0', 'btrim.r_min_m=0.05', 'track.turns=7',
-                 'track.stop_at_target_energy=false', 'track.n_final=10000', 'track.n_tracks=10000',
-                 'PyCentralRegion.cli evaluate'):
-        assert item in cmd
-    assert 'paths.model3d' not in out and 'btrim.amplitude' not in out    # the base's own model; no trim
-
-
-def test_campaign_config_dry_run(capsys):
-    """The full campaign: five geometry variables (the channel aperture, the inflector rotation) and two cheap ones
-    (RF phase, dee voltage; the trim is opt-in), every design at its 7th turn; its first evaluation is the base design,
-    built into the campaign's geometry cache."""
-    from PyCentralRegion.geometry.options import GeometryConfig
-    if 'aperture_inner_mm' not in {f.name for f in dataclasses.fields(GeometryConfig)}:
-        pytest.skip('[geometry] has no aperture_inner_mm .. aperture_taper_length_mm yet')
-    cfg = driver.load(CAMPAIGN)
-    if not Path(cfg.physics_python).is_file():
-        pytest.skip('the campaign names a physics interpreter of the machine it runs on')
-    assert [v.kind for v in cfg.variables] == ['geometry'] * 5 + ['cheap'] * 2
-    assert cfg.n_startup >= 2 * (len(cfg.variables) + 2) + 1          # enough for the opt-in trim's two as well
-    camp = driver.Campaign(cfg)
-    if camp.store.log.exists():
-        pytest.skip('the campaign has started')
-    assert camp.dry_run() == 0
-    out = capsys.readouterr().out
-    cmd = out.strip().splitlines()[-1]                         # the command (the log above it lists the fidelities)
+    cmd = capsys.readouterr().out.strip().splitlines()[-1]
     params = camp.warm_point(0)
+    assert params == {'ap_inner': 14.0, 'phase': 35.0}
     key = space.geometry_key(camp.base(cfg.search_fidelity), cfg, params)
-    assert params['si_rot'] == pytest.approx(4.726034523988023) and 'trim_c' not in params
-    assert f"geometries/{key}/fields.pkl" in cmd and 'track.n_tracks=10000' in cmd
-    assert 'track.turns=7' in cmd and 'track.stop_at_target_energy=false' in cmd
-    assert 'btrim.amplitude' not in out                                # no trim
-
-
-def test_connected_campaign_config(tmp_path):
-    """The connected-gap-lines campaign: the dee opening, the channel and every gap line's 4 variables (gap 0: 3, it
-    starts on the exit plate) as geometry, the phase as the cheap one; 65 kV, no trim. Its 35 [geometry] variables are
-    checked at every corner of each table's own (a channel, a gap line) and at RANDOM_CORNERS random corners of their
-    box: 2^35 corners would never end."""
-    cfg = driver.load(CONNECTED)
-    names = [v.name for v in cfg.variables]
-    assert len(names) == 37 and names[0] == 'phi' and names[-1] == 'phase' and 'g0_f0' not in names
-    assert [v.kind for v in cfg.variables] == ['geometry'] * 36 + ['cheap']
-    assert all((v.low, v.high) == (-1.0, 1.0) for v in cfg.variables if v.name[-3:] in ('_f0', '_f1'))
-    assert 'track.volt_scale=1.0' in cfg.fixed and not any('btrim' in v.target for v in cfg.variables)
-    assert cfg.n_startup >= 2 * (len(cfg.variables) + 2) + 1
-    box = [v for v in cfg.variables if v.target.startswith('geometry.')]
-    corners = driver._box_corners(box)
-    assert len(corners) == 2 ** 4 + 2 ** 3 + 7 * 2 ** 4 + driver.RANDOM_CORNERS and corners == driver._box_corners(box)
-    assert len(driver._box_corners(box[:driver.FULL_CORNERS_MAX])) == 2 ** driver.FULL_CORNERS_MAX
-    if not Path(cfg.physics_python).is_file():
-        pytest.skip('the campaign names a physics interpreter of the machine it runs on')
-    camp = driver.Campaign(driver.load(CONNECTED, [f'mobo.campaign_dir={C.toml_value(str(tmp_path))}']))
-    assert camp.warm_point(1)['phi'] == 28.0 and camp.warm_point(2)['phi'] == 38.0      # (checked its overrides)
-
-
-def test_v6o_c1_campaign_config(tmp_path):
-    """The full cold-started campaign on the v6 map: the dee opening, the channel and every gap line (r1 and dr along
-    the ray, the fractions across it; gap 0 without f0) as geometry, the RF phase and the magnet level as the cheap
-    ones; 65 kV, no trim, three objectives read at 0 deg in pass 7. Its base places posts by rule, and its base gap
-    lines lie inside the boxes (the warm starts take them); the post rule's bare run takes no cheap variable from an
-    evaluation."""
-    cfg = driver.load(V6O_C1)
-    names = [v.name for v in cfg.variables]
-    assert len(names) == 38 and names[0] == 'phi' and names[-2:] == ['phase', 'level'] and 'g0_f0' not in names
-    assert [v.kind for v in cfg.variables] == ['geometry'] * 36 + ['cheap'] * 2
-    assert all((v.low, v.high) == (-1.0, 1.0) for v in cfg.variables if v.name[-3:] in ('_f0', '_f1'))
-    assert all((v.low, v.high) == (12.0, 90.0) for v in cfg.variables if v.name.endswith('_dr'))
-    assert 'track.volt_scale=1.0' in cfg.fixed and not any('btrim' in v.target for v in cfg.variables)
-    assert cfg.n_startup >= 2 * (len(cfg.variables) + 2) + 1
-    assert [o.metric for o in cfg.objectives] == ['I_2pct_best_az', 'I_final_az', 'z_p95_az']
-    assert [c.label() for c in cfg.constraints] == ['E_med_az>=2.9']
-    by = {v.name: v for v in cfg.variables}
-    assert by['ap_start'].target == 'geometry.aperture_taper_start_mm' and 'ap_center' not in by
-    # every corner of the channel's box fits the plates of the base design (the noses and their own taper)
-    from PyCentralRegion.geometry import options as O
-    geo = C.section(C.load(V6O_C1.parent / cfg.base_config_file), 'geometry')
-    assert geo.plate_profile_mm == ((70.0, 25.0), (110.0, 48.2)) and geo.plate_half_gap_mm == 30.0
-    assert by['ap_start'].low >= geo.plate_profile_mm[0][0] and by['ap_outer'].high == O.channel_height_max_mm(geo)
-    assert by['ap_inner'].high < O.channel_height_max_at_mm(geo, 0.0) == 40.0
-    for corner in itertools.product(*[(by[k].low, by[k].high) for k in ('ap_inner', 'ap_outer', 'ap_start',
-                                                                         'ap_length')]):
-        g = dataclasses.replace(geo, **dict(zip(('aperture_inner_mm', 'aperture_outer_mm', 'aperture_taper_start_mm',
-                                                 'aperture_taper_length_mm'), corner)))
-        O.check_bounds(g)
-    if not Path(cfg.physics_python).is_file():
-        pytest.skip('the campaign names a physics interpreter of the machine it runs on')
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter('always')
-        camp = driver.Campaign(driver.load(V6O_C1, [f'mobo.campaign_dir={C.toml_value(str(tmp_path))}']))
-    assert not [w for w in caught if 'bare run' in str(w.message)]
-    base = camp.base(cfg.search_fidelity)
-    assert base['post_rule']['enabled'] is True and base['geometry']['post_shape'] == 'cylinder'
-    lines = {g['gap']: g for g in base['geometry']['gap_line']}
-    for v in cfg.variables:
-        if v.name[-3:] in ('_r1', '_dr'):
-            assert v.low <= lines[int(v.name[1])][v.name[-2:] + '_mm'] <= v.high, v.name
-    assert [camp.warm_point(i)['phi'] for i in range(6)] == [38.0, 34.0, 42.0, 45.0, 36.0, 40.0]
-
-
-@pytest.mark.parametrize('path', [PILOT, CAMPAIGN], ids=['pilot', 'campaign'])
-def test_opt_in_trim(path, tmp_path):
-    """The first-harmonic trim is opt-in (the design has no trim coils): its two variables are commented out, and
-    uncommented they make a valid campaign with them. The second pilot ran with them: its store reads only so."""
-    lines, on = [], False
-    for line in path.read_text(encoding='utf-8').splitlines():
-        on = line.startswith('# [[mobo.variables]]') or (on and line.startswith('#'))
-        lines.append((line[2:] if line != '#' else '') if on else line)
-    default = driver.load(path)
-    opted = tmp_path / path.name
-    opted.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    trim = driver.load(opted, [f'mobo.base_config_file={C.toml_value(default.base_config_file)}']).validate()
-    assert [v.name for v in trim.variables] == [v.name for v in default.variables] + ['trim_c', 'trim_s']
-    assert [(v.target, v.low, v.high, v.kind) for v in trim.variables[-2:]] == [
-        ('btrim.amplitude_cos_t', -2e-3, 2e-3, 'cheap'), ('btrim.amplitude_sin_t', -2e-3, 2e-3, 'cheap')]
-    assert trim.n_startup >= 2 * len(trim.variables) + 1
-    if path != PILOT or not Path(trim.physics_python).is_file() or not store.Store(trim.campaign_dir).log.exists():
-        return
-    evals = store.Store(trim.campaign_dir).evaluations()
-    driver.Campaign(trim).check_store(evals)
-    with pytest.raises(C.ConfigError, match='the variables changed'):
-        driver.Campaign(default).check_store(evals)
-
-
-def test_slit_config_dry_run(capsys):
-    """The slit's own campaign: three cheap variables at one fixed pass on the base design's model and fields."""
-    cfg = driver.load(SLIT)
-    if not Path(cfg.physics_python).is_file():
-        pytest.skip('the slit campaign names a physics interpreter of the machine it runs on')
-    assert [(v.name, v.kind) for v in cfg.variables] == [('slit_hw', 'cheap'), ('slit_az', 'cheap'),
-                                                         ('slit_off', 'cheap')]
-    assert min(v.low for v in cfg.variables if v.name == 'slit_hw') > 0.0       # an open slit in every design
-    assert cfg.n_startup >= 2 * len(cfg.variables) + 1
-    camp = driver.Campaign(cfg)
-    if camp.store.log.exists():
-        pytest.skip('the slit campaign has started')
-    assert camp.dry_run() == 0
-    out = capsys.readouterr().out
-    cmd = out.strip().splitlines()[-1]                         # the command (the log above it lists the fidelities)
-    for item in ('slit.half_width_mm=5.0', 'slit.azimuth_deg=315.0', 'slit.offset_mm=0.0', 'slit.pass_index=3',
-                 'track.turns=7', 'track.stop_at_target_energy=false', 'track.n_final=10000'):
-        assert item in cmd
-    assert 'paths.model3d' not in out                          # the base config's own model and fields
+    for item in ('PyCentralRegion.cli evaluate', 'track.stop_at_target_energy=false', 'geometry.aperture_inner_mm=14.0',
+                 'track.phases_deg=[35.0]', f'geometries/{key}/fields.pkl'):
+        assert item in cmd, item
 
 
 def test_flat_channel_designs_share_one_geometry_key(tmp_path):

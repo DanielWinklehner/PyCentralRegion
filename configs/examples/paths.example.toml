@@ -1,0 +1,22 @@
+# A computer's paths file: where its disk roots are. Run files name a root, ${name}/..., never a drive, so that the
+# same files run on another computer with its own paths file. The format is shared with the other packages of the
+# chain (spyral_inflector reads the same file): one [roots] table of absolute paths; [meta] is for people; a table
+# named after a package holds settings only that package reads (PyCentralRegion has none).
+#
+# PyCentralRegion finds the file at the first of: pcr --paths FILE, $MACHINE_PATHS, $PYCENTRALREGION_PATHS,
+# ~/.config/pycentralregion/paths.toml. It is read only when a run file names a root; an unknown name is an error
+# naming the file that was read. A path written without a root (absolute, or relative to its run file) works as
+# before. ${pcr} is built in: the PyCentralRegion source tree, for run files kept outside it, e.g.
+#     include = ["${pcr}/configs/defaults/core.toml"]
+#
+# Copy this file, put this computer's folders in it and point MACHINE_PATHS at it. Placeholders below.
+
+[meta]
+name = "laptop"
+description = "what this computer is"
+
+[roots]
+inputs = '/data/cyclotron/inputs'        # magnet maps, hand-off bunches, CAD exports (read only)
+work = '/data/cyclotron/work'            # results: models, field caches, runs, campaigns
+# On Windows use TOML literal strings, so the backslashes stay as they are:
+# inputs = 'E:\cyclotron'
