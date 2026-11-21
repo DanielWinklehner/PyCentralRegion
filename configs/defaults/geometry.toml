@@ -1,0 +1,188 @@
+# Defaults of the [geometry] section: the 3D electrode builder (PyCentralRegion.geometry, `pcr build`). Lengths in mm,
+# angles in degrees. The machine (dee angles, harmonic, gap-width law, cavity radius, dee voltage) is [machine], the
+# spiral inflector's rotation [inflector] rotation_deg, the inputs [paths] seed / housing_outline / handoff and the
+# output [paths] model3d (<prefix>.msh / .step / _dees.png / _build.json are written beside it).
+#
+# A build needs, besides [machine]: paths.seed (the gap-geometry optimization's result pickle: the gap lines),
+# paths.housing_outline (the spiral-inflector export's housing_outline.txt: the housing's plan-view outline and its
+# exit opening, in the machine frame; format in geometry.builder.read_housing_outline), the hand-off file whose
+# particle cloud is the emitting plane (emitting_plane_file below, else the export's own beside the outline, else
+# paths.handoff) and paths.model3d; si_rotation = "corner" and gap0_on_plate also read the export's
+# exit_plane_spec.json. Then `pcr build run.toml` (or `python -m PyCentralRegion.geometry.build build run.toml`);
+# `... geometry.build bounds run.toml` prints the channel bounds below without building.
+#
+# THE BEAM CHANNEL. Every dee is hollowed by a channel of full height aperture_inner_mm inside the radial taper and
+# aperture_outer_mm beyond it, linear in between, from r0 = aperture_taper_center_mm - aperture_taper_length_mm / 2 to
+# r1 = aperture_taper_center_mm + aperture_taper_length_mm / 2, or from r0 = aperture_taper_start_mm over the length
+# when the start is given (it replaces the centre). The dummy dees and the star ground share the taper and
+# take dummy_aperture_inner_mm / dummy_aperture_outer_mm when those are non-zero. The four channel fields are
+# independent - an optimiser needs no ordering constraint (inner > outer is an inverted taper). The old
+# "inner,outer" / "r0,r1" strings convert with options.aperture_from_spec ("26,32", "100,140" -> 26 / 32 / 120 / 40).
+#
+# BOUNDS, checked at build time (a ConfigError names the bound); a campaign sets its variable ranges inside them
+# (`python -m PyCentralRegion.geometry.build bounds run.toml` prints them for a config):
+#   every channel height (dees, and dummy dees when set) <= 2 x (plate_half_gap_mm - dee_wall_mm)
+#       the dee plates, dee_wall_mm thick, must fit inside the vertical gap of the plates / poles they sit between
+#       (40 mm for a 25 mm half gap and 5 mm walls; 30 mm for these defaults); where plate_profile_mm narrows that
+#       half gap (a pole nose and its own taper), the channel at each radius <= 2 x (the half gap there - dee_wall_mm):
+#       with [[70, 25], [110, 48.2]] and plate_half_gap_mm = 30 the channel may be 40 mm inside r 70, open up along
+#       the nose's taper (to 50 mm at r 78.6) and be 50 mm beyond;
+#   aperture_inner_mm (and dummy_aperture_inner_mm when set) >= 2 x the spiral-inflector housing exit's half height,
+#   and so is the channel height (dees and dummy dees) at the exit's outermost radius
+#       the channel must clear the exit the beam leaves the housing by over the opening's whole radial span (the second
+#       binds only for an inverted taper that starts inside the exit); the half height is the largest |z| of the exit
+#       aperture in the housing outline (paths.housing_outline), after aperture_inset_mm - no field of its own;
+#   aperture_taper_length_mm > 0 and 0 < r0 < r1; every height < 2 x half_height_mm;
+#   windows: 0 < half_height_mm and |z_center_mm| + half_height_mm <= the owner's channel half height at the window's
+#   middle. Posts, window blocks and hole plates run post_overhang_mm past the channel's highest point over them.
+# Refused as well, instead of being ignored: r_max_mm beyond [machine] r_max_cavity_m, gap0_face_mm without the star
+# ground, dee0_trim_mm together with dee0_clearance_mm.
+#
+# HARDWARE on a gap edge is placed by arclength along that edge from its inner end [mm]; gap 2j is dee j's
+# low-azimuth edge, gap 2j+1 its high-azimuth edge, side "dummy" the other side of the same gap. Arrays of tables:
+#     [[geometry.posts]]      # gap, side ("dee" | "dummy"), s_mm, length_mm (along the edge; 0 = post_size_mm)
+#     [[geometry.windows]]    # gap, side, s_lo_mm, s_hi_mm, half_height_mm, z_center_mm (= 0): metal above and below
+#                             # the opening z_center_mm +- half_height_mm; an optimiser targets
+#                             # geometry.windows.<i>.half_height_mm
+#     [[geometry.holes]]      # gap, side, r_mm, s_mm, z_mm, s_lo_mm, s_hi_mm: a plate with a round hole
+#                             # (geometry.build.gap0_hole places one where the hand-off bunch meets gap 0)
+#     [[geometry.boxes]]      # x_min_mm, x_max_mm, y_min_mm, y_max_mm: grounded full-height collimators
+#     [[geometry.junctions]]  # gap, r_mm: a variable -> fixed junction moved along its segment's line
+#     [[geometry.dee_rmin]]   # dee, r_mm: an inner end moved out by hand
+# A rule that moves an edge's inner end (dee0's tip cut, a pinched dee, dee_rmin) moves the arclength origin:
+# geometry.build.edge_shift turns a radius change into an arclength on the build's own edges.
+#
+# CONNECTED GAP LINES (gap_lines = "connected"): the seed gives only its reference orbit. Every gap line runs from the
+# axis through P0 -> P1 -> P2 and then out along its radial ray, without the seed's steps (an RF cavity cannot have
+# them), at [machine] dee_opening_deg. In the gap's own frame (x along its ray, y across it): P2 = (r2_mm, 0),
+# P1 = (r1_mm, y1), P0 = (gap_line_r0_mm, y0); f1 and f0 are y1 and y0 as fractions in [-1, 1] of what the limits allow
+# (P0 and P1 within gap_line_d_max_deg of the ray, the bends at P1 and P2 <= bend_max_deg), so every fraction gives a
+# buildable line and all 0 is the radial line. Gap 0 starts where the turned exit-plate line meets its ray (needs
+# gap0_on_plate; its bend there is free) and has no f0. One [[geometry.gap_line]] per gap, gaps 0 .. n in order:
+#     [[geometry.gap_line]]   # gap, r1_mm, r2_mm (0 < r1 < r2) or dr_mm (> 0, instead of r2_mm: r2 = r1 + dr),
+#                             # f0 (= 0), f1 (= 0)
+# snap_nodes must be false and junctions empty (both move the seed's nodes).
+#
+# POSTS IN THE LOOP ([post_rule] enabled, read by `pcr evaluate` only): a geometry is first built, solved and tracked
+# bare, with a phase scan at magnet.scale = scan_magnet_scale; the rule places posts between the turns' bands of the
+# bare run's final tracks (PyCentralRegion.geometry.post_rule); the geometry is then built and solved again with them,
+# and that is the model every evaluation of the geometry tracks. geometry.posts must be empty. A post is
+# post_size_mm deep, with post_shape; set "cylinder" in the design so that both passes agree.
+#
+# tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/geometry/options.py.
+
+[geometry]
+# gap lines
+gap_lines = "seed"           # "seed": the seed's gap lines (snap, junctions, gap0_on_plate); "connected": above
+gap_line = []                # "connected": one table per gap
+gap_line_r0_mm = 50.0        # "connected": P0 of gaps 1 .. n this far out along the ray
+gap_line_d_max_deg = 8.0     # "connected": P0 and P1 at most this far off the ray (as seen from the axis)
+bend_max_deg = 35.0          # "connected": the bends at P1 and P2 at most this (gap 0's at the exit plate is free)
+snap_nodes = true            # zero inert variable segments, then put the node radii midway between turns
+junctions = []               # after the snap: junctions moved to radii between the 3D beam's passes
+junction_tol_deg = 1.0       # close a variable -> fixed junction whose net angular step is below this
+# spiral inflector
+si_rotation = "fixed"        # "fixed": the electrodes are built around the inflector turned by [inflector] rotation_deg
+                             # (a campaign that varies the rotation uses this); "corner": gap 0's ray minus the exit
+                             # spec's gap azimuth. The model records the angle (params si_rotation_deg) and the tracker
+                             # refuses an inflector.rotation_deg that differs from it
+gap0_on_plate = false        # re-fit gap 0's variable segment onto the turned exit-plate line (reads the exit spec)
+exit_plane_spec_file = ""    # exit_plane_spec.json; "" = the export folder above the housing outline's
+emitting_plane_file = ""     # hand-off file whose particle cloud is the emitting plane of the beam channel; "" = the
+                             # export's own (handoff_sc_all_level.h5 beside the outline's folder), else paths.handoff
+channel_back_mm = 1.0        # beam channel starts this far upstream of the emitting plane
+channel_extend_mm = 200.0    # ... and runs this far downstream along its normal
+exit_opening = "export"      # the housing's exit opening: "export" (where the outline has it, swept along the emitting
+                             # plane's normal) | "centred" (on the median plane, with the exported opening's exit half
+                             # height so that it contains it, swept level: the electrodes are then mirror symmetric
+                             # about z = 0, which mirror_mesh below needs)
+aperture_inset_mm = [0.0, 0.0]   # narrow the exit aperture: off each end of its (longer, shorter) edge
+cluster_tol_mm = 0.5         # outline files without curves: vertices this close to a long face form a cluster
+keep_every = 5               # ... and every Nth loose vertex is a spline knot
+# vertical structure (the bounds above)
+half_height_mm = 50.0        # electrodes and housing span z = -H .. +H
+aperture_inner_mm = 26.0     # dee channel full height inside the taper (>= 2 x the housing exit's half height)
+aperture_outer_mm = 30.0     # ... and beyond it (<= 2 x (plate_half_gap_mm - dee_wall_mm))
+aperture_taper_center_mm = 120.0   # the height changes linearly over centre -+ length / 2
+aperture_taper_length_mm = 40.0    # (> 0)
+aperture_taper_start_mm = 0.0      # > 0: the taper runs from here over its length (replaces the centre)
+dummy_aperture_inner_mm = 0.0      # dummy dees' (and star ground's) full heights; 0 = the dees' value
+dummy_aperture_outer_mm = 0.0
+plate_half_gap_mm = 20.0     # half the vertical gap of the plates / poles the dees sit between
+plate_profile_mm = []        # where that gap is narrower: [[r, half gap], ...] mm, r ascending, linear between,
+                             # constant beyond the ends; the half gap at r is the smaller of it and plate_half_gap_mm
+# dees
+r_max_mm = 0.0               # dees and model end here (<= [machine] r_max_cavity_m); 0 = r_max_cavity_m
+housing_clearance_mm = 10.0  # the dee metal of gaps 1 .. n stays this far off the housing
+dee_wall_mm = 5.0            # thickness of a dee's walls: its solid inner end wall and its plates (the bound above)
+dee_inner = "arc"            # dees 1 .. n-1 close on an "arc" about the axis or "hug" the housing
+hug_ds_mm = 4.0              # "hug": sampling along the closure
+hug_ring_n = 180             # "hug": rays of the end-wall ring
+dee_rmin = []                # inner ends moved out by hand (override pinch / hug)
+dee_tip_width_mm = 4.0       # a pinched dee's tip is cut back to a face this wide; 0 = off
+dummy_tip_width_mm = 4.0     # a dummy tip crossing outside the housing is cut back to this; 0 = vertex
+dummy_overlap_mm = 6.0       # dummy dees reach this far into the housing
+dee0_clearance_mm = 0.0      # cut dee0's tip back until it clears the housing by this; 0 = off
+dee0_trim_mm = 0.0           # or (not both) cut it back this far along both edges; 0 = off
+dee0_nose_mm = 0.0           # round dee0's vertex with this radius in plan view; 0 = vertex
+# ground
+ground = "dummies"           # "dummies" (wedges fused onto the housing) | "star" (one 2D layout)
+star_tip_gap_mm = 0.0        # star: ground gap round the dee tips; 0 = [machine] gap_width_min_m
+star_min_ground_mm = 2.0     # star: thinnest ground allowed between two dees' keep-outs
+gap0_face_mm = 0.0           # star: fill gap 0's dummy side down to the housing where it is this close; 0 = off
+# hardware
+posts = []
+gap0_posts_mm = []           # [s_inner, s_outer]: a post pair on dee0's gap-0 edge
+windows = []
+holes = []
+gap0_hole_r_mm = 0.0         # > 0: a round hole of this radius on dee0's gap-0 edge, placed at every build where the
+                             # hand-off bunch meets that edge (geometry.build.gap0_hole); 0 = off
+gap0_hole_rim_mm = 8.0       # ... its plate reaches this far beyond the hole on each side
+gap0_hole_dr_mm = 0.0        # ... its centre moved this far in radius along the edge
+boxes = []
+post_size_mm = 10.0          # post width and depth; window / hole plate depth
+post_offset_mm = 5.0         # post centre from its edge (half the size: face flush)
+post_overhang_mm = 5.0       # posts and plates reach this far past the channel (its highest over their footprint)
+post_shape = "square"        # "square" | "cylinder" (a post_facets-gon: no 90 deg edges in the gap)
+post_facets = 16
+post_wall_join_mm = 2.0      # carry a post end this close to a hug dee's end wall into it; 0 = never
+# mesh
+lc_mm = 8.0                  # surface mesh size
+lc_outer_mm = 0.0            # > lc_mm: graded, lc_mm inside r_fine_mm, this beyond r_coarse_mm
+r_fine_mm = 150.0
+r_coarse_mm = 220.0
+lc_posts_mm = 0.0            # < lc_mm: refine round every post, window block and hole
+lc_far_mm = 0.0              # > 0: coarser faces far from the channel (the electrodes' top and bottom, the upper
+                             # walls): the size grows from the bulk's at |z| = lc_far_z0_mm to this at lc_far_z1_mm.
+                             # 32 with 34 / 48 takes about 30 % of the triangles; 0 = off
+lc_far_z0_mm = 34.0          # ... at least 6 mm above the highest channel face
+lc_far_z1_mm = 48.0          # ... at most half_height_mm
+mirror_mesh = false          # true: mesh the upper half (z >= 0) and mirror it. The mesh is then mirror symmetric
+                             # triangle for triangle and `pcr fields` solves it as half a model ([fields] symmetry).
+                             # Needs exit_opening = "centred" and windows / holes centred on the median plane; the
+                             # build checks every electrode's volume and centre of mass and refuses otherwise.
+                             # <prefix>.step stays the whole CAD, <prefix>.msh is the upper half's mesh
+nose_lc_mm = 2.0             # a round dee0 nose: this size on it, twice it out to the ground; 0 = off
+mesh_algorithm = 6           # gmsh Mesh.Algorithm (6 = Frontal-Delaunay)
+mesh_size_min_mm = 0.0       # gmsh Mesh.MeshSizeMin; 0 = lc_mm / 2
+mesh_flip_min_deg = 5.0      # repair triangles with an angle below this by edge flips; 0 = off
+occ_fuzzy_mm = 0.05          # OCC fuzzy boolean tolerance; 0 = exact booleans
+# output
+plot_dees = true             # write <prefix>_dees.png (the 2D layout) next to the model
+
+[post_rule]
+enabled = false              # off: geometry.posts is what is built
+gaps = [1, 2, 3, 4, 5]       # gaps that get posts between the turns' bands (gap 0 never: the housing exit and hole plate)
+rows = [1, 2]                # row k: between the bands of passes k and k + 1
+inner_gaps = [1]             # gaps that get a post on the inside of their first band
+clear_mm = 5.0               # arclength left between a post and each band's edge
+min_share = 0.2              # a band needs this share of the survivors' crossings
+lo_q = 0.005                 # a band's edges: its quantiles lo_q and 1 - lo_q
+inner_clear_mm = 5.0         # the inner post's outer end this far inside the first band's edge ...
+inner_len_mm = 20.0          # ... at most this long ...
+inner_rmin_mm = 45.0         # ... never below this radius ...
+inner_smin_mm = 8.0          # ... or this arclength (the nose round / the housing cut)
+scan_phases_deg = [-45.0, -30.0, -15.0, 0.0, 15.0]   # the bare run's phase scan; its final run at the best
+scan_magnet_scale = 1.0      # the bare run's magnet.scale: the posts depend on the geometry alone
+fuzzy_retry_mm = [0.02, 0.1]  # a model with posts that fails is built again at these geometry.occ_fuzzy_mm [mm] in
+                              # turn before the geometry stays without posts (its record keeps the one that worked)

@@ -6,9 +6,8 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from PyPATools.particles import ParticleDistribution
-from scipy import constants
 
-CLIGHT = constants.speed_of_light
+from .kinematics import CLIGHT
 
 
 @dataclass
@@ -386,7 +385,7 @@ class BeamStatisticsCollector:
 
         # Energy
         v_mag = np.linalg.norm(v_active, axis=1)
-        gamma = 1.0 / np.sqrt(1.0 - (v_mag / 299792458.0) ** 2)
+        gamma = 1.0 / np.sqrt(1.0 - (v_mag / CLIGHT) ** 2)
         energies_mev = (gamma - 1.0) * self.species.mass_mev
 
         stats = TurnStatistics(

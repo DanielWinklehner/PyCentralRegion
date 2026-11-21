@@ -34,7 +34,10 @@ What the kernel reproduces per step, in ``Tracker.run`` order:
      segment's normal, and a ``boris_rel`` push forward by ``+dt_back``;
   5. terminators: ``RadialVerticalTerminator(r_max, z_max)`` over ALL rows, then
      ``MetalTerminator`` over the active ones in ascending index order, the
-     virtual reference particle exempt (its contacts logged in ``ref_hits``);
+     virtual reference particle exempt (its contacts logged in ``ref_hits``).
+     The metal test is the OR of at most one column test
+     (``metal_columns.ColumnObstacles``, through the same ``in_columns`` the
+     Python path calls) and at most two nearest-node rasters;
   6. ``t += dt``; the finder's callback - replayed in Python afterwards.
 
 The E-field stack it understands is the one the 3D bunch deck installs:
@@ -80,6 +83,7 @@ default. ``finder.fast3d_interp = 'batch'`` selects the exact mode.
 Part of: PyCentralRegion (2026-09-16)
 """
 import time
+import types
 
 import numpy as np
 
@@ -104,6 +108,7 @@ from PyPATools.field import Field, TimedField
 # nothing but numpy / numba / PyPATools at module scope and its njit bodies
 # compile lazily, so this is cheap.
 from .fast_track import _pack_cavities, FastPathUnavailable as _FastTrack2DUnavailable
+from .metal_columns import NO_COLUMNS, ColumnObstacles, in_columns as _in_columns
 
 if HAS_NUMBA:
     from PyPATools.field_src.interpolators import (_searchsorted_numba, _searchsorted_with_hint,
@@ -560,15 +565,15 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
                   taper_on, taper_s, taper_r0, taper_r1, omega, phase,
                   cav, q_state, mass_mev,
                   sc_on, sc_E, sc_B, sc_kick_mask, sc_has_field, sc_qom, sc_kick_z,
-                  r_max, z_max, metal_on, metal_every, exempt_ref, ref_particle, ras_a, ras_b,
+                  r_max, z_max, metal_on, metal_every, exempt_ref, ref_particle, ras_a, ras_b, cols,
                   hints, r_prev,
                   r_hist, v_hist, active_hist, t_hist, ref_hit_hist, kick_hist, hit_p, hit_s):
     """Advance ``r``, ``v``, ``active`` (all full-length, mutated in place) over
     steps ``step0 .. step0 + n_sub - 1``.
 
-    ``skip_ab_first``   the first step's push/release AND space-charge kick were
-                        already done (the driver ran the Python solve): start at
-                        the RF thin-gap kick phase.
+    ``skip_ab_first``   the first step's push and release were already done (the
+                        driver ran the Python solve for it): start at the
+                        space-charge kick with the field that solve stored.
     ``stop_after_a_last`` the last step stops right after push/release, so the
                         driver can run the Python solve for it.
 
@@ -867,40 +872,45 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
                 if birth_step[p] == step + 1:
                     active[p] = True
 
-            # ---------------- 3b: SpaceChargeKick, stored field --------------
-            # ``stop_after_a_last`` splits the step between the release and this
-            # kick: the driver runs the Python solve for it and the kick comes
-            # from SpaceChargeKick.apply, so the kernel must NOT kick here too.
-            if sc_on and do_c:
-                nsel = 0
-                any_b = False
-                for p in range(n):
-                    if active[p] and sc_kick_mask[p] and sc_has_field[p]:
-                        ex = sc_E[p, 0]
-                        ey = sc_E[p, 1]
-                        ez = sc_E[p, 2] if sc_kick_z else 0.0
-                        bx = sc_B[p, 0]
-                        by = sc_B[p, 1]
-                        bz = sc_B[p, 2]
-                        if (ex != 0.0 or ey != 0.0 or ez != 0.0
-                                or bx != 0.0 or by != 0.0 or bz != 0.0):
-                            sel[nsel] = p
-                            nsel += 1
-                            if bx != 0.0 or by != 0.0 or bz != 0.0:
-                                any_b = True
-                if nsel > 0:
-                    qom_dt = sc_qom * dt
-                    for a in range(nsel):
-                        p = sel[a]
-                        ez2 = sc_E[p, 2] if sc_kick_z else 0.0
-                        nvx, nvy, nvz = _sc_kick_point(
-                            v[p, 0], v[p, 1], v[p, 2], sc_E[p, 0], sc_E[p, 1], ez2,
-                            sc_B[p, 0], sc_B[p, 1], sc_B[p, 2], any_b, qom_dt)
-                        v[p, 0] = nvx
-                        v[p, 1] = nvy
-                        v[p, 2] = nvz
-                    n_kick += 1
-                    kicked = True
+        # ---------------- 3b: SpaceChargeKick, stored field ------------------
+        # ``stop_after_a_last`` splits the step between the release and this
+        # kick: the driver runs the Python part (``SpaceChargeKick.refresh``:
+        # the solve, or the gather for the particles just released), which
+        # fills sc_E / sc_B / sc_has_field, and the ``skip_ab_first`` re-entry
+        # then kicks here with that field. Until 2026-11-14 the driver's
+        # ``SpaceChargeKick.apply`` did that step's kick in NumPy and the kernel
+        # skipped it: the same arithmetic (``_sc_kick_point``), a dozen passes
+        # over n-row arrays per solve step.
+        if sc_on and do_c:
+            nsel = 0
+            any_b = False
+            for p in range(n):
+                if active[p] and sc_kick_mask[p] and sc_has_field[p]:
+                    ex = sc_E[p, 0]
+                    ey = sc_E[p, 1]
+                    ez = sc_E[p, 2] if sc_kick_z else 0.0
+                    bx = sc_B[p, 0]
+                    by = sc_B[p, 1]
+                    bz = sc_B[p, 2]
+                    if (ex != 0.0 or ey != 0.0 or ez != 0.0
+                            or bx != 0.0 or by != 0.0 or bz != 0.0):
+                        sel[nsel] = p
+                        nsel += 1
+                        if bx != 0.0 or by != 0.0 or bz != 0.0:
+                            any_b = True
+            if nsel > 0:
+                qom_dt = sc_qom * dt
+                for a in range(nsel):
+                    p = sel[a]
+                    ez2 = sc_E[p, 2] if sc_kick_z else 0.0
+                    nvx, nvy, nvz = _sc_kick_point(
+                        v[p, 0], v[p, 1], v[p, 2], sc_E[p, 0], sc_E[p, 1], ez2,
+                        sc_B[p, 0], sc_B[p, 1], sc_B[p, 2], any_b, qom_dt)
+                    v[p, 0] = nvx
+                    v[p, 1] = nvy
+                    v[p, 2] = nvz
+                n_kick += 1
+                kicked = True
 
         if not do_c:
             break
@@ -910,7 +920,7 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
         # `engine.extra_interactions` when use_rf and gap_model == 'thin', so the
         # kick runs AFTER the release and the space-charge kick (it must sit
         # after the `do_c` break, not at the end of the `do_ab` block: on a
-        # space-charge solve step the Python `sc.apply` runs between the two).
+        # space-charge solve step the Python solve runs between the two).
         if cav[0]:
             cav_seg_start = cav[1]
             seg_p1 = cav[2]
@@ -1094,7 +1104,8 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
                 active[p] = False
                 continue
             if do_metal:
-                hitmask[p] = (_in_raster(ras_a, r[p, 0], r[p, 1], r[p, 2])
+                hitmask[p] = (_in_columns(cols, r[p, 0], r[p, 1], r[p, 2])
+                              or _in_raster(ras_a, r[p, 0], r[p, 1], r[p, 2])
                               or _in_raster(ras_b, r[p, 0], r[p, 1], r[p, 2]))
         ref_hit = False
         if do_metal:
@@ -1143,12 +1154,31 @@ def _chunk3d_impl(r, v, active, birth_step, step0, n_sub, skip_ab_first, stop_af
 # the kernel is to get rid of exactly that overhead. PAR_MIN_PARTICLES is where
 # the parallel one starts to win (measured, see FAST3D_KERNEL_REPORT.md).
 _chunk3d_serial = njit(cache=True)(_chunk3d_impl)
-# cache=False on purpose. With cache=True numba 0.64 hands back a SERIALIZED
-# build of a parallel=True function on every load after the first: a fresh
-# compile scales with the thread count, the cached one runs single-threaded and
-# is indistinguishable from _chunk3d_serial (measured, 2026-09-16). The parallel
-# variant is only chosen for large bunches, whose runs dwarf its ~10 s compile.
-_chunk3d_par = njit(cache=False, parallel=True)(_chunk3d_impl)
+
+
+def _renamed(fn, name):
+    """``fn`` under another name: the same code, globals, defaults and closure, filed apart by numba's disk cache.
+
+    numba files a cached function by its source file, qualified name and first line, and keys the entry on the
+    argument types and the bytecode, never on the compile options (numba 0.64, ``core/caching.py``). Two dispatchers
+    of ONE function, a serial and a ``parallel=True`` one, therefore share one cache entry, and each loads the build
+    the other saved last. That was the "cached parallel build runs single-threaded" of 2026-09-16: the parallel
+    dispatcher had loaded the serial build. So the parallel kernel ran with the cache off and was compiled afresh in
+    every process: 136-169 s on 2026-11-11 (the serial build: 18-19 s), most of a cheap evaluation."""
+    code = fn.__code__.replace(co_name=name, co_qualname=name)
+    out = types.FunctionType(code, fn.__globals__, name, fn.__defaults__, fn.__closure__)
+    out.__qualname__, out.__module__ = name, fn.__module__
+    out.__doc__, out.__kwdefaults__ = fn.__doc__, fn.__kwdefaults__
+    return out
+
+
+# The parallel variant, chosen from PAR_MIN_PARTICLES on, is cached like the serial one, in its own files
+# __pycache__/fast_track3d._chunk3d_par_impl-<line>.*: the first process after an edit of this file compiles both
+# builds (209 s on 2026-11-11, 190 s of it the parallel one), every later process loads them in under a second. Like
+# the serial build it does not see an edit of a file it calls into (metal_columns.py, PyPATools' interpolators and
+# pusher): numba checks this file only, and the selftest gates the interpolation and the column test against those
+# modules' own functions (``_require_selftest``).
+_chunk3d_par = njit(cache=True, parallel=True)(_renamed(_chunk3d_impl, '_chunk3d_par_impl'))
 # Below this the thread fork/join of two parallel regions per step (~25 us each
 # on the laptop) costs more than the work: measured best-of-3 on the smoke model,
 # 120 particles serial 4.7x vs parallel 3.6x, 480 particles serial 3.2x vs
@@ -1190,6 +1220,32 @@ def _sign_point(x):
 @njit(cache=True)
 def _interp_point(x, xp, fp):
     return np.interp(x, xp, fp)
+
+
+# metal_columns.in_columns compiled in THIS file, as the cached kernel inlines it: numba checks a cached function
+# against its own file only, so after an edit of metal_columns.py this copy is as stale as the kernel's
+@njit(cache=True)
+def _in_columns_points(co, x, y, z, out):
+    for p in range(len(x)):
+        out[p] = _in_columns(co, x[p], y[p], z[p])
+
+
+def _columns_case(rng, n):
+    """A column test of random intervals on a 9 x 9 grid, and ``n`` points: half anywhere around it, half on and next
+    to its interval ends at x-y up to 0.6 of a cell off the node (half-cell ties included)."""
+    xs = np.linspace(-2e-3, 2e-3, 9)
+    h = float(xs[1] - xs[0])
+    k = rng.integers(0, 4, size=len(xs) ** 2)
+    ends = np.concatenate([np.sort(rng.uniform(-0.02, 0.02, 2 * m)) for m in k])
+    cols = ColumnObstacles(np.concatenate([[0], np.cumsum(k)]), ends[0::2], ends[1::2], xs)
+    pts = np.column_stack([rng.uniform(-3e-3, 3e-3, n), rng.uniform(-3e-3, 3e-3, n), rng.uniform(-0.025, 0.025, n)])
+    m = rng.integers(0, len(cols.lo), size=n // 2)
+    i, j = np.divmod(np.repeat(np.arange(len(k)), k)[m], len(xs))
+    off = rng.choice([0.0, 0.5, -0.5, 0.3, -0.6], size=(n // 2, 2)) * h
+    z = np.where(rng.random(n // 2) < 0.5, cols.lo[m], cols.hi[m])
+    z = np.where(rng.random(n // 2) < 0.5, z, np.nextafter(z, rng.choice([-1.0, 1.0], size=n // 2)))
+    pts[:n // 2] = np.column_stack([xs[i] + off[:, 0], xs[j] + off[:, 1], z])
+    return cols, pts
 
 
 # NO fastmath: the kick chain of the kernel, one particle, for the selftest.
@@ -1279,7 +1335,9 @@ def selftest(n: int = 4096, seed: int = 20260916) -> dict:
 
     What MUST be exact, and is checked: the cell-hint search returning the same
     index as the plain binary search, the per-point interpolation matching
-    ``_interp3d_single``, and numba's ``np.hypot`` matching NumPy's.
+    ``_interp3d_single``, numba's ``np.hypot`` matching NumPy's, and the
+    kernel's compiled column test matching ``metal_columns``' own (a cached
+    function here does not see an edit of that file).
     """
     from PyPATools.field_src.interpolators import _interp3d_batch3 as _b3, _interp3d_single
     from PyPATools.pusher import boris_rel_dkd_batch
@@ -1395,7 +1453,18 @@ def selftest(n: int = 4096, seed: int = 20260916) -> dict:
     lens_ok = bool(np.array_equal(v_ref_l, v_mine_l))
     lens_max = float(np.max(np.abs(v_ref_l - v_mine_l)))
 
+    # the column test: the kernel's compiled copy of metal_columns.in_columns against the module's own
+    cols, cp = _columns_case(rng, n)
+    cx, cy, cz = (np.ascontiguousarray(cp[:, k]) for k in range(3))
+    c_ref = cols(cp)
+    c_mine = np.zeros(len(cp), dtype=np.bool_)
+    _in_columns_points(cols.packed, cx, cy, cz, c_mine)
+    c_none = np.zeros(len(cp), dtype=np.bool_)
+    _in_columns_points(NO_COLUMNS, cx, cy, cz, c_none)
+    columns_ok = bool(np.array_equal(c_ref, c_mine) and not c_none.any())
+
     return {'n_samples': int(n),
+            'columns_point_exact': columns_ok, 'columns_points_in_metal': int(c_ref.sum()),
             'kick_point_exact_vs_numpy': kick_ok, 'kick_point_max_abs': kick_max,
             'kick_point_rows_differing': kick_rows,
             'kick_lens_point_exact_vs_numpy': lens_ok, 'kick_lens_point_max_abs': lens_max,
@@ -1429,6 +1498,10 @@ def _require_selftest(exact_kick: bool = False):
             "the cell-hint interpolation does not match the plain binary search")
     if not s['hypot_exact']:
         raise FastPathUnavailable("numba's np.hypot differs from NumPy's (blend radius)")
+    if not s['columns_point_exact']:
+        raise FastPathUnavailable(
+            "the kernel's compiled copy of metal_columns.in_columns is stale (numba checks the cache of fast_track3d.py "
+            "against that file only): delete the fast_track3d.* entries of its __pycache__, or touch fast_track3d.py")
     if exact_kick and not s['kick_point_exact_vs_numpy']:
         raise FastPathUnavailable(
             "the thin-gap kick chain does not reproduce apply_kicks_batch bit for bit "
@@ -1547,13 +1620,24 @@ def _pack_efield(ef):
                 omega=omega, phase=phase)
 
 
-def _raster_parts(mask):
-    """The nearest-node boolean tests behind ``combine_obstacles``."""
+def _obstacle_parts(mask):
+    """The tests behind ``combine_obstacles`` (the test itself when it is one)."""
     if mask is None:
         return []
-    parts = list(getattr(mask, 'parts', None) or [mask])
+    return list(getattr(mask, 'parts', None) or [mask])
+
+
+def _column_parts(mask):
+    """The column tests (``metal_columns.ColumnObstacles``) behind ``combine_obstacles``, packed for ``in_columns``."""
+    return [p.packed for p in _obstacle_parts(mask) if isinstance(p, ColumnObstacles)]
+
+
+def _raster_parts(mask):
+    """The nearest-node boolean rasters behind ``combine_obstacles``; its column tests are ``_column_parts``."""
     out = []
-    for p in parts:
+    for p in _obstacle_parts(mask):
+        if isinstance(p, ColumnObstacles):
+            continue
         grid = getattr(p, 'grid', None)
         if grid is None:
             raise FastPathUnavailable(f"obstacle test {type(p).__name__} is not a raster")
@@ -1633,7 +1717,7 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
         if not hasattr(sc.solver, 'gather'):
             raise FastPathUnavailable("space-charge solver without gather()")
         if getattr(sc, 'move', False):
-            # HCHC60_SC_MOVE rotates the stored per-particle E_sc/B_sc with the
+            # SpaceChargeKick(move=True) rotates the stored per-particle E_sc/B_sc with the
             # bunch's mean direction on EVERY step between solves, so the kernel's
             # "the solve's field is frozen until the next solve" no longer holds
             # and every step would have to be a chunk boundary. Reproducing the
@@ -1641,7 +1725,7 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
             # one Rodrigues formula over the mean velocity of the solve's own
             # particle set); until then these runs take the general path.
             raise FastPathUnavailable(
-                "SpaceChargeKick.move (HCHC60_SC_MOVE=1): the stored self-field is "
+                "SpaceChargeKick(move=True): the stored self-field is "
                 "rotated every step, which the chunked kernel does not reproduce")
 
     # terminators: at most one MetalTerminator, no collimator
@@ -1657,6 +1741,9 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
     rasters = _raster_parts(metal.inside if metal is not None else None)
     if len(rasters) > 2:
         raise FastPathUnavailable(f"{len(rasters)} obstacle rasters (the kernel carries two)")
+    columns = _column_parts(metal.inside if metal is not None else None)
+    if len(columns) > 1:
+        raise FastPathUnavailable(f"{len(columns)} column tests (the kernel carries one)")
 
     design = engine.design
     e = _pack_efield(design.efield)
@@ -1741,6 +1828,7 @@ def build_kernel_args3d(finder, pd_init, dt: float, n_steps: int, t0: float,
         index_offset=int(getattr(metal, 'index_offset', 0)) if metal is not None else 0,
         ras_a=rasters[0] if len(rasters) > 0 else _NO_RASTER,
         ras_b=rasters[1] if len(rasters) > 1 else _NO_RASTER,
+        cols=columns[0] if columns else NO_COLUMNS,
         sc=sc, release=release, n_ref=int(n_ref), interp=interp,
         # None = decide from the particle count (PAR_MIN_PARTICLES); True/False forces it
         parallel=getattr(finder, 'fast3d_parallel', None),
@@ -1861,7 +1949,9 @@ def _run_fast3d(finder, args: dict, callback, dt: float, t0: float,
 
     while step < n_steps:
         if mid:
-            sc.apply(step, r, v, r, v, active, t, dt)
+            # the solve (or the gather for particles just released) of this step; its kick is the kernel's first act
+            # on re-entry (phase 3b), with the field stored here
+            sc.refresh(step, r, v, active, t)
             mid = False
             skip_ab = True
         else:
@@ -1905,7 +1995,7 @@ def _run_fast3d(finder, args: dict, callback, dt: float, t0: float,
             args['cav'], args['q_state'], args['mass_mev'],
             sc_on, sc_E, sc_B, sc_kick_mask, sc_has_field, sc_qom, sc_kick_z,
             args['r_max'], args['z_max'], args['metal_on'], args['metal_every'],
-            args['exempt_ref'], args['ref_particle'], args['ras_a'], args['ras_b'],
+            args['exempt_ref'], args['ref_particle'], args['ras_a'], args['ras_b'], args['cols'],
             hints, r_prev,
             r_hist, v_hist, active_hist, t_hist, ref_hist, kick_hist, hit_p, hit_s)
         if numba_mod is not None:

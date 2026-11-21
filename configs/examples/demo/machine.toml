@@ -1,0 +1,47 @@
+# The demo machine: a small four-dee proton cyclotron (h = 4, 1.2 T, 20 kV dees, 60 keV injection, about five turns
+# to 0.8 MeV) whose inputs need nothing proprietary: `python -m PyCentralRegion.demo` generates them into inputs/
+# (an analytic magnet map, a seed orbit, a hand-off bunch, a housing; see PyCentralRegion.demo). Not a real machine:
+# the numbers are small and round so that the whole chain runs in minutes. This file holds what the designs share
+# (machine, magnet, injected beam); a design file includes it and adds its electrode options and run settings.
+# A real machine is set up the same way (docs/machine.md).
+
+include = ["../../defaults/core.toml"]
+
+[run]
+cache_dir = "../../../output/demo/cache"      # map crops (relative paths are taken relative to this file)
+
+[paths]
+bfield_3d = "inputs/bfield_3d.txt"            # the analytic map (COMSOL text layout: x y z Bx By Bz)
+seed = "inputs/seed.pkl"                      # straight radial gaps and a thin-gap reference orbit
+handoff = "inputs/handoff.h5"                 # 20000 protons on the emitting plane, 1 mA
+inflector_efield = "inputs/inflector_efield.pickle"   # zero: the demo's inflector is only its housing
+housing_step = "inputs/housing.stp"           # the housing solid (mm), the tracker's obstacle
+housing_outline = "inputs/housing_outline.txt"        # its outline and exit aperture, for the electrode builder
+
+[machine]
+species = "proton"
+harmonic = 4
+n_dees = 4
+dee_shape = "radial"
+dee_center_angles_deg = [45.0, 135.0, 225.0, 315.0]
+dee_opening_deg = 40.0
+dee_voltage_kv = 20.0
+design_voltage_kv = 20.0
+gap_width_m = 0.008
+gap_angle_deg = 2.5
+gap_width_min_m = 0.005
+r_min_m = 0.005
+r_max_cavity_m = 0.13
+r_max_m = 0.14
+z_max_m = 0.012
+target_energy_mev = 0.8
+n_turns_design = 6
+skip_turns_design = 1
+
+[magnet]
+sign = 1.0
+scale = 1.0
+crop_r_m = 0.15             # the whole generated map
+
+[score]
+pick_e_min_mev = 0.75       # an operating point's bunch reaches this final energy

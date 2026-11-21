@@ -34,7 +34,8 @@ import numpy as np
 
 from PyPATools.field import Field, FieldBase, TimedField, CompositeField
 
-from .handoff import load_handoff, make_beam_from_handoff, _rot
+from .frames import rotation_z
+from .handoff import load_handoff, make_beam_from_handoff
 
 
 # ============================================================================
@@ -127,7 +128,7 @@ def load_inflector_field(source: Union[str, os.PathLike, FieldBase], rotation_de
         gz = -gz[order]
         vx, vy, vz = vx[:, :, order], vy[:, :, order], -vz[:, :, order]
     if rotation_deg:
-        R = _rot(rotation_deg)
+        R = rotation_z(rotation_deg)
         X, Y, Z = np.meshgrid(gx, gy, gz, indexing='ij')
         pts = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
         src = Field.from_arrays(grid={'x': gx, 'y': gy, 'z': gz},

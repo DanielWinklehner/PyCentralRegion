@@ -12,6 +12,8 @@ from typing import Tuple, Optional, List, Dict
 from PyPATools.global_variables import CLIGHT
 from PyPATools.particles import ParticleDistribution
 
+from .frames import rotation_z
+
 
 class RFCavity:
     """
@@ -145,7 +147,7 @@ class RFCavity:
 
         # Optional ANGULAR gap: a constant-angle wedge with a minimum slot width,
         #     width(r) = max(gap_width_min, r * gap_angle)
-        # which is how the HCHC-60 CAD gap is actually drawn (Daniel, 2026-09-20): 2.5 deg
+        # which is how a real cyclotron's CAD gap is drawn (2026-09-20), e.g. 2.5 deg
         # beyond r = 150 mm, flooring at ~6.5 mm inward. The two anchors agree to 0.05 mm,
         # because 2.5 deg * 150 mm = 6.545 mm - the floor bites at r = 149 mm.
         #
@@ -186,6 +188,9 @@ class RFCavity:
         self.segment_radii = segment_radii if segment_radii is not None else []
         self.segment_rotations = (segment_rotations if segment_rotations is not None
                                   else [0.0] * n_variable_segments)
+        # A chain laid through explicit vertices (set_vertices) replaces the
+        # angle / radius / rotation parametrization above.
+        self.vertices = None
 
         # Validate
         if n_variable_segments > 0:
@@ -219,8 +224,22 @@ class RFCavity:
         r_current = self.r_min
         angle_current = base_angle_rad
 
+        # A connected chain through explicit vertices: the last one lies on the
+        # base ray, so the fixed segment below starts where the chain ends.
+        if self.vertices is not None:
+            v = self.vertices
+            for a, b in zip(v[:-1], v[1:]):
+                self.segments.append({
+                    'p1': np.array([a[0], a[1], 0.0]),
+                    'p2': np.array([b[0], b[1], 0.0]),
+                    'r_min': float(np.hypot(a[0], a[1])),
+                    'r_max': float(np.hypot(b[0], b[1])),
+                    'type': 'variable'
+                })
+            r_current = float(np.hypot(v[-1][0], v[-1][1]))
+
         # Variable segments
-        for i in range(self.n_variable_segments):
+        for i in range(self.n_variable_segments if self.vertices is None else 0):
             r_outer = self.segment_radii[i]
             angle_excursion = np.deg2rad(self.segment_angles[i])
 
@@ -242,11 +261,10 @@ class RFCavity:
             # Optional rotation about the segment midpoint (decouples kick
             # direction from crossing azimuth). The CHAIN continues from the
             # NOMINAL (unrotated) endpoint so rotations don't propagate.
-            rot = np.deg2rad(self.segment_rotations[i]) if self.segment_rotations else 0.0
+            rot = self.segment_rotations[i] if self.segment_rotations else 0.0
             if rot != 0.0:
                 mid = 0.5 * (p1 + p2)
-                c, s = np.cos(rot), np.sin(rot)
-                R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+                R = rotation_z(rot)
                 p1_stored = mid + R @ (p1 - mid)
                 p2_stored = mid + R @ (p2 - mid)
             else:
@@ -334,6 +352,8 @@ class RFCavity:
             New per-segment midpoint rotations [degrees].
         """
 
+        if self.vertices is not None:
+            raise ValueError("this gap's chain is laid through vertices (set_vertices): lay it again instead")
         if segment_angles is not None:
             if len(segment_angles) != self.n_variable_segments:
                 raise ValueError(f"segment_angles must have length {self.n_variable_segments}")
@@ -353,6 +373,31 @@ class RFCavity:
             self.segment_rotations = segment_rotations
 
         # Rebuild geometry
+        self._build_geometry()
+
+    def set_vertices(self, vertices):
+        """Lay the variable chain through explicit vertices [m], (k + 1, 2) or (k + 1, 3), inner to outer: k connected
+        straight segments, then the fixed radial segment from the last vertex, which must lie on the base ray, out to
+        r_max. It replaces the angle / radius / rotation parametrization (n_variable_segments becomes k; the angles
+        are then the vertices' azimuths off the base ray and the radii theirs, for reports only)."""
+        v = np.asarray(vertices, dtype=float)[:, :2].copy()
+        if len(v) < 2:
+            raise ValueError("set_vertices needs at least two vertices")
+        b = np.deg2rad(self.base_angle)
+        e = np.array([np.cos(b), np.sin(b)])
+        r = np.hypot(v[:, 0], v[:, 1])
+        if abs(e[0] * v[-1, 1] - e[1] * v[-1, 0]) > 1e-9 or v[-1] @ e <= 0.0:
+            raise ValueError(f"the last vertex {v[-1]} is not on the base ray at {self.base_angle:.4f} deg")
+        if not r[-1] < self.r_max:
+            raise ValueError(f"the last vertex lies at r = {r[-1]:.4f} m, not inside r_max = {self.r_max:.4f} m")
+        if np.any(np.hypot(*np.diff(v, axis=0).T) <= 0.0):
+            raise ValueError("set_vertices: two consecutive vertices coincide")
+        self.vertices = v
+        self.n_variable_segments = len(v) - 1
+        az = np.degrees(np.arctan2(v[:, 1], v[:, 0])) - self.base_angle
+        self.segment_angles = [float((a + 180.0) % 360.0 - 180.0) for a in az[1:]]
+        self.segment_radii = [float(x) for x in r[1:]]
+        self.segment_rotations = [0.0] * self.n_variable_segments
         self._build_geometry()
 
     def gap_width_at(self, r):
@@ -542,8 +587,8 @@ class RFCavity:
             # minus sign. Without it the crossing was found on the chord AFTER
             # the true crossing (s_part = -s_true), i.e. one step late, and a
             # chord ending exactly on the gap line produced a missed or a
-            # doubled kick (seen as 7 or 9 kicks per turn in the HCHC-60
-            # accelerated orbit, 2026-09-03).
+            # doubled kick (seen as 7 or 9 kicks per turn instead of 8 in a
+            # four-dee accelerated orbit, 2026-09-03).
             s_part[valid_mask] = -det_s_part[valid_mask] / det[valid_mask]
 
             # Check bounds
@@ -1009,6 +1054,44 @@ def check_variable_segments(design_or_cavities, trajectory,
                       f"{f['r_first'] * 1000:.1f} mm, tip {f['r_tip'] * 1000:.1f} mm, usable "
                       f"extent {f['extent'] * 1000:.1f} mm")
     return findings
+
+
+def neutralise_inert_segments(design_or_cavities, trajectory, verbose: bool = True) -> List[tuple]:
+    """Straighten every variable segment that a reference trajectory never crosses.
+
+    Such a segment changes no crossing, yet it puts a kink and a jog into the dee edge, and snapping its node
+    between turns (``snap_nodes_between_turns``) could only move it outward past a real crossing, which would change
+    the beam dynamics. Zero excursion and rotation make it part of the plain radial line at the gap's base angle.
+    Run it BEFORE the snap, on the radii the optimizer produced. Geometry is updated IN PLACE.
+
+    Returns a list of (gap, segment, r_lo, r_hi, old_angle, old_rotation, r_first_crossing) [m, deg].
+    """
+    cavities = getattr(design_or_cavities, 'rf_cavities', design_or_cavities)
+    changed = []
+    for gi, cav in enumerate(cavities):
+        if cav.n_variable_segments == 0:
+            continue
+        cr = gap_crossing_radii(cav, trajectory)
+        edges = [cav.r_min] + [float(v) for v in cav.segment_radii]
+        ang = list(cav.segment_angles)
+        rot = list(cav.segment_rotations or [0.0] * cav.n_variable_segments)
+        touched = False
+        for i in range(cav.n_variable_segments):
+            lo, hi = edges[i], edges[i + 1]
+            if np.any((cr >= lo) & (cr <= hi)) or (ang[i] == 0.0 and rot[i] == 0.0):
+                continue
+            changed.append((gi, i, lo, hi, ang[i], rot[i], float(cr[0]) if len(cr) else float('nan')))
+            ang[i], rot[i], touched = 0.0, 0.0, True
+        if touched:
+            cav.update_geometry(segment_angles=ang, segment_rotations=rot)
+    if verbose:
+        if not changed:
+            print("[neutralise] every variable segment has at least one beam crossing; none straightened")
+        for gi, i, lo, hi, a0, r0, first in changed:
+            print(f"[neutralise] gap{gi} segment {i} spans r {lo * 1e3:.2f}..{hi * 1e3:.2f} mm but the orbit first "
+                  f"reaches this gap at {first * 1e3:.2f} mm: angle {a0:+.4f} -> 0, rotation {r0:+.4f} -> 0 "
+                  f"(radial line at {cavities[gi].base_angle:.1f} deg)")
+    return changed
 
 
 def snap_nodes_between_turns(design_or_cavities, trajectory,

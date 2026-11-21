@@ -1546,7 +1546,7 @@ class CavityGeometryOptimizer:
             # ---- Seeds: distinct VIABLE phase basins, then jittered clones of the good basins.
             # Seeding non-accelerating phases wastes whole DFO-LS starts.
             #
-            # 2026-09-16: made a parameter, but MEASUREMENT SAYS DO NOT RAISE IT. On HCHC-60 the only
+            # 2026-09-16: made a parameter, but MEASUREMENT SAYS DO NOT RAISE IT. On a 60 MeV H2+ design the only
             # start that ever converged was seeded at phase -120 deg and optimized to -46 deg, moving 74
             # deg. Stage A ranks phases with the geometry FROZEN at x0 (naive, all segment angles zero),
             # and it rates -120 POORLY - so a higher floor deletes the one viable basin:

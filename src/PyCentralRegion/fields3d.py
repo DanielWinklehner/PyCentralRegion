@@ -137,7 +137,7 @@ def field_from_crop(crop: dict, scaling: float = 1.0, label: str = '3D map', bac
 # ============================================================================
 def load_rf_quarter_map(path, r_max: float, cache: Optional[os.PathLike] = None, n_xy: int = 1264, n_z: int = 31,
                         spacing: float = 0.002, z0: float = -0.030, verbose: bool = True) -> dict:
-    """The IBA cavity eigenmode export: 1264 x 1264 x 31 nodes, x fastest then
+    """A cavity eigenmode export of this layout: 1264 x 1264 x 31 nodes, x fastest then
     y then z, x = y = 0..2526 mm, z = -30..30 mm at 2 mm, columns Ex Ey Ez
     (arbitrary amplitude), NaN in metal. Cropped to x, y <= r_max [m]
     (arrays (nx, ny, nz)) and cached as npz when ``cache`` is given."""
@@ -358,10 +358,19 @@ class RadialTaperField(FieldBase):
 # ============================================================================
 # 3D BEM solution -> gridded Field
 # ============================================================================
+def mirror_levels(zs, tol: float = 1e-9):
+    """For ascending z levels [m] that mirror onto each other about z = 0, the index of every level's mirror image
+    (level k and level len(zs) - 1 - k); None when they do not (within ``tol``)."""
+    zs = np.asarray(zs, dtype=float)
+    if zs.ndim != 1 or len(zs) < 2 or np.any(np.diff(zs) <= 0.0) or np.any(np.abs(zs + zs[::-1]) > tol):
+        return None
+    return len(zs) - 1 - np.arange(len(zs))
+
+
 def bem_field3d(sol, xs, ys, zs, metal: Optional[Callable] = None, chunk: int = 4000, erode: int = 2,
                 backend: str = 'numba', label: str = 'BEM 3D gap field', r_max: Optional[float] = None,
                 pot_device: Optional[str] = None, pot_precision: Optional[str] = None,
-                pot_check: int = 0, verbose: bool = True) -> Field:
+                pot_check: int = 0, mirror_z: bool = False, verbose: bool = True) -> Field:
     """E = -grad(phi) of a ``GapFieldSolution`` on the (xs, ys, zs) grid [m]
     as a dim-3 Field. ``metal(xyz) -> bool`` (e.g. ``electrodes3d.stacked_obstacles``)
     zeroes the field ``erode`` cells deep inside metal (the wall jump layer is
@@ -377,25 +386,39 @@ def bem_field3d(sol, xs, ys, zs, metal: Optional[Callable] = None, chunk: int = 
     evaluated ('cpu'/'gpu', 'double'/'single' - see ``GapFieldSolution.potential``); this is the
     dominant cost of a whole map. ``pot_check`` re-evaluates that many random grid points in
     double precision on the CPU and reports the difference, so a faster setting is measured
-    rather than assumed."""
+    rather than assumed.
+
+    ``mirror_z``: the charge is mirror symmetric about z = 0 (``sol.mirror``: a mirror-symmetric mesh), so the
+    potential is even in z: it is evaluated on the levels z >= 0 only and copied to their mirror levels, which makes
+    E_x and E_y even and E_z odd in z (E_x and E_y to the last bit, E_z to rounding). It needs z levels that mirror
+    onto each other (``mirror_levels``); with others the whole grid is evaluated and that is said."""
     xs, ys, zs = (np.asarray(a, dtype=float) for a in (xs, ys, zs))
     gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')
     pts = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
     t0 = time.time()
     kw = dict(chunk=chunk, verbose=verbose, device=pot_device, precision=pot_precision)
-    if r_max is None:
-        keep = np.ones(len(pts), dtype=bool)
+    image = mirror_levels(zs) if mirror_z else None
+    if mirror_z and image is None and verbose:
+        print("[fields3d] the z levels do not mirror onto each other: the whole grid is evaluated")
+    keep = np.ones(len(pts), dtype=bool)
+    if r_max is not None:
+        keep &= np.hypot(pts[:, 0], pts[:, 1]) <= float(r_max) + 2.0 * float(np.max(np.abs(np.diff(xs))))
+    if image is not None:
+        keep &= np.repeat(np.arange(len(zs))[None, :] >= image[None, :], len(xs) * len(ys), axis=0).ravel()
+    if keep.all():
         phi = sol.potential(pts, **kw).reshape(gx.shape)
-        n_eval = len(pts)
     else:
-        keep = np.hypot(pts[:, 0], pts[:, 1]) <= float(r_max) + 2.0 * float(np.max(np.abs(np.diff(xs))))
         flat = np.zeros(len(pts))
         flat[keep] = sol.potential(pts[keep], **kw)
         phi = flat.reshape(gx.shape)
-        n_eval = int(keep.sum())
+    n_eval = int(keep.sum())
+    if image is not None:
+        lower = np.flatnonzero(np.arange(len(zs)) < image)
+        phi[:, :, lower] = phi[:, :, image[lower]]
     if verbose:
         print(f"[fields3d] BEM potential on {gx.shape} ({n_eval / 1e6:.2f} of "
-              f"{pts.shape[0] / 1e6:.2f} M points) in {time.time() - t0:.0f} s"
+              f"{pts.shape[0] / 1e6:.2f} M points" + (", the levels z >= 0 mirrored" if image is not None else "")
+              + f") in {time.time() - t0:.0f} s"
               + (f" [{pot_device or 'cpu'}/{pot_precision or 'double'}]"
                  if (pot_device or pot_precision) else ""))
     if pot_check > 0 and n_eval:
@@ -413,6 +436,10 @@ def bem_field3d(sol, xs, ys, zs, metal: Optional[Callable] = None, chunk: int = 
     if metal is not None:
         from scipy.ndimage import binary_erosion
         inside = np.asarray(metal(pts), dtype=bool).reshape(gx.shape)
+        if image is not None:
+            # a face that lies on a grid level is metal or vacuum by the last bit of that level's z, which differs
+            # between a level and its mirror image: the mask of the levels z >= 0 for both, as the potential
+            inside[:, :, lower] = inside[:, :, image[lower]]
         deep = binary_erosion(inside, iterations=erode) if erode > 0 else inside
         ex[deep] = 0.0
         ey[deep] = 0.0

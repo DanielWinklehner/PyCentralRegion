@@ -30,7 +30,7 @@ one field lookup per stage for the whole batch), and the field lookup is a
 cubic B-spline (scipy.ndimage.spline_filter once, map_coordinates with
 prefilter=False per call), so a radial scan of ~200 orbits takes seconds.
 Validated against PyCentralRegion's Cartesian time-domain SEO tracker to
-< 1e-6 in revolution frequency on the IsoDAR HCHC-60 maps (relative 4th
+< 1e-6 in revolution frequency on the maps of a 60 MeV H2+ cyclotron (relative 4th
 harmonic ~0.9), where the first-order analytic scalloping formulas are
 ~0.4 % off.
 
@@ -54,7 +54,8 @@ from typing import Optional
 import numpy as np
 from scipy.ndimage import map_coordinates, spline_filter
 
-CLIGHT = 299792458.0
+from .kinematics import CLIGHT
+
 RIGIDITY_K = 299.792458        # p[MeV/c] = K * |q| * (B rho)[T m]
 
 __all__ = ['CartesianMidplane', 'PolarMidplane', 'closed_orbits',

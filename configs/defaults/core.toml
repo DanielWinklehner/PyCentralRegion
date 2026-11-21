@@ -1,0 +1,148 @@
+# Defaults of the core pipeline sections: [run], [paths], [machine], [magnet], [inflector], [fields], [track], [slit].
+# A run file includes what it needs and sets only what differs, e.g.
+#     include = ["../../defaults/core.toml"]
+#     [run]
+#     name = "my_design"
+# tests/test_config.py checks that these values equal the dataclass defaults in PyCentralRegion/config.py.
+
+[run]
+name = ""                   # run name; output files carry it
+out_dir = ""                # results folder
+cache_dir = ""              # field-map crops and other reusable caches
+full_speed = true           # Windows: opt the process out of power throttling. A process without a window (a campaign
+                            # started detached, an evaluation the campaign driver starts) is otherwise moved to the
+                            # efficiency cores of a hybrid CPU within seconds and runs at half the speed: the same
+                            # tracked run 47 s instead of 22 s (2026-11-14). The priority is not changed; no effect on
+                            # other systems. false leaves the process to Windows
+
+[paths]                     # relative paths are taken relative to the file that sets them; "" = not given
+bfield_3d = ""              # 3D magnet map (COMSOL text export: x y z Bx By Bz)
+bfield_2d = ""              # midplane magnet map (optional: midplane check of the 3D crop)
+seed = ""                   # gap-geometry optimizer result (.pkl): gap lines, reference orbit, phase, f_rev
+handoff = ""                # injected bunch: openPMD plane-crossing file of the spiral inflector (.h5)
+inflector_efield = ""       # spiral-inflector static E-field (.pickle, PyPATools Field)
+housing_step = ""           # spiral-inflector housing solid (.stp)
+housing_outline = ""        # housing outline at the midplane (.txt), read by the electrode builder
+model3d = ""                # 3D electrode model (.pkl); written by `pcr build`
+fields = ""                 # BEM field cache (.pkl); written by `pcr fields`
+
+[machine]                   # the machine's properties: none has a default, every run sets them all (a machine file its
+                            # designs include: docs/machine.md); configs/examples/demo/machine.toml is one
+# species = "proton"        # PyPATools species name ("proton", "H2_1+", "4He_2+", ...)
+# harmonic = 4              # RF harmonic h
+# n_dees = 4                # number of dees; 4-fold symmetric machines are supported
+# dee_shape = "radial"      # "radial": gap lines made of straight segments; "spiral" is not supported yet
+# dee_center_angles_deg = [45.0, 135.0, 225.0, 315.0]   # azimuth of every dee's centre line
+# dee_opening_deg = 40.0    # angular width of every dee
+# dee_voltage_kv = 20.0     # dee voltage the electrode model is built (and the BEM field normalised) at
+# design_voltage_kv = 20.0  # dee voltage of the 1D gap model the seed geometry was optimized with
+# gap_width_m = 0.008       # nominal gap width of the dee-system template
+# gap_angle_deg = 2.5       # gap width law: max(gap_width_min_m, r * gap_angle_deg)
+# gap_width_min_m = 0.005
+# r_min_m = 0.005           # inner end of the gap lines
+# r_max_cavity_m = 0.13     # outer end of the gap lines
+# r_max_m = 0.14            # tracking: particles beyond this radius are lost
+# z_max_m = 0.012           # tracking: particles beyond |z| are lost
+# target_energy_mev = 0.8   # tracking: a run ends at the turn its reference reaches it (track.stop_at_target_energy)
+# n_turns_design = 6        # turns of the seed optimization (used to rebuild its dee system)
+# skip_turns_design = 1
+
+[magnet]
+sign = 1.0                  # multiplies the map (its Bz sign vs the tracker's convention)
+scale = 1.0                 # multiplies the map
+crop_r_m = 0.40             # radius of the 3D crop kept in memory
+flatten_r_m = 0.0           # > 0: flatten the central field inside this radius (Maxwell-consistent); 0 = off
+
+[inflector]
+rotation_deg = 0.0          # rotation of the spiral inflector about the machine axis (field, housing, bunch)
+refine = 4                  # E-field grid refinement before a rotation
+refine_z_max_m = 0.030      # |z| kept when refining
+zshift_m = 0.0              # vertical shift of the inflector field
+flip_z = false
+housing_scale = 0.001       # housing STEP units -> m
+
+[fields]                    # BEM solve and field grid
+dxy_m = 0.0015              # grid spacing in x and y
+margin_m = 0.005            # grid half-width = model r_cut + margin
+z_half_m = 0.028            # grid covers |z| <= z_half_m
+dz_m = 0.002
+stack_z_half_m = 0.030      # the z slices of track.obstacles = "raster": |z| range and spacing
+stack_dz_m = 0.001
+stack_dxy_m = 0.0005        # x-y node spacing of the metal test (columns and slices) and of the field's metal mask
+max_elements = 80000        # refuse larger meshes
+tol = 1e-5                  # GMRES tolerance
+solver = "auto"             # auto | cupy | scipy | strong | dense (a direct LU); auto takes dense for a mirror-symmetric
+                            # mesh, else the GPU when the matrix fits it, else scipy
+symmetry = "auto"           # auto: a mesh that is mirror symmetric about z = 0, triangle for triangle (geometry.mirror_mesh
+                            # builds one), is solved for its upper half and its potential evaluated on z >= 0 only;
+                            # "off": never; "require": fail on any other mesh
+pot_device = "gpu"          # potential evaluation on cpu | gpu
+pot_precision = "single"    # single | double
+pot_chunk = 250000          # points per potential batch (on the GPU also held to one short launch)
+pot_check = 3000            # points re-evaluated in double precision as a check
+gpu_fit_safety = 1.05       # GPU memory head-room factor of the potential batches
+
+[track]                     # bunch tracking
+pusher = "boris_rel"
+steps_per_turn = 1000
+turns = 8
+stop_at_target_energy = true   # end a run at the turn its reference reaches machine.target_energy_mev; false: every
+                            # run tracks `turns` turns, so designs of an optimisation are scored at the same turn
+fast3d = true               # numba 3D fast path
+fast3d_interp = "point"
+volt_scale = 1.0            # dee voltage / the model's voltage
+phases_deg = []             # RF phases [deg]; several = a phase scan whose best (T x E) gets the final run;
+                            # empty = the seed's phase and +-10 deg
+n_scan = 4000               # particles per phase-scan run
+n_final = 0                 # particles of the final run; 0 = the whole hand-off bunch
+seed_scan = 0               # bunch sampling seeds
+seed_final = 2
+sc = true                   # space charge
+sc_cells = 64               # phase scan: FFT grid nodes per axis (0 = cell size sc_h_m)
+sc_every = 5                # phase scan: steps between Poisson solves
+sc_final_cells = 128        # the final run's grid and solve interval
+sc_final_every = 1
+sc_h_m = 0.0005             # FFT cell size when the nodes per axis are 0
+sc_max_cells = 8000000      # cap on the total FFT cells when the cell size sets the grid
+sc_window_q = 0.002         # particles outside the [q, 1 - q] quantiles per axis neither deposit nor feel SC
+sc_frame = "bunch"          # "bunch" (grid turned onto the mean horizontal velocity) | "lab"
+sc_gpu = true
+sc_current_ma = 0.0         # 0 = the hand-off file's current
+sc_gpu_pool_gb = 0.0        # > 0: limit of the GPU memory pool of the space-charge solver [GiB]; 0 = the solver's own
+                            # (2 GiB). A train's mesh at 128 nodes needs more (the run says how much)
+# Bunch train (opt-in): the bunch of the run among the bunches of the turns next to it. One bunch is released every
+# machine.harmonic RF periods (one revolution), so at any moment the bunches sit side by side on neighbouring turns;
+# all of them share one space-charge mesh. 0 and 0 = the bunch alone. The outputs describe the run's bunch only, in
+# its own clock, plus a table per bunch (track.json: final.train).
+bunches_ahead = 0           # bunches released before the run's bunch (older: they fly on the turns outside it)
+bunches_behind = 0          # bunches released after it (younger: inside it)
+train_coupled = true        # false = the control of a train run: the run's bunch feels only its own charge, on the
+                            # train's mesh, while the other bunches fly as before (two solves per step). A train run
+                            # and its control differ by the neighbours' forces on the run's bunch
+train_charge = 1.0          # charge of those bunches relative to the run's bunch; 0 = weightless: tracked on the same
+                            # mesh, but nothing feels them and they feel no charge of their own (a cheaper, rougher
+                            # control: without their own space charge they have other sizes, so the mesh differs)
+sc_train_cells_radial = 512 # train: FFT grid nodes across the train (the radial axis of the bunch frame); along the
+                            # bunch and vertically the nodes stay sc_cells / sc_final_cells
+n_tracks = 20000            # particles whose full tracks are stored (final run)
+track_every = 4             # steps between stored track points
+probes_deg = [25.0, 45.0]   # azimuths of the radial probes (final run)
+snapshot_ns = [10.0, 20.0, 30.0, 40.0]   # times [ns] of full-beam snapshots (final run)
+obstacles = "columns"       # metal test: "columns" (the metal's z intervals per x-y node, exact in z) | "raster"
+                            # (the design deck's z slices 1 mm apart: a face acts at the half millimetre next to it;
+                            # for comparisons with deck runs) | "mesh" (the model's triangles, GPU, no fast path)
+extra_posts_mm = []         # full-height grounded posts [[x, y, r], ...] mm; obstacle test only, the field is unchanged
+extra_boxes_mm = []         # full-height grounded boxes [[xmin, xmax, ymin, ymax], ...] mm; obstacle test only
+extra_jaws_mm = []          # vertical jaw pairs [[x, y, r, z_half], ...] mm: metal at |z| >= z_half over the disc;
+                            # obstacle test only
+
+[slit]                      # a two-sided radial slit: two thin full-height jaws on one ray (obstacle only, no field;
+                            # exact for jaws mounted inside a dee, away from its gaps). Cheap to optimise: no new BEM.
+half_width_mm = 0.0         # half the opening between the jaws; 0 = no slit
+azimuth_deg = 315.0         # the ray the jaws sit on
+pass_index = 3              # centre = the reference particle's radius at its crossing number pass_index of that ray
+                            # (the probes' pass numbering), or r_center_mm with pass_index = -1 ...
+offset_mm = 0.0             # ... plus offset_mm
+r_center_mm = 0.0           # the slit centre when pass_index = -1
+jaw_length_mm = 6.0         # radial length of each jaw (keep it below the gap to the neighbouring turns)
+thickness_mm = 2.0          # azimuthal thickness of each jaw: more than a tracking step there (2 pi r / steps_per_turn)

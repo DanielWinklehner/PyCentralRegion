@@ -1,0 +1,119 @@
+"""First-harmonic trim of the magnet field, a design knob for centring the first turns.
+
+A trim (coils, or a shimmed pole) adding a first harmonic b(r) cos(theta - theta_0) to the median-plane B_z shifts the
+orbit centres of the turns it acts on. Whether the beam gains from that is a cheap question - the electrodes and the
+BEM field stay as they are - so the trim is a [btrim] section the optimizer can vary.
+
+The trim is a vacuum field. From the scalar potential Phi = z f - z^3/6 lap_perp f with f = b(r) cos(theta - theta_0):
+
+    B_z     = [b - z^2/2 (b'' + b'/r - b/r^2)] cos(theta - theta_0)
+    B_r     = z b' cos(theta - theta_0)
+    B_theta = -z (b / r) sin(theta - theta_0)
+
+divergence-free exactly and curl-free to O(z^2), the order the median-plane expansion carries. b(r) is
+``amplitude_t`` on [r_min_m, r_max_m] and rises / falls to 0 over ``edge_m`` on either side with the quintic
+smoothstep (C2, so b'' is continuous). A first harmonic has to vanish on the axis, so r_min_m >= edge_m.
+
+The same harmonic can be given by its Cartesian components instead, b_c cos(theta) + b_s sin(theta) on the same
+profile, ``amplitude_cos_t`` = b_c and ``amplitude_sin_t`` = b_s, which add to the polar part (``resolved``: exact,
+since the field is linear in them). An optimiser should vary those: the polar azimuth is periodic (-180 and +180 deg
+are one trim, on opposite faces of a search box) and does nothing at zero amplitude, while the components have
+neither a seam nor more than one zero.
+
+``add_trim`` adds it to the node values of the 3D map crop before the Field is made (``machine.magnet_field_3d``):
+the tracked field stays one gridded map, which the compiled 3D tracker needs.
+"""
+import dataclasses
+import math
+
+import numpy as np
+
+from .config import ConfigError
+
+
+@dataclasses.dataclass
+class BTrimConfig:
+    amplitude_t: float = 0.0         # first-harmonic amplitude of the median-plane B_z [T]; 0 = no trim
+    phase_deg: float = 0.0           # azimuth of the maximum [deg]
+    amplitude_cos_t: float = 0.0     # the same harmonic as Cartesian components b_c cos(theta) + b_s sin(theta) [T],
+    amplitude_sin_t: float = 0.0     # added to the polar part (the coordinates to optimise: no seam, one zero)
+    r_min_m: float = 0.0             # full amplitude between r_min_m and r_max_m [m] (the machine's: 0 = not set, a
+    r_max_m: float = 0.0             # trim with an amplitude refuses it) ...
+    edge_m: float = 0.01             # ... falling to 0 over edge_m on either side
+
+
+def resolved(bt):
+    """The trim as one polar harmonic: the Cartesian components added to amplitude_t at phase_deg, then written as
+    amplitude_t at phase_deg (hypot and atan2 of the sums). A trim without Cartesian components is returned as it is,
+    so a polar trim's field stays bit for bit."""
+    if bt.amplitude_cos_t == 0.0 and bt.amplitude_sin_t == 0.0:
+        return bt
+    ph = math.radians(bt.phase_deg)
+    c = float(bt.amplitude_t) * math.cos(ph) + float(bt.amplitude_cos_t)
+    s = float(bt.amplitude_t) * math.sin(ph) + float(bt.amplitude_sin_t)
+    return dataclasses.replace(bt, amplitude_t=math.hypot(c, s), phase_deg=math.degrees(math.atan2(s, c)),
+                               amplitude_cos_t=0.0, amplitude_sin_t=0.0)
+
+
+def _smoothstep(t):
+    """Quintic smoothstep s(t) and its first two derivatives, t clipped to [0, 1]."""
+    t = np.clip(t, 0.0, 1.0)
+    return (t ** 3 * (10.0 - 15.0 * t + 6.0 * t * t), 30.0 * t * t * (1.0 - t) ** 2,
+            60.0 * t * (1.0 - t) * (1.0 - 2.0 * t))
+
+
+def profile(r, bt):
+    """b(r), b'(r), b''(r) [T, T/m, T/m^2] of the trim's radial profile, at the amplitude of the ``resolved`` trim."""
+    if bt.edge_m <= 0 or bt.r_min_m < bt.edge_m or bt.r_max_m <= bt.r_min_m:
+        raise ConfigError(f"[btrim] needs 0 < edge_m <= r_min_m < r_max_m (got edge {bt.edge_m}, r_min {bt.r_min_m}, "
+                          f"r_max {bt.r_max_m}); the radii are the machine's and have no default")
+    r = np.asarray(r, dtype=float)
+    e = bt.edge_m
+    s1, d1, dd1 = _smoothstep((r - (bt.r_min_m - e)) / e)
+    s2, d2, dd2 = _smoothstep((r - bt.r_max_m) / e)
+    w = s1 * (1.0 - s2)
+    wp = (d1 * (1.0 - s2) - s1 * d2) / e
+    wpp = (dd1 * (1.0 - s2) - 2.0 * d1 * d2 - s1 * dd2) / e ** 2
+    a = float(resolved(bt).amplitude_t)
+    return a * w, a * wp, a * wpp
+
+
+def trim_field(x, y, z, bt):
+    """The trim's (Bx, By, Bz) [T] at points (arrays of one shape)."""
+    bt = resolved(bt)
+    r = np.hypot(x, y)
+    rs = np.maximum(r, 1e-12)
+    th = np.arctan2(y, x)
+    b, bp, bpp = profile(r, bt)
+    c, s = np.cos(th - np.radians(bt.phase_deg)), np.sin(th - np.radians(bt.phase_deg))
+    bz = (b - 0.5 * z * z * (bpp + bp / rs - b / rs ** 2)) * c
+    br = z * bp * c
+    bth = -z * (b / rs) * s
+    ct, st = np.cos(th), np.sin(th)
+    return br * ct - bth * st, br * st + bth * ct, bz
+
+
+def add_trim(crop, bt, scaling=1.0, verbose=True):
+    """Add the trim of [btrim] to a 3D map crop (``fields3d.crop_comsol_3d`` layout) in place, divided by the Field
+    ``scaling`` the crop will get, so the tracked field carries the trim at its amplitude. Only the nodes inside
+    r_max_m + edge_m are touched. Returns the crop."""
+    polar = resolved(bt)
+    if polar.amplitude_t == 0.0:
+        return crop
+    gx, gy, gz = (np.asarray(crop['grid'][k], dtype=float) for k in 'xyz')
+    reach = polar.r_max_m + polar.edge_m
+    ix = np.flatnonzero(np.abs(gx) <= reach)
+    iy = np.flatnonzero(np.abs(gy) <= reach)
+    X, Y, Z = np.meshgrid(gx[ix], gy[iy], gz, indexing='ij')
+    bx, by, bz = trim_field(X, Y, Z, polar)
+    block = (slice(ix[0], ix[-1] + 1), slice(iy[0], iy[-1] + 1), slice(None))
+    for k, v in zip('xyz', (bx, by, bz)):
+        crop['values'][k][block] += v / float(scaling)
+    if verbose:
+        given = ('' if polar is bt else
+                 f" (given as cos {bt.amplitude_cos_t * 1e4:+.2f} G, sin {bt.amplitude_sin_t * 1e4:+.2f} G"
+                 + (f", plus {bt.amplitude_t * 1e4:.2f} G at {bt.phase_deg:+.1f} deg" if bt.amplitude_t else '') + ')')
+        print(f"[btrim] first harmonic {polar.amplitude_t * 1e4:.2f} G at {polar.phase_deg:+.1f} deg{given} on "
+              f"r = {polar.r_min_m * 1e3:.0f}..{polar.r_max_m * 1e3:.0f} mm (edges {polar.edge_m * 1e3:.0f} mm) added "
+              f"to the map", flush=True)
+    return crop

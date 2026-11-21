@@ -25,6 +25,7 @@ import csv
 from .tracking import TrackingEngine
 from .diagnostics import (PoincareAnalyzer, calculate_turn_metrics,
                           BeamStatisticsCollector, TurnStatistics)
+from .probes import beam_sense, crossing_direction, crossing_fraction, interpolate, start_pass
 from PyPATools.particles import ParticleDistribution
 from PyPATools.field import Field
 from PyPATools.global_variables import CLIGHT
@@ -136,7 +137,8 @@ class ProbeRecorder:
     that starts already past a probe (a probe just downstream of the hand-off plane cuts the
     bunch) begins at pass 1, so the passes of one turn line up across the bunch. The sense of
     rotation is taken from the beam's angular momentum at the first record; a crossing against
-    it is kept with ``direction`` -1.
+    it is kept with ``direction`` -1. The rules are those of the module ``probes``, shared with
+    the probes built from recorded tracks (``analysis.metrics.probe_crossings``).
 
     Attach to ``AcceleratedOrbitFinder.probes``; ``track_with_rf`` resets it and calls ``record``
     every step with the real particles only. ``data()`` returns one dict of arrays per probe."""
@@ -166,15 +168,12 @@ class ProbeRecorder:
             self._seen = np.zeros(len(r), dtype=bool)
             self._passes = np.zeros((len(self.angles_deg), len(r)), dtype=np.int32)
         if not self.sense and np.any(active):
-            lz = r[active, 0] * v[active, 1] - r[active, 1] * v[active, 0]
-            self.sense = 1.0 if np.sum(lz) >= 0.0 else -1.0
+            self.sense = beam_sense(r[active], v[active])
         new = active & ~self._seen
         if np.any(new) and self.sense:
-            # azimuth of each new particle relative to each probe, wrapped to (-pi, pi]: ahead of
-            # the probe (in the direction of motion) means pass 0 is already behind it
-            ph = np.arctan2(r[new, 1], r[new, 0])[:, None] - np.deg2rad(self.angles_deg)[None, :]
-            ahead = self.sense * np.angle(np.exp(1j * ph)) > 0.0
-            self._passes[:, new] = ahead.T.astype(np.int32)
+            # pass 1 at each probe a new particle is already past in the direction of motion, else 0
+            self._passes[:, new] = start_pass(np.arctan2(r[new, 1], r[new, 0])[:, None],
+                                              np.asarray(self.angles_deg)[None, :], self.sense).T
             self._seen |= new
         if self._r0 is not None and len(self._r0) == len(r):
             both = active & self._a0
@@ -183,15 +182,15 @@ class ProbeRecorder:
                 idx = np.nonzero(both & ((a < 0.0) != (b < 0.0)))[0]
                 if not len(idx):
                     continue
-                f = a[idx] / (a[idx] - b[idx])
-                rc = self._r0[idx] + f[:, None] * (r[idx] - self._r0[idx])
+                f = crossing_fraction(a[idx], b[idx])
+                rc = interpolate(self._r0[idx], r[idx], f)
                 along = rc[:, :2] @ self._along[k]
                 keep = (along >= self.r_min) & (along <= self.r_max)
                 if not np.any(keep):
                     continue
                 idx, f, rc = idx[keep], f[keep], rc[keep]
-                vc = self._v0[idx] + f[:, None] * (v[idx] - self._v0[idx])
-                direction = np.where(self.sense * b[idx] >= 0.0, 1, -1).astype(np.int8)
+                vc = interpolate(self._v0[idx], v[idx], f)
+                direction = crossing_direction(b[idx], self.sense)
                 self._rows[k].append((idx.astype(np.int32), self._passes[k, idx].copy(), direction,
                                       rc, vc, self._t0 + f * (t - self._t0), np.full(len(idx), int(step), np.int32)))
                 self._passes[k, idx] += 1
@@ -512,6 +511,17 @@ class AcceleratedOrbitFinder:
         self.n_particles = 1
         self.is_multiparticle = False
         self._n_ref = 0
+        # Bunch train (handoff.make_train): the rows behind the run's own bunch
+        # are companions - the bunches of the turns next to it. They are
+        # tracked, carry charge and are lost like any particle, but count in
+        # no statistic, record or probe; n_particles is the own bunch's count.
+        # After a run: last_record_offset (steps of the train's clock before
+        # the own bunch's), last_final_state (r, v, active of every row) and
+        # last_train (live particles per bunch at every logged turn).
+        self._n_companions = 0
+        self.last_record_offset = 0
+        self.last_final_state = None
+        self.last_train = None
         # Optional midplane obstacle test inside(xy) -> bool array (see
         # electrodes3d.midplane_obstacles): particles entering metal are lost
         # (tracking.MetalTerminator). A virtual reference particle is exempt
@@ -547,7 +557,7 @@ class AcceleratedOrbitFinder:
         # Compiled MULTI-PARTICLE 3D fast path (fast_track3d.py): the whole
         # bunch advanced for a chunk of steps in one njit kernel, with the same
         # callback replaying the recorded steps. OFF by default; the 3D bunch
-        # deck turns it on from HCHC60_FAST3D=1. 'point' inlines the field
+        # tracker (simulate3d) sets it from [track] fast3d. 'point' inlines the field
         # interpolation per particle (fast, 1 ulp from the Python path);
         # 'batch' calls interpolators._interp3d_batch3 itself and is bit-exact.
         self.fast3d = False
@@ -568,7 +578,7 @@ class AcceleratedOrbitFinder:
         # its solve count, timings and mean |E_sc| land in the result metadata
         # under 'space_charge'. Disables the single-particle fast path.
         self.space_charge = None
-        # Multiparticle objective options (MiniDAR 2026-10-20, Daniel: "optimize for transmission, mean
+        # Multiparticle objective options (2026-10-20, Daniel: "optimize for transmission, mean
         # energy, and centeredness, only using turns 3 and beyond"):
         #   center_source  'reference' (default): the 'center' block measures the reference particle's
         #                  orbit centre; 'bunch': the orbit centre of the BUNCH CENTROID (mean of the
@@ -605,6 +615,10 @@ class AcceleratedOrbitFinder:
         # TURN_BUDGET_MARGIN), and the per-block sums of squares of the
         # least-squares residual, so weight tuning can be observational.
         self.last_budget_exhausted = False
+        # set by track_with_rf when the virtual reference was lost and its
+        # fallback turn clock took over (None: the reference survived)
+        self.last_reference_lost = None
+        self.last_stop = None
         self.last_resid_blocks = {}
         self.best_resid_blocks = {}
         self._checkpoint_inited = False
@@ -692,7 +706,7 @@ class AcceleratedOrbitFinder:
             # identity test against static_efields alone misses it and
             # superpose_efield SUMS the two: the inflector's E_x / E_y applied twice
             # (E_z only once, since the slice drops it). Measured 2026-09-16 at the
-            # HCHC-60 injection point: E_x -748624 V/m tracked where -374312 is
+            # injection point of a 60 MeV H2+ machine: E_x -748624 V/m tracked where -374312 is
             # correct, with E_z right - an error that survives a sanity check.
             # InflectorModel caches both forms (_field, _field2d) and there is one
             # instance per process, so identity still settles it.
@@ -815,13 +829,23 @@ class AcceleratedOrbitFinder:
         """Record the REAL particle count of a prepared beam.
 
         ``n_ref`` is the number of prepended virtual reference particles (0 or
-        1, as returned by ``_prepare_beam``); they do not count as beam.
+        1, as returned by ``_prepare_beam``); they do not count as beam. Of a
+        bunch train (``handoff.make_train``) only the run's own bunch counts:
+        the rows behind it are companions (``_n_companions``) - tracked, with
+        their charge and their losses, but in no statistic, record or probe.
         """
         self._n_ref = int(n_ref)
-        self.n_particles = int(beam.numpart) - self._n_ref
+        n_real = int(beam.numpart) - self._n_ref
+        n_scored = getattr(beam, 'n_scored', None)
+        if n_scored is not None and not 0 < int(n_scored) <= n_real:
+            raise ValueError(f"the beam's own bunch has {n_scored} of its {n_real} particles")
+        self.n_particles = n_real if n_scored is None else int(n_scored)
+        self._n_companions = n_real - self.n_particles
         self.is_multiparticle = self.n_particles > 1
 
-    _BEAM_EXTRAS = ('birth_time', 'reference_state', 'handoff_meta', 'macro_charge_c')
+    # hand-off extras (see handoff.py); the last four mark a bunch train (handoff.TRAIN_EXTRAS)
+    _BEAM_EXTRAS = ('birth_time', 'reference_state', 'handoff_meta', 'macro_charge_c',
+                    'n_scored', 'bunch_of', 'charge_weight', 'train')
 
     def _copy_beam(self, beam: ParticleDistribution) -> ParticleDistribution:
         pd = ParticleDistribution(species=self.design.species,
@@ -869,9 +893,14 @@ class AcceleratedOrbitFinder:
         birth = getattr(pd, 'birth_time', None)
         if birth is not None:
             out.birth_time = np.concatenate([[0.0], np.asarray(birth, dtype=float)])
-        for name in ('handoff_meta', 'macro_charge_c'):
+        for name in ('handoff_meta', 'macro_charge_c', 'n_scored', 'train'):
             if hasattr(pd, name):
                 setattr(out, name, getattr(pd, name))
+        # a bunch train's per-particle extras: the reference rides with the run's bunch (label 0)
+        for name, first in (('bunch_of', 0), ('charge_weight', 1.0)):
+            if getattr(pd, name, None) is not None:
+                val = np.asarray(getattr(pd, name))
+                setattr(out, name, np.concatenate([np.array([first], dtype=val.dtype), val]))
         return out, 1
 
     def _prepare_beam(self, initial_beam, r0=None, pr0=None,
@@ -1030,9 +1059,18 @@ class AcceleratedOrbitFinder:
         virtual reference particle (``self._n_ref == 1``) that particle drives
         the Poincare section and the reference trajectory, and is excluded from
         the beam statistics and from ``full_beam``.
+
+        A bunch train (``handoff.make_train``, ``self._n_companions`` rows
+        behind the run's own bunch) is tracked whole, but everything returned
+        is of the own bunch, with steps counted in its own clock (see the
+        train block below); ``last_train`` and ``last_final_state`` tell of
+        the other bunches.
         """
         n_ref = self._n_ref
         self.last_budget_exhausted = False
+        self.last_reference_lost = None
+        self.last_final_state = None
+        self.last_train = None
 
         if section_angle is None:
             x0 = pd_init.x_vec[0]
@@ -1055,6 +1093,21 @@ class AcceleratedOrbitFinder:
         turn_counter = [0]
         energy_reached = [False]
         n_recorded = [0]
+        stop_reason = [None]           # 'turns' | 'energy' | 'beam_lost' (callback); see last_stop
+        # Fallback turn clock for a LOST virtual reference. The reference is
+        # exempt from the metal test but not from the r_max / z_max boundary;
+        # without it no crossing is ever logged again: the per-turn record
+        # (and the run's 'transmission') ends at its last logged crossing
+        # while the run spends its whole step budget (max_turns +
+        # TURN_BUDGET_MARGIN turns), so the final states are turns later than
+        # the "final" turn. Once the reference is gone, a turn
+        # is counted every `period` steps after its last logged crossing (its
+        # launch when none was logged): period = the mean of its completed
+        # turns, the nominal steps_per_turn when it completed none. A
+        # reference that is merely not yet born (timed release) never starts
+        # the clock. Runs whose reference survives are not changed.
+        ref_clock = {'launch': None, 'lost': None, 'next': None, 'period': None,
+                     'turns_logged': 0, 'steps': []}
 
         # See TURN_BUDGET_MARGIN: the abort below fires the moment the last turn
         # is logged, so the margin is only ever consumed when actually needed.
@@ -1081,6 +1134,31 @@ class AcceleratedOrbitFinder:
             pd_init.alive = birth_step == 0
             from .tracking import TimedRelease
             release = TimedRelease(birth_step)
+        # Bunch train (handoff.make_train): the rows behind the run's own bunch
+        # are companions, the bunches of the turns next to it. Those released
+        # before it start the clock; everything this run records - turns,
+        # statistics, the beam record, the probes - is of its own bunch and in
+        # that bunch's own clock: step 0 is where a run of the bunch alone
+        # would start, `rec_off` steps into the train's clock. So a train run
+        # reads like a single-bunch run, and its particles pair with one.
+        n_own = int(self.n_particles)
+        n_comp = int(getattr(self, '_n_companions', 0) or 0)
+        own = None                     # the rows of the run's own bunch (with companions only)
+        rec_off, t0_rec = 0, t0
+        train_labels = train_slot = None
+        train_alive = []               # live particles per bunch at every logged turn
+        if n_comp:
+            if release is None:
+                raise ValueError("a bunch train needs the timed launch and the birth times of handoff.make_train")
+            own = np.zeros(int(pd_init.numpart), dtype=bool)
+            own[n_ref:n_ref + n_own] = True
+            t0_rec = float(min(0.0, birth[n_ref:n_ref + n_own].min()))
+            rec_off = int(round((t0_rec - t0) / dt))
+            labels = getattr(pd_init, 'bunch_of', None)
+            labels = (np.asarray(labels) if labels is not None
+                      else np.where(own, 0, 1))                    # unlabelled companions: one group
+            train_labels, train_slot = np.unique(labels[n_ref:], return_inverse=True)
+        self.last_record_offset = rec_off
         extras = [release] if release is not None else []
         if self.space_charge is not None:
             # after the release (newly born particles deposit in the same step),
@@ -1095,8 +1173,15 @@ class AcceleratedOrbitFinder:
             'reference_birth_step': int(birth_step[0]) if len(birth_step) else 0,
             'n_released_later': int(np.sum(birth_step > 0)),
             'birth_quantization_s': 0.5 * dt if release is not None else 0.0}
+        if n_comp:
+            # the same in the own bunch's clock, and the train's own clock: where it starts and how far the run's
+            # bunch is into it
+            self.last_launch.update(
+                t0_s=t0_rec, reference_birth_step=int(birth_step[0]) - rec_off,
+                n_released_later=int(np.sum(birth_step[:n_ref + n_own] > rec_off)),
+                train={'t0_s': t0, 'record_offset_steps': rec_off, 'n_companions': n_comp})
         if save_times_s is not None:
-            full_beam = SparseBeamRecord(save_times_s, self.n_particles, t0, dt,
+            full_beam = SparseBeamRecord(save_times_s, self.n_particles, t0_rec, dt,
                                          track_ids=track_ids, track_every=track_every)
         else:
             full_beam = (np.full((n_steps, self.n_particles, 6), np.nan)
@@ -1104,6 +1189,8 @@ class AcceleratedOrbitFinder:
         probes = getattr(self, 'probes', None)      # ProbeRecorder: every crossing of every real particle
         if probes is not None:
             probes.reset()
+        # birth steps of the real particles; of a train, of the run's own bunch in its own clock
+        birth_own = birth_step[n_ref:n_ref + n_own] - rec_off if n_comp else birth_step[n_ref:]
 
         def callback(step, r_array, v_array, active, t):
             if not np.any(active):
@@ -1112,10 +1199,11 @@ class AcceleratedOrbitFinder:
             if n_ref:
                 real = active.copy()
                 real[:n_ref] = False
-                if not np.any(real) and not np.any(birth_step[n_ref:] > step + 1):
+                if not np.any(real) and not np.any(birth_own > step + 1):
                     # Physical beam gone (none alive, none still to be born);
                     # the virtual reference alone would keep logging turns
                     # over an empty bunch.
+                    stop_reason[0] = 'beam_lost'
                     return True
             else:
                 real = active
@@ -1149,6 +1237,11 @@ class AcceleratedOrbitFinder:
             n_recorded[0] = step + 1
 
             if active[0]:
+                if ref_clock['launch'] is None:
+                    # the state before its first active step is its launch,
+                    # on the section: a crossing logged at step s happened
+                    # during step s, so turn k spans turn_ids[k] - launch
+                    ref_clock['launch'] = step - 1
                 # step 0 compares the post-step position with itself, so no
                 # crossing can be logged there; that is what keeps a launch
                 # exactly on the section from registering immediately.
@@ -1180,16 +1273,68 @@ class AcceleratedOrbitFinder:
 
                     if poincare.crossings[-1].energy_mev >= self.target_energy_mev:
                         energy_reached[0] = True
+                        stop_reason[0] = 'energy'
                         if self.verbose:
                             print(f"    Reached target energy at turn {turn_counter[0]}")
                         return True
                     if turn_counter[0] >= max_turns:
+                        stop_reason[0] = 'turns'
                         if self.verbose:
                             print(f"    Reached max turns: {turn_counter[0]}")
                         return True
 
                 callback.r_prev = r_array[0].copy()
+            elif n_ref and ref_clock['launch'] is not None:
+                # The virtual reference was born and is now gone: the fallback
+                # clock counts the remaining turns (see ref_clock above).
+                if ref_clock['next'] is None:
+                    k = len(turn_ids)
+                    period = ((turn_ids[-1] - ref_clock['launch']) / k if k
+                              else float(self.steps_per_turn))
+                    ref_clock.update(lost=step, period=period, turns_logged=k,
+                                     next=(turn_ids[-1] if k else ref_clock['launch']) + period)
+                    if self.verbose:
+                        print(f"    Reference lost at step {step} after {k} turns: "
+                              f"turns now counted every {period:.1f} steps")
+                if step >= ref_clock['next']:
+                    beam_stats_collector.record(step, r_array[real], v_array[real], t)
+                    beam_stats_collector.increment_turn()
+                    if self.is_multiparticle:
+                        last_turn_v[0] = np.array(v_array[real], dtype=float, copy=True)
+                    ref_clock['steps'].append(step)
+                    ref_clock['next'] += ref_clock['period']
+                    turn_counter[0] += 1
+                    # no reference energy any more: the bunch mean stands in
+                    if beam_stats_collector.turn_stats[-1].mean_energy_mev >= self.target_energy_mev:
+                        energy_reached[0] = True
+                        stop_reason[0] = 'energy'
+                        if self.verbose:
+                            print(f"    Bunch mean reached the target energy at turn {turn_counter[0]}")
+                        return True
+                    if turn_counter[0] >= max_turns:
+                        stop_reason[0] = 'turns'
+                        if self.verbose:
+                            print(f"    Reached max turns on the fallback clock: {turn_counter[0]}")
+                        return True
             return False
+
+        def train_callback(step, r_array, v_array, active, t):
+            """A bunch train's steps for ``callback``: the reference and the run's own bunch (the first rows), in
+            that bunch's clock. The steps before its release are the bunches ahead flying alone."""
+            if step < rec_off:
+                return False
+            m = n_ref + n_own
+            if not np.any(active[:m]) and not np.any(birth_own > step - rec_off + 1):
+                # the run's own bunch and its reference are gone: the companions alone are no run
+                stop_reason[0] = 'beam_lost'
+                return True
+            logged = turn_counter[0]
+            stop = callback(step - rec_off, r_array[:m], v_array[:m], active[:m], t)
+            if turn_counter[0] > logged:
+                train_alive.append(np.bincount(train_slot[active[n_ref:]], minlength=len(train_labels)))
+            return stop
+
+        step_callback = train_callback if n_comp else callback
 
         fast = None
         fast3 = None
@@ -1217,7 +1362,7 @@ class AcceleratedOrbitFinder:
             result = None
             if fast3 is not None:
                 from .fast_track3d import run_fast3d
-                result = run_fast3d(self, fast3, callback, dt, t0)
+                result = run_fast3d(self, fast3, step_callback, dt, t0)
             if result is None and fast is not None:
                 result = self._run_fast_path(fast, callback, dt, t0)
                 if result is None:
@@ -1228,6 +1373,9 @@ class AcceleratedOrbitFinder:
                     last_turn_v[0] = None
                     turn_counter[0] = 0
                     energy_reached[0] = False
+                    ref_clock.update(launch=None, lost=None, next=None, period=None,
+                                     turns_logged=0, steps=[])
+                    stop_reason[0] = None
                     poincare.crossings.clear()
                     poincare._armed = poincare.arm_angle <= 0.0
                     poincare._azimuth_travelled = 0.0
@@ -1238,7 +1386,7 @@ class AcceleratedOrbitFinder:
                         del callback.r_prev
             if result is None:
                 result = self.engine.track_multiparticle(
-                    pd_init, dt=dt, n_steps=n_steps, callback=callback,
+                    pd_init, dt=dt, n_steps=n_steps, callback=step_callback,
                     callback_frequency=1, show_progress=False, t0=t0,
                 )
         except Exception as e:
@@ -1255,12 +1403,36 @@ class AcceleratedOrbitFinder:
                 f"while {int(np.sum(birth_step > result.n_steps))} were still to be born - the "
                 f"tracker stops when nothing is alive; check the first-born particles against "
                 f"the obstacles / boundary before the bunch centre is even released")
+        # the last states of every row (reference first, then the run's bunch, then a train's companions) and, of
+        # a train, the live particles per bunch at every logged turn: what a caller builds its per-bunch table from
+        self.last_final_state = (result.r_final, result.v_final, result.active)
+        if n_comp:
+            self.last_train = {'labels': [int(k) for k in train_labels],
+                               'alive': [[int(c) for c in row] for row in train_alive],
+                               'record_offset_steps': int(rec_off)}
 
         # Distinguish "aborted on turns/energy" from "ran out of clock": the
         # tracker reports success either way, which is how a silently lost final
         # turn survived a 7272-evaluation optimization.
         self.last_budget_exhausted = (result.metadata.get('termination') is None
                                       and turn_counter[0] < max_turns)
+        # why the run ended: 'turns' / 'energy' (logged turn), 'beam_lost' (no
+        # real particle left, none to be born), 'all_lost' (the engine found
+        # nothing active), 'budget' (step budget spent)
+        term = result.metadata.get('termination')
+        self.last_stop = (stop_reason[0] if stop_reason[0] is not None
+                          else 'all_lost' if term == 'all_lost'
+                          else 'budget' if term is None else str(term))
+        if ref_clock['lost'] is not None:
+            self.last_reference_lost = {
+                'step': int(ref_clock['lost']),
+                'launch_step': int(ref_clock['launch']),
+                'turns_logged': int(ref_clock['turns_logged']),
+                'period_steps': float(ref_clock['period']),
+                'clock_steps': [int(s) for s in ref_clock['steps']]}
+            if self.verbose:
+                print(f"    WARNING: reference lost at step {ref_clock['lost']}; "
+                      f"{len(ref_clock['steps'])} turns counted on the fallback clock")
         if self.last_budget_exhausted and self.verbose:
             print(f"    WARNING: step budget exhausted after {turn_counter[0]}/"
                   f"{max_turns} turns ({n_steps} steps) - raise "
@@ -1559,7 +1731,7 @@ class AcceleratedOrbitFinder:
                     # within +-window_rel of E_c, against everything launched (post-collimator)
                     vlt = self.last_turn_v
                     if vlt is not None and len(vlt):
-                        c2 = 299792458.0 ** 2
+                        c2 = CLIGHT ** 2
                         gam = 1.0 / np.sqrt(1.0 - np.minimum(np.sum(vlt * vlt, axis=1) / c2, 1.0 - 1e-15))
                         e_last = (gam - 1.0) * float(self.design.species.mass_mev)
                         e_c = (float(np.median(e_last)) if self.window_center == 'median'
@@ -1814,9 +1986,16 @@ class AcceleratedOrbitFinder:
             # trajectory is the centroid orbit rather than a survivor mean.
             'reference_centroid': bool(self._n_ref),
             'budget_exhausted': bool(self.last_budget_exhausted),
+            # the virtual reference left the boundary and the fallback turn
+            # clock ended the run (step, turns it logged, period, clock steps)
+            'reference_lost': (dict(self.last_reference_lost)
+                               if self.last_reference_lost else None),
+            'stop': self.last_stop,
             'resid_blocks_best': dict(self.best_resid_blocks),
             # staggered launch bookkeeping (mode, clock start, reference birth step)
             'launch': dict(self.last_launch) if self.last_launch else None,
+            # bunch train: its bunches' labels and live particles per logged turn; None for a bunch alone
+            'train': dict(self.last_train) if getattr(self, 'last_train', None) else None,
             # compiled single-particle path: used / why not, kernel steps, time
             'fast_path': dict(self.last_fast_path) if self.last_fast_path else None,
             # space charge (tracking.SpaceChargeKick): solve count, timing,

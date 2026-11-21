@@ -1,9 +1,9 @@
 """
 handoff.py - Spiral-inflector hand-off bunches as initial beams.
 
-Reads the openPMD plane-crossing files written by the HCHC-60 spiral-inflector
-deck (spec version 1, 2026-09-07: ``BunchTrack.py --save-openpmd``, see
-``Spiral_inflector/Docs/openpmd_plane_crossing_handoff.md``) and turns them
+Reads the openPMD plane-crossing files written by the spiral-inflector deck
+(spyral_inflector, spec version 1, 2026-09-07: ``BunchTrack.py --save-openpmd``,
+see ``Spiral_inflector/Docs/openpmd_plane_crossing_handoff.md``) and turns them
 into a ``ParticleDistribution`` for ``AcceleratedOrbitFinder``.
 
 Two launch modes
@@ -30,6 +30,15 @@ Frame: the deck frame is the machine frame up to a rotation about z
 (``rotation_deg`` - where the exit sits relative to the dees is a design
 choice of the central region) and, if the deck's z axis points the other
 way, ``flip_z``. Units SI throughout; momenta in the file are eV/c.
+
+Bunch train
+-----------
+``make_train`` turns one such bunch into a train: the bunch and copies of it
+released a fixed period before and after it (``train_period_s``: one bunch
+every ``harmonic`` RF periods, one revolution, so the copies fly on the turns
+next to it). The bunch stays the first rows of the train, with its reference
+particle and t = 0; the finder tracks the others as companions and the
+space-charge hook puts them all on one mesh.
 """
 import warnings
 from typing import Optional, Union
@@ -38,7 +47,10 @@ import numpy as np
 from PyPATools.particles import ParticleDistribution
 from PyPATools.species import IonSpecies
 
-CLIGHT = 2.99792458e8
+from .frames import rotation_z
+from .kinematics import CLIGHT
+from .probes import beam_sense
+
 _PREFIX = "PyPATools:"
 
 
@@ -88,11 +100,6 @@ def load_handoff(path) -> dict:
     return out
 
 
-def _rot(deg: float) -> np.ndarray:
-    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
 def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecies] = None,
                            rotation_deg: float = 0.0, launch: str = 'timed',
                            reference: str = 'design', n_particles: Optional[int] = None,
@@ -115,11 +122,19 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
     meta = d['meta']
     mode = str(meta.get('mode', 'plane_crossing'))
     if species is None:
-        species = IonSpecies(str(meta.get('pypatools_species_name', 'H2_1+')))
-    m_ev = meta.get('species_mass_mev')
-    m_ev = float(m_ev) * 1e6 if m_ev is not None else getattr(species, 'mass_mev', None)
-    if m_ev is None:
+        if meta.get('pypatools_species_name') is None:
+            raise ValueError(f"{d.get('path')}: the file names no species (pypatools_species_name): pass species=")
+        species = IonSpecies(str(meta['pypatools_species_name']))
+    m_mev = meta.get('species_mass_mev')
+    m_species = getattr(species, 'mass_mev', None)          # PyPATools gives MeV / c^2 too
+    if m_mev is not None and m_species is not None and abs(float(m_species) / float(m_mev) - 1.0) > 1e-3:
+        raise ValueError(f"{d.get('path')}: the file's species has {float(m_mev):.3f} MeV, the tracked species "
+                         f"{float(m_species):.3f} MeV: a hand-off of another species")
+    if m_mev is None:
+        m_mev = m_species
+    if m_mev is None:
         raise ValueError("species mass unknown: the file has no species_mass_mev and the species no mass_mev")
+    m_ev = 1e6 * float(m_mev)
 
     r = np.array(d['r'], dtype=float)
     p = np.array(d['p_ev_c'], dtype=float)
@@ -162,7 +177,7 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
         v_ref = dir_mean / np.linalg.norm(dir_mean) * float(speed.mean())
 
     # ---- frame: rotation about z, optional z flip
-    R = _rot(rotation_deg)
+    R = rotation_z(rotation_deg)
     r, v = r @ R.T, v @ R.T
     x_ref, v_ref = R @ x_ref, R @ v_ref
     if flip_z:
@@ -179,7 +194,7 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
             if f_rf <= 0:
                 raise ValueError("snapshot launch needs omega_c (no rf_frequency_hz in the file)")
             omega_c = 2.0 * np.pi * f_rf / float(harmonic)
-        sense = np.sign(np.mean(r[:, 0] * v[:, 1] - r[:, 1] * v[:, 0])) or 1.0     # +1: counter-clockwise
+        sense = beam_sense(r, v)                                                   # +1: counter-clockwise
         speed = np.hypot(v[:, 0], v[:, 1])
         rho = speed / omega_c
         n_hat = np.column_stack([v[:, 1], -v[:, 0]]) / speed[:, None]              # right of travel
@@ -198,6 +213,7 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
     pd = ParticleDistribution(species=species, x_vec=r.copy(), p_vec=np.zeros_like(r))
     pd.set_p_from_v_vec(v.copy())
     pd.birth_time = birth
+    pd.handoff_index = idx                      # the hand-off file's particle of every bunch particle
     pd.reference_state = (x_ref, v_ref)
     pd.macro_charge_c = w_mean * n_total / n
     pd.handoff_meta = {
@@ -216,3 +232,59 @@ def make_beam_from_handoff(source: Union[str, dict], species: Optional[IonSpecie
               f"reference at r = {np.hypot(x_ref[0], x_ref[1]) * 1e3:.1f} mm, az = "
               f"{np.degrees(np.arctan2(x_ref[1], x_ref[0])):.1f} deg, |v| = {np.linalg.norm(v_ref):.4e} m/s")
     return pd
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# bunch train
+# What a train adds to a beam (``make_train``); ``AcceleratedOrbitFinder`` and ``tracking.SpaceChargeKick`` read them
+TRAIN_EXTRAS = ('n_scored', 'bunch_of', 'charge_weight', 'train')
+
+
+def train_period_s(harmonic: int, rf_frequency_hz: float) -> float:
+    """Time between two bunches that follow each other at one azimuth, turn after turn: ``harmonic`` RF periods, one
+    revolution of an isochronous machine. The RF buckets in between hold the bunches at the other azimuths."""
+    if int(harmonic) < 1 or not float(rf_frequency_hz) > 0.0:
+        raise ValueError(f"train period: harmonic {harmonic} and RF frequency {rf_frequency_hz} Hz")
+    return float(int(harmonic)) / float(rf_frequency_hz)
+
+
+def make_train(bunch: ParticleDistribution, n_ahead: int, n_behind: int, period_s: float,
+               charge: float = 1.0) -> ParticleDistribution:
+    """A bunch train from one bunch: the bunch itself and copies of it released ``k * period_s`` after it.
+
+    k = 0 is the bunch (the first rows of the train, unchanged: the bunch the run is about, 'scored'); k = -1 ..
+    -n_ahead are the bunches released before it, which fly ahead of it on the turns outside; k = 1 .. n_behind those
+    released after it, on the turns inside. Rows: bunch 0, then -1 .. -n_ahead, then 1 .. n_behind. With ``period_s`` =
+    ``train_period_s`` every bunch meets the same RF phase, so in the steady state of a machine each is the same bunch
+    at another age, and at any moment they sit side by side on neighbouring turns.
+
+    The train carries the bunch's reference, macro-charge and hand-off record (one bunch's: the reference particle
+    and t = 0 stay those of bunch 0), its birth times shifted per bunch, and ``TRAIN_EXTRAS``: ``n_scored`` (rows of
+    bunch 0), ``bunch_of`` (k of every row), ``charge_weight`` (1 for bunch 0, ``charge`` for the others: their charge
+    relative to bunch 0's; 0 makes them weightless companions) and ``train`` (labels, period, rows per bunch, charge).
+    """
+    n_ahead, n_behind = int(n_ahead), int(n_behind)
+    if n_ahead < 0 or n_behind < 0:
+        raise ValueError(f"a train of {n_ahead} bunches ahead and {n_behind} behind")
+    if not float(period_s) > 0.0:
+        raise ValueError(f"train period {period_s} s")
+    if float(charge) < 0.0:
+        raise ValueError(f"train charge {charge} (relative to the bunch: >= 0)")
+    n = int(bunch.numpart)
+    labels = [0] + [-k for k in range(1, n_ahead + 1)] + list(range(1, n_behind + 1))
+    birth = getattr(bunch, 'birth_time', None)
+    birth = np.zeros(n) if birth is None else np.asarray(birth, dtype=float)
+    out = ParticleDistribution(species=bunch.species, x_vec=np.tile(bunch.x_vec, (len(labels), 1)),
+                               p_vec=np.tile(bunch.p_vec, (len(labels), 1)))
+    out.birth_time = np.concatenate([birth.copy() if k == 0 else birth + k * float(period_s) for k in labels])
+    for name in ('reference_state', 'macro_charge_c', 'handoff_meta'):
+        if hasattr(bunch, name):
+            setattr(out, name, getattr(bunch, name))
+    index = getattr(bunch, 'handoff_index', None)
+    if index is not None:
+        out.handoff_index = np.tile(np.asarray(index), len(labels))
+    out.n_scored = n
+    out.bunch_of = np.repeat(np.asarray(labels, dtype=np.int64), n)
+    out.charge_weight = np.where(out.bunch_of == 0, 1.0, float(charge))
+    out.train = {'labels': labels, 'period_s': float(period_s), 'n_per_bunch': n, 'charge': float(charge)}
+    return out

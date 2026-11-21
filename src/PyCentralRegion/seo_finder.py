@@ -1085,13 +1085,13 @@ class SEOFinder:
         outermost SUCCESSFUL orbits - the two places the answer is not to be
         trusted. Inside, the field is not yet isochronous (the injection orbit's
         frequency is far off) and closure is poor; outside, the pole fringe rolls
-        the field over and the frequency drops away (on the HCHC-60 maps the
+        the field over and the frequency drops away (on a 60 MeV H2+ cyclotron's maps the
         outermost tabulated orbit sits ~3e-3 low while everything from 400 to
         1900 mm agrees to ~1e-3).
 
         Why this matters (2026-09-16): handing a cavity optimizer a free RF
         frequency lets a short-turn cost function pull it ABOVE the isochronous
-        value - on HCHC-60 by 6.5e-4 over 15 turns, which is 0.94 deg of phase
+        value - on that machine by 6.5e-4 over 15 turns, which is 0.94 deg of phase
         slip per turn at harmonic 4 and crests the beam at half energy. The
         frequency belongs to the FIELD, not to the cost function.
 
@@ -1127,8 +1127,8 @@ class SEOFinder:
             raise ValueError(f"isochronous_frequency: bad span {r_min_mm}..{r_max_mm} mm")
 
         # One radius at a time, tolerating failures: the Newton solve RAISES where no closed orbit
-        # exists, and that is precisely the fringe this method is meant to discard (on the HCHC-60
-        # 2.2 m maps it fails from ~2.09 m out). find_seos_at_radii would propagate the first one.
+        # exists, and that is precisely the fringe this method is meant to discard (on a 60 MeV H2+
+        # machine's 2.2 m maps it fails from ~2.09 m out). find_seos_at_radii would propagate the first one.
         radii = list(np.linspace(float(r_min_mm), float(r_max_mm), int(n_orbits)))
         # energy_seed_kev stays None so each radius derives its own seed from the local average field,
         # exactly as find_seos_at_radii does. Do NOT warm-start from the previous radius: seeding a large

@@ -1,26 +1,29 @@
-"""
-01_find_static_orbits.py - Find Static Equilibrium Orbits
+"""Static equilibrium orbits (SEOs) of a 2D midplane field map.
 
-Demonstrates SEO finding using Poincare section method.
-Defines radii, calculates ideal energies from B-field sampling.
+Shows: a CentralRegion design (species + midplane B map) and SEOFinder - the azimuthal average field,
+flutter and ideal energy at a few radii, closed orbits from 50 to 300 mm by the Poincare-section method,
+their closure quality, and the isochronism check (revolution frequency vs energy).
+Inputs: <resources>/midplane_field_0.5mm.comsol (COMSOL midplane export of a muon cyclotron, 0.5 mm grid).
+Runtime: about 1.5 minutes, most of it parsing the 150 MB field map.
+Outputs: <out>/seo_database.pkl, <out>/seo_poincare_analysis.png.
 
 Usage:
-    python 01_find_static_orbits.py
+    python examples/01_find_static_orbits.py [--resources DIR] [--out DIR]
 """
-
-import sys
 import numpy as np
 import matplotlib.pyplot as plt
-from pathlib import Path
 
-# Add parent directory to path to import from src/
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
-
+import _common
 from PyCentralRegion.central_region import CentralRegion
 from PyCentralRegion.seo_finder import SEOFinder, save_seo_database, analyze_isochronism
 
+FIELD_FILE = 'midplane_field_0.5mm.comsol'
+
 
 def main():
+    args = _common.parse(_common.arguments(__doc__))
+    field_path = _common.require(args.resources / FIELD_FILE)
+    output_dir = args.out
     print("=" * 70)
     print("STATIC EQUILIBRIUM ORBIT FINDER - POINCARE METHOD")
     print("=" * 70)
@@ -32,19 +35,10 @@ def main():
     print("\n1. Creating cyclotron design...")
     design = CentralRegion(name="CompactCyclotron", dimensionality='2D')
 
-    # Set ion species (H2+ molecular hydrogen ion)
     design.set_species('muon')
     print(f"   Species: {design.species.name}")
     print(f"   Mass: {design.species.mass_mev:.3f} MeV/c^2")
     print(f"   Charge: {design.species.q}e")
-
-    # Load magnetic field
-    field_path = Path(__file__).parent.parent / 'resources' / 'midplane_field_0.5mm.comsol'
-
-    if not field_path.exists():
-        print(f"\nERROR: Field file not found: {field_path}")
-        print("Please ensure midplane_field_0.5mm.comsol is in resources/")
-        sys.exit(1)
 
     print(f"\n2. Loading magnetic field from {field_path.name}...")
     design.set_magnetic_field(field_path, interpolator_backend='fast')
@@ -99,7 +93,7 @@ def main():
         n_turns=10,  # Track 10 turns
         steps_per_turn=500,  # 500 steps per turn
         n_theta_samples=36,  # Sample field at 36 angles
-        closure_tol_mm=0.5,  # 1 mm closure tolerance
+        closure_tol_mm=0.5,  # 0.5 mm closure tolerance
         algorithm='rk4_rel',
         verbose=True
     )
@@ -140,9 +134,6 @@ def main():
     # Save database
     # ========================================================================
 
-    output_dir = Path(__file__).parent.parent / 'output'
-    output_dir.mkdir(exist_ok=True)
-
     db_file = output_dir / 'seo_database.pkl'
     save_seo_database(orbits, str(db_file))
 
@@ -160,7 +151,7 @@ def main():
     ax1 = plt.subplot(3, 3, 1)
 
     print("  Plotting field map...")
-    extent = 0.4  # 350 mm
+    extent = 0.4  # 400 mm
     x_plot = np.linspace(-extent, extent, 150)
     y_plot = np.linspace(-extent, extent, 150)
     X, Y = np.meshgrid(x_plot, y_plot, indexing='ij')
