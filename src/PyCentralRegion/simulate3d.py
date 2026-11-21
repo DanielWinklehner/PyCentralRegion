@@ -315,15 +315,65 @@ def install(finder, fields, cav0, volt_scale):
 
 # ---------------------------------------------------------------------------------------------------------------------
 # tracking
-def space_charge_kick(tc, cells, every, current_ma, f_rf):
+GREEN_CACHE_BYTES = 0.6e9     # a train mesh's solver keeps Green spectra up to about this size (at least one)
+POOL_MARGIN = 1.1             # the GPU pool must hold this times the arrays of a solve (sc_mesh_memory_gb)
+
+
+def train_mesh(tc, cells):
+    """(nodes per axis, cached Green spectra) of a bunch train's space-charge mesh: ``cells`` along the bunch and
+    vertically, ``track.sc_train_cells_radial`` across the train (the second axis of the solver's bunch frame, which
+    its first axis, the mean horizontal velocity, makes the radial one). The solver's Green cache is cut for a large
+    mesh: a spectrum is as large as the doubled grid."""
+    if tc.sc_frame != 'bunch':
+        raise ConfigError(f"track.sc_frame = {tc.sc_frame!r}: a bunch train's mesh lies across the train in the bunch "
+                          f"frame ('bunch')")
+    n_cells = (int(cells), int(tc.sc_train_cells_radial), int(cells))
+    if min(n_cells) < 9:
+        raise ConfigError(f"a train mesh of {n_cells} nodes: at least 9 per axis (track.sc_train_cells_radial)")
+    spectrum = 8.0 * 8.0 * float(np.prod(n_cells))
+    return n_cells, max(1, min(4, int(GREEN_CACHE_BYTES // spectrum)))
+
+
+def sc_mesh_memory_gb(n_cells, cache=4):
+    """GPU memory [GiB] one FFT space-charge solve on ``n_cells`` nodes holds, from its array sizes: on the doubled
+    grid the padded charge, its spectrum and the potential, ``cache`` Green spectra and, while a new one is computed,
+    the Green function and its spectrum; on the mesh the potential and the field. The FFT plans' work areas are not
+    counted: measured (2026-11-13, CuPy's pool at its fullest over 40 solves of a breathing train), the pool held 3
+    to 5 % more, 1.23 GiB for the 1.19 of 128^3 or 64 x 512 x 64 with four spectra and 3.41 GiB for the 3.25 of
+    128 x 512 x 128 with one."""
+    n = float(np.prod(n_cells))
+    return (8.0 * 8.0 * n * (3 + cache + 2) + 8.0 * n * 4) / 2 ** 30
+
+
+def space_charge_kick(tc, cells, every, current_ma, f_rf, train=False):
     """FFT space-charge hook (``tracking.SpaceChargeKick``) at bunch current ``current_ma`` [mA] and bunch frequency
-    ``f_rf`` [Hz]; ``cells`` nodes per axis, or the cell size ``track.sc_h_m`` when 0."""
+    ``f_rf`` [Hz]; ``cells`` nodes per axis, or the cell size ``track.sc_h_m`` when 0. ``train``: the mesh of a bunch
+    train (``train_mesh``). ``track.sc_gpu_pool_gb`` > 0 sets the limit of the GPU memory pool the solver works in; a
+    train's mesh that cannot fit the limit in force is refused here, because a solve that runs out of memory is
+    skipped by the hook, not failed."""
     from PyPATools.poisson_fft import FFTPoissonSolver
     from .tracking import SpaceChargeKick
+    n_cells, extra = (cells or None), {}
+    if train and cells:
+        n_cells, cache = train_mesh(tc, cells)
+        extra = {'cache_size': cache}
     solver = FFTPoissonSolver(h=tc.sc_h_m, pad_cells=3, window_quantile=tc.sc_window_q, use_gpu=tc.sc_gpu,
-                              max_cells=tc.sc_max_cells, n_cells=(cells or None), frame=tc.sc_frame)
+                              max_cells=tc.sc_max_cells, n_cells=n_cells, frame=tc.sc_frame, **extra)
+    if solver.use_gpu and (tc.sc_gpu_pool_gb > 0 or extra):
+        import cupy
+        pool = cupy.get_default_memory_pool()
+        if tc.sc_gpu_pool_gb > 0:
+            pool.set_limit(size=int(tc.sc_gpu_pool_gb * 2 ** 30))
+        limit = pool.get_limit() / 2 ** 30                   # 0: no limit
+        if extra:
+            need = POOL_MARGIN * sc_mesh_memory_gb(n_cells, extra['cache_size'])
+            if 0 < limit < need:
+                raise ConfigError(f"the train's space-charge mesh of {n_cells[0]} x {n_cells[1]} x {n_cells[2]} nodes "
+                                  f"needs about {need:.1f} GiB on the GPU, more than the solver's memory pool of "
+                                  f"{limit:g} GiB: set track.sc_gpu_pool_gb (to {math.ceil(need)} or more), or fewer "
+                                  f"nodes")
     return SpaceChargeKick(solver, resolve_every=every, bunch_current_a=current_ma * 1e-3, bunch_frequency_hz=f_rf,
-                           kick_z=True, verbose=True)
+                           kick_z=True, verbose=True, train_coupled=bool(tc.train_coupled))
 
 
 def final_transmission(alive, stop, n):
@@ -475,14 +525,33 @@ class BunchTracker:
                 + ', '.join(f"{p} (r {v:.2f} mm)" for p, v in on_jaw.items()))
         return test, rec
 
+    def train_of(self, bunch):
+        """The beam of a bunch run: ``bunch`` itself, or with ``track.bunches_ahead`` / ``bunches_behind`` the bunch
+        train around it (``handoff.make_train``): copies of the bunch released one every machine.harmonic periods of
+        the tracking RF before and after it, with ``track.train_charge`` times its charge."""
+        tc = self.tc
+        if tc.bunches_ahead < 0 or tc.bunches_behind < 0 or tc.train_charge < 0:
+            raise ConfigError("[track] bunches_ahead, bunches_behind and train_charge must be >= 0")
+        if not (tc.bunches_ahead or tc.bunches_behind):
+            return bunch
+        from .handoff import make_train, train_period_s
+        period = train_period_s(self.mc.harmonic, self.mc.harmonic * self.f_mhz * 1e6)
+        return make_train(bunch, tc.bunches_ahead, tc.bunches_behind, period, charge=tc.train_charge)
+
     def run_bunch(self, ph, n, full, seed_rng, cells, every, out_dir=None):
         """Track ``n`` hand-off particles (0 = all; sampled with ``seed_rng``) at phase ``ph`` with space charge on a
         ``cells``^3 grid solved every ``every`` steps. ``full``: also the final / initial states, snapshots, tracks
-        and (into ``out_dir``) the probe files. Returns the run record of the deck's layout."""
+        and (into ``out_dir``) the probe files. Returns the run record of the deck's layout.
+
+        With a bunch train (``train_of``) the bunch flies among the bunches of the turns next to it, all on one
+        space-charge mesh (``train_mesh``). The record is still the bunch's own, in its own clock (step 0 = its first
+        release), so it reads like the record of the bunch alone; 'train' adds a table per bunch."""
         from .accelerated_orbit_finder import ProbeRecorder
         tc, finder = self.tc, self.finder
         t1 = time.time()
         bunch = self.inflector.beam(n_particles=(int(n) or None), seed=seed_rng, species=self.design.species)
+        beam = self.train_of(bunch)
+        is_train = beam is not bunch
         r0 = np.column_stack([np.asarray(bunch.x, dtype=float), np.asarray(bunch.y, dtype=float),
                               np.asarray(bunch.z, dtype=float)])
         slit, slit_rec = self.slit_for(ph)
@@ -498,10 +567,17 @@ class BunchTracker:
             if tc.sc:
                 i_ma = (tc.sc_current_ma if tc.sc_current_ma > 0
                         else 1e3 * float(bunch.macro_charge_c) * bunch.numpart * self.f_rf)
-                sc_kick = space_charge_kick(tc, cells, every, i_ma, self.f_rf)
+                sc_kick = space_charge_kick(tc, cells, every, i_ma, self.f_rf, train=is_train)
                 grid = f"{cells}^3 nodes" if cells else f"h = {tc.sc_h_m * 1e3:.2f} mm"
+                if is_train and cells:
+                    grid = ' x '.join(str(c) for c in train_mesh(tc, cells)[0]) + " nodes over the train"
                 say(f"[sc] FFT solver ({'GPU' if tc.sc_gpu else 'CPU'}) {grid} ({tc.sc_frame} frame), every {every} "
                     f"steps, {i_ma:.3f} mA")
+            if is_train:
+                say(f"[train] {tc.bunches_ahead} bunch(es) ahead and {tc.bunches_behind} behind the run's bunch, one "
+                    f"every {self.mc.harmonic} RF periods ({tc.steps_per_turn} steps), {bunch.numpart} particles "
+                    f"each, their charge x {tc.train_charge:g}"
+                    + ('' if tc.train_coupled else "; CONTROL: the run's bunch feels only its own charge"))
             finder.space_charge = sc_kick
             track_ids = None
             if full and tc.n_tracks > 0:
@@ -509,7 +585,7 @@ class BunchTracker:
                     bunch.numpart, size=min(tc.n_tracks, bunch.numpart), replace=False))
             probe = ProbeRecorder(list(tc.probes_deg)) if (full and tc.probes_deg) else None
             finder.probes = probe
-            res = finder.track_once(bunch, bunch_phase_deg=ph, rf_freq_mhz=self.f_mhz, max_turns=tc.turns,
+            res = finder.track_once(beam, bunch_phase_deg=ph, rf_freq_mhz=self.f_mhz, max_turns=tc.turns,
                                     save_full_beam=False,
                                     save_times_s=[t * 1e-9 for t in tc.snapshot_ns] if full else None,
                                     track_ids=track_ids, track_every=tc.track_every)
@@ -520,6 +596,19 @@ class BunchTracker:
         term = finder._obstacle_terminator
         hits = np.array(term.hits, dtype=float).reshape(-1, 4) if term is not None and term.hits else np.zeros((0, 4))
         hits_z = np.array(getattr(term, 'hits_z', []), dtype=float) if term is not None else np.zeros(0)
+        train_rec = None
+        if is_train:
+            # the metal test logs every bunch in the train's clock: the table per bunch takes them all, the record
+            # the own bunch's (the first rows of the train), in its own clock
+            train_rec = self._train_record(beam, res, hits)
+            mine = hits[:, 0] < bunch.numpart
+            hits, hits_z = hits[mine], hits_z[mine]
+            hits[:, 1] -= finder.last_record_offset
+        sc_rep = res.metadata.get('space_charge') or {}
+        if sc_rep.get('n_memory_errors'):
+            say(f"[sc] WARNING: {sc_rep['n_memory_errors']} of {sc_rep.get('n_solves', 0) + sc_rep['n_memory_errors']} "
+                f"space-charge solves ran out of memory and kept the field of the solve before: this run's space "
+                f"charge is not what was asked for (track.sc_gpu_pool_gb, or fewer nodes)")
         if slit is not None:
             on_slit = slit(np.column_stack([hits[:, 2], hits[:, 3], hits_z])) if len(hits) else np.zeros(0, bool)
             slit_rec['n_lost'] = int(np.count_nonzero(on_slit))
@@ -550,6 +639,12 @@ class BunchTracker:
             out['space_charge'] = {k: v for k, v in out['space_charge'].items() if k != 'log'}
         if slit_rec is not None:
             out['slit'] = slit_rec
+        if train_rec is not None:
+            out['train'] = train_rec
+            say("[train] alive at the end, bunch by bunch: "
+                + ', '.join(f"{k:+d}: {a}" for k, a in zip(train_rec['labels'], train_rec['alive_end']))
+                + f" of {out['n']} each; lost on metal "
+                + ', '.join(f"{k:+d}: {m}" for k, m in zip(train_rec['labels'], train_rec['lost_metal'])))
         survived = None
         fb = res.metadata.get('full_beam') if full else None
         if fb is not None:
@@ -562,6 +657,39 @@ class BunchTracker:
             f"{(out['std_z'] or [0])[-1] * 1e3:.2f} mm, lost on metal {out['n_lost_metal']}"
             + (f" (on the slit {slit_rec['n_lost']})" if slit_rec is not None else '') + f" ({out['time_s']:.0f} s)")
         return out
+
+    def _train_record(self, beam, res, hits):
+        """The table per bunch of a train run. Bunch k was released k x ``period_steps`` steps after the run's own
+        bunch (k = 0): k < 0 flies ahead of it on the turns outside, k > 0 behind it, inside. Per bunch, in the order
+        of 'labels': 'alive' at every logged turn of the own bunch (bunch k is then k turns younger than bunch 0: in
+        the steady state it has as many particles as bunch 0 had k turns earlier, which is the check of a train long
+        enough), 'alive_end', 'lost_metal' (``hits``: the metal test's log of every bunch), and of the particles alive
+        at the end the mean energy, mean radius and rms height. 'charge_c' is each bunch's charge when space charge
+        is on, 'record_offset_steps' the steps of the train's clock before the own bunch's."""
+        finder, labels = self.finder, np.asarray(beam.bunch_of)
+        tr = res.metadata.get('train') or {}
+        ks = [int(k) for k in tr.get('labels', sorted(set(labels.tolist())))]
+        r, v, act = (np.asarray(a)[finder._n_ref:] for a in finder.last_final_state)
+        hit_bunch = labels[hits[:, 0].astype(np.int64)] if len(hits) else np.zeros(0, dtype=np.int64)
+        alive = np.asarray(tr.get('alive', []), dtype=np.int64).reshape(-1, len(ks))
+        rec = {'labels': ks, 'period_steps': int(self.tc.steps_per_turn), 'n_per_bunch': int(beam.n_scored),
+               'charge_relative': float(self.tc.train_charge), 'coupled': bool(self.tc.train_coupled),
+               'record_offset_steps': int(tr.get('record_offset_steps', finder.last_record_offset)),
+               'alive': {str(k): [int(a) for a in alive[:, j]] for j, k in enumerate(ks)},
+               'alive_end': [], 'lost_metal': [], 'e_mean_end_mev': [], 'r_mean_end_mm': [], 'z_rms_end_mm': []}
+        for k in ks:
+            sel = (labels == k) & act & np.isfinite(r).all(axis=1) & np.isfinite(v).all(axis=1)
+            rec['alive_end'].append(int(sel.sum()))
+            rec['lost_metal'].append(int(np.count_nonzero(hit_bunch == k)))
+            some = bool(sel.any())
+            rec['e_mean_end_mev'].append(float(kinetic_energy_mev(v[sel], self.mass_mev).mean()) if some else math.nan)
+            rec['r_mean_end_mm'].append(float(np.hypot(r[sel, 0], r[sel, 1]).mean() * 1e3) if some else math.nan)
+            rec['z_rms_end_mm'].append(float(r[sel, 2].std() * 1e3) if some else math.nan)
+        sc = (res.metadata.get('space_charge') or {}).get('train')
+        if sc:
+            charge = dict(zip(sc['labels'], sc['bunch_charge_c']))
+            rec['charge_c'] = [float(charge.get(k, math.nan)) for k in ks]
+        return rec
 
     def _full_record(self, out, fb, res, bunch, hits, track_ids):
         """Final / initial states, snapshots and tracks of a full run into ``out``; returns the survivor mask: the
@@ -678,6 +806,12 @@ def track_stage(cfg, verbose=True):
                           'bfield_3d': pc.bfield_3d, 'inflector_efield': pc.inflector_efield,
                           'housing_step': pc.housing_step},
                'wall_s': time.time() - t0}
+    if tc.bunches_ahead or tc.bunches_behind:
+        # a bunch train: every bunch run of this stage flew in one (the table per bunch is final.train)
+        summary['train'] = {'bunches_ahead': int(tc.bunches_ahead), 'bunches_behind': int(tc.bunches_behind),
+                            'charge_relative': float(tc.train_charge), 'coupled': bool(tc.train_coupled),
+                            'period_rf_periods': int(mc.harmonic),
+                            'cells_radial': int(tc.sc_train_cells_radial)}
     model3d = bt.fields['model3d']
     data = {'summary': summary, 'scan': scan, 'final': final, 'final_sc': None, 'ref': ref,
             'sections3d': {f'z{int(round(z * 1e3))}': section_loops(model3d, z=z) for z in (0.0, 0.015)},

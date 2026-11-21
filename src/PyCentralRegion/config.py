@@ -449,6 +449,18 @@ class TrackConfig:
     sc_frame: str = 'bunch'          # 'bunch' (grid turned onto the mean horizontal velocity) | 'lab'
     sc_gpu: bool = True
     sc_current_ma: float = 0.0       # 0 = the hand-off file's current
+    sc_gpu_pool_gb: float = 0.0      # > 0: limit of the GPU memory pool of the space-charge solver [GiB]; 0 = the
+    #                                  solver's own (2 GiB). A train's mesh at 128 nodes needs more
+    # bunch train (opt-in): the bunch of the run among the bunches of the turns next to it, released one every
+    # machine.harmonic RF periods (one revolution), all on one space-charge mesh; 0 and 0 = the bunch alone
+    bunches_ahead: int = 0           # bunches released before the run's bunch (older: they fly on the turns outside it)
+    bunches_behind: int = 0          # bunches released after it (younger: inside it)
+    train_coupled: bool = True       # false = the control of a train run: the run's bunch feels only its own charge,
+    #                                  on the train's mesh; the other bunches fly as before (two solves per step)
+    train_charge: float = 1.0        # charge of those bunches relative to the run's bunch; 0 = weightless: tracked on
+    #                                  the same mesh, but nothing feels them and they feel no charge of their own
+    sc_train_cells_radial: int = 512  # train: FFT grid nodes across the train (the radial axis of the bunch frame);
+    #                                   along the bunch and vertically the nodes stay sc_cells / sc_final_cells
     n_tracks: int = 20000            # particles whose full tracks are stored (final run)
     track_every: int = 4             # steps between stored track points
     probes_deg: tuple = (25.0, 45.0)  # azimuths of the radial probes (final run)

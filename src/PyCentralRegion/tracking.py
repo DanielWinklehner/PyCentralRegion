@@ -29,6 +29,12 @@ from PyPATools.particles import ParticleDistribution
 from PyPATools.global_variables import CLIGHT
 from PyPATools.trackers import Tracker, Interaction, Terminator, Recorder
 
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except ImportError:                                   # pragma: no cover
+    HAS_NUMBA = False
+
 
 @dataclass
 class TrackingResult:
@@ -324,6 +330,64 @@ def _rotation_from_to(a, b):
     th = np.arctan2(s, c)
     return np.eye(3) + np.sin(th) * K + (1.0 - np.cos(th)) * (K @ K)
 
+
+if HAS_NUMBA:
+    # NO fastmath: this is ``SpaceChargeKick._kick_numpy`` row by row, the same operations in the same order (NumPy
+    # sums a row's three squares from the left and never contracts a multiply-add; neither does numba without
+    # fastmath), so the two agree bit for bit (tests/test_sc_kick.py) - as ``fast_track3d._sc_kick_point``, the same
+    # arithmetic inside the compiled kernel, does.
+    @njit(cache=True)
+    def _kick_rows(v, mask, E, B, kick_z, qom_dt, c2):
+        """``SpaceChargeKick._kick`` in place: u = gamma v; u += (q/m) (E + v x B) dt; v = u / gamma(u), on the rows
+        of ``mask`` that have a field (v x B only when any of them has a B). Returns whether any row had one."""
+        n = v.shape[0]
+        any_field = False
+        any_b = False
+        for p in range(n):
+            if mask[p]:
+                has_b = B[p, 0] != 0.0 or B[p, 1] != 0.0 or B[p, 2] != 0.0
+                if has_b or E[p, 0] != 0.0 or E[p, 1] != 0.0 or (kick_z and E[p, 2] != 0.0):
+                    any_field = True
+                    if has_b:
+                        any_b = True
+                        break
+        if not any_field:
+            return False
+        for p in range(n):
+            if not mask[p]:
+                continue
+            ex = E[p, 0]
+            ey = E[p, 1]
+            ez = E[p, 2] if kick_z else 0.0
+            bx = B[p, 0]
+            by = B[p, 1]
+            bz = B[p, 2]
+            if not (ex != 0.0 or ey != 0.0 or ez != 0.0 or bx != 0.0 or by != 0.0 or bz != 0.0):
+                continue
+            vx = v[p, 0]
+            vy = v[p, 1]
+            vz = v[p, 2]
+            gamma = 1.0 / np.sqrt(1.0 - ((vx * vx + vy * vy) + vz * vz) / c2)
+            ux = gamma * vx
+            uy = gamma * vy
+            uz = gamma * vz
+            fx = ex
+            fy = ey
+            fz = ez
+            if any_b:
+                fx = ex + (vy * bz - vz * by)
+                fy = ey + (vz * bx - vx * bz)
+                fz = ez + (vx * by - vy * bx)
+            ux = ux + qom_dt * fx
+            uy = uy + qom_dt * fy
+            uz = uz + qom_dt * fz
+            gn = np.sqrt(1.0 + ((ux * ux + uy * uy) + uz * uz) / c2)
+            v[p, 0] = ux / gn
+            v[p, 1] = uy / gn
+            v[p, 2] = uz / gn
+        return True
+
+
 class SpaceChargeKick(Interaction):
     """Space-charge kick of the live bunch from an open-boundary Poisson solve.
 
@@ -363,15 +427,31 @@ class SpaceChargeKick(Interaction):
 
     ``move=True`` rotates the stored per-particle fields with the bunch's mean direction between solves (see
     ``step``); the numba fast path does not reproduce it and falls back to the general path.
+
+    Bunch train (``handoff.make_train``): every bunch of the beam deposits on the one mesh of the solver, so each
+    feels its own field and the others' from the same solve. The macro-charge is one bunch's (the charge I / f shared
+    by the particles of the beam's own bunch, ``beam.n_scored``), times ``beam.charge_weight`` per particle: the
+    other bunches' charge relative to the own bunch's. Particles of weight 0 are weightless companions: they go into
+    the solve without charge, so the mesh still spans the train and they feel the field at their place, but nothing
+    feels them. ``bunch_charge_c`` stays the own bunch's charge.
+
+    ``train_coupled=False`` is the control of a train run: the own bunch feels only its own charge, on the train's
+    mesh, while the other bunches feel every charge as before. Two solves on the same positions, so on the same
+    mesh: first with the own bunch's charge alone (the field for the own bunch), then with every charge (the field
+    for the others, and the grid that particles released between solves gather from). The other bunches then fly as
+    in the coupled run, so a coupled run and its control differ by the neighbours' forces on the own bunch and by
+    nothing else to first order.
     """
 
     def __init__(self, solver, resolve_every: int = 8, macro_charge_c: Optional[float] = None,
                  bunch_current_a: Optional[float] = None, bunch_frequency_hz: Optional[float] = None,
                  charge_scale: float = 1.0, kick_z: bool = False, min_particles: int = 2,
-                 exempt_ref: bool = True, verbose: bool = False, log_limit: int = 20000, move: bool = False):
+                 exempt_ref: bool = True, verbose: bool = False, log_limit: int = 20000, move: bool = False,
+                 train_coupled: bool = True):
         if not hasattr(solver, 'solve_eb'):
             raise TypeError("solver must provide solve_eb(positions, charges, velocities) -> (E, B)")
         self.solver = solver
+        self.train_coupled = bool(train_coupled)     # a bunch train: the own bunch feels the other bunches
         self.move = bool(move)   # 2026-09-16: self-field carried with the bunch between solves
         self._c0 = None
         self.every = max(1, int(resolve_every))
@@ -397,6 +477,11 @@ class SpaceChargeKick(Interaction):
         self.has_field = np.zeros(n, dtype=bool)
         self.kick_mask = np.ones(n, dtype=bool)
         self.deposit_mask = np.zeros(n, dtype=bool)
+        # bunch train: weightless companions (in the solve without charge) and the train's record; none by default
+        self.window_only = np.zeros(n, dtype=bool)
+        self._any_window_only = False
+        self.train = None
+        self._own_rows = None                 # a train: the rows of the own bunch
         self.n_solves = 0
         self.n_skipped = 0
         self.n_kick_steps = 0
@@ -437,19 +522,49 @@ class SpaceChargeKick(Interaction):
         if species is None:
             raise ValueError("species needed for q/m")
         self.q_over_m = float(species.charge) / float(species.mass_kg)
-        q_macro = self.resolve_macro_charge(beam, n - n_ref, default_frequency_hz) * self.charge_scale
+        # the beam's own bunch: all its real particles, or the first n_scored of a bunch train. One bunch's charge
+        # is shared by one bunch's particles, however many bunches the beam holds
+        n_own = getattr(beam, 'n_scored', None)
+        n_own = n - n_ref if n_own is None else int(n_own)
+        weight = getattr(beam, 'charge_weight', None)
+        q_macro = self.resolve_macro_charge(beam, n_own, default_frequency_hz) * self.charge_scale
         self.charges = np.full(n, q_macro)
+        if weight is not None:
+            weight = np.asarray(weight, dtype=float)
+            if weight.shape != (n,) or np.any(weight < 0.0):
+                raise ValueError(f"beam.charge_weight: one value >= 0 per particle ({n}), got shape {weight.shape}")
+            self.charges = q_macro * weight
+            self.window_only = weight == 0.0
+            self.window_only[:n_ref] = False
+            self._any_window_only = bool(self.window_only.any()) and q_macro != 0.0
         self.charges[:n_ref] = 0.0
         self.deposit_mask = self.charges != 0.0
         if self.exempt_ref:
             self.kick_mask[:n_ref] = False
         self.n_charged = int(self.deposit_mask.sum())
-        self.bunch_charge_c = float(self.charges.sum())
+        if n_own == n - n_ref:
+            self.bunch_charge_c = float(self.charges.sum())
+        else:
+            self.bunch_charge_c = float(self.charges[n_ref:n_ref + n_own].sum())
+            labels = getattr(beam, 'bunch_of', None)
+            labels = np.where(np.arange(n) < n_ref + n_own, 0, 1) if labels is None else np.asarray(labels)
+            ks = [int(k) for k in np.unique(labels[n_ref:])]
+            self._own_rows = np.zeros(n, dtype=bool)
+            self._own_rows[n_ref:n_ref + n_own] = True
+            self.train = {'labels': ks, 'n_own': n_own, 'coupled': bool(self.train_coupled),
+                          'bunch_charge_c': [float(self.charges[n_ref:][labels[n_ref:] == k].sum()) for k in ks],
+                          'n_charged': [int(self.deposit_mask[n_ref:][labels[n_ref:] == k].sum()) for k in ks],
+                          'n_weightless': int(self.window_only.sum()),
+                          'total_charge_c': float(self.charges.sum())}
         self.noop = self.bunch_charge_c == 0.0 or self.n_charged == 0
         if self.verbose:
             print(f"    space charge: {self.n_charged} charged particles x {q_macro:.4e} C = "
                   f"{self.bunch_charge_c:.4e} C, solve every {self.every} steps"
                   + (" (zero charge: no-op)" if self.noop else ""))
+            if self.train is not None:
+                print("    bunch train: " + ', '.join(
+                    f"bunch {k:+d} {q:.4e} C" for k, q in zip(self.train['labels'], self.train['bunch_charge_c']))
+                    + f" on one mesh ({self.train['n_weightless']} weightless particles)")
 
     # ------------------------------------------------------------------ core
     def _solve(self, step, r, v, active, t):
@@ -463,9 +578,23 @@ class SpaceChargeKick(Interaction):
             self.n_skipped += 1
             return
         t0 = time.perf_counter()
+        if self._any_window_only:
+            # a train's weightless companions go into the solve without charge: the mesh spans them (the same
+            # mesh as with their charge) and they get the field at their place
+            dep = dep | (active & self.window_only)
         r_dep = r[dep]
         try:
-            E_dep, B_dep = self.solver.solve_eb(r_dep, self.charges[dep], v[dep])
+            mine = None if (self.train is None or self.train_coupled) else self._own_rows[dep]
+            if mine is not None and mine.any() and not mine.all():
+                # the control of a train run: the own bunch's field from its own charge alone, the others' from
+                # every charge; the same positions in both solves, so the same mesh
+                q = self.charges[dep]
+                E_dep, B_dep = self.solver.solve_eb(r_dep, np.where(mine, q, 0.0), v[dep])
+                E_all, B_all = self.solver.solve_eb(r_dep, q, v[dep])
+                E_dep = np.where(mine[:, None], E_dep, E_all)
+                B_dep = np.where(mine[:, None], B_dep, B_all)
+            else:
+                E_dep, B_dep = self.solver.solve_eb(r_dep, self.charges[dep], v[dep])
         except MemoryError as exc:
             # 2026-09-16 04:38: a 152 MiB FFT array failed to allocate while a 39 GB dense BEM LU ran alongside and the
             # whole 4 h extraction run was lost. Keep the previous per-particle field for this interval and go on
@@ -509,7 +638,21 @@ class SpaceChargeKick(Interaction):
                   f"max {row[4]:.3e} V/m, rms size {1e3 * sig[0]:.2f} x {1e3 * sig[1]:.2f} x {1e3 * sig[2]:.2f} mm, "
                   f"{1e3 * wall:.1f} ms", flush=True)
 
+    # The kick of the stored field on the rows of a mask, for ``apply``: the tracker's general path. The compiled 3D
+    # kernel applies every kick itself (``refresh``, then ``fast_track3d._sc_kick_point``, the same arithmetic).
+    # Compiled (``_kick_rows``) when numba is there: the NumPy kick's dozen passes over the bunch cost about as much
+    # as the rest of a step. ``compiled_kick = False`` selects the NumPy kick, the reference: the two agree bit for
+    # bit (tests/test_sc_kick.py).
+    compiled_kick = True
+
     def _kick(self, v, mask, dt):
+        if self.compiled_kick and HAS_NUMBA:
+            if _kick_rows(v, mask, self.E, self.B, self.kick_z, self.q_over_m * dt, CLIGHT ** 2):
+                self.n_kick_steps += 1
+            return
+        self._kick_numpy(v, mask, dt)
+
+    def _kick_numpy(self, v, mask, dt):
         E = self.E[mask]
         B = self.B[mask]
         if not self.kick_z:
@@ -600,6 +743,10 @@ class SpaceChargeKick(Interaction):
                             'sigma_x_m', 'sigma_y_m', 'sigma_z_m'],
             'log': log,
         }
+        if self.train is not None:
+            # a bunch train: per bunch its label, charge and charged particles ('bunch_charge_c' above is the own
+            # bunch's; 'n_charged' and the log's n_deposit count every bunch)
+            out['train'] = dict(self.train)
         if hasattr(self.solver, 'summary'):
             out['solver'] = self.solver.summary()
         return out
