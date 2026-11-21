@@ -2678,7 +2678,9 @@ def _si_steps(which: str, si_dir: Path = None, outline: Path = None):
     d = Path(si_dir) if si_dir else (_default_export_dir(outline) / 'steps_baseline_mm')
     if not d.is_dir():
         raise SystemExit(f"spiral inflector STEPs not found: {d}")
-    avail = {f.stem: f for f in sorted(d.glob('*.step'))}
+    # the inflector export is .stp since 2026-10-16 (.step before); _negative solids are not electrodes
+    avail = {f.stem: f for f in sorted(list(d.glob('*.step')) + list(d.glob('*.stp')))
+             if not f.stem.lower().endswith('_negative')}
     w = (which or 'default').strip().lower()
     if w in ('default', '1', 'yes', 'true', ''):
         names = list(_SI_DEFAULT)

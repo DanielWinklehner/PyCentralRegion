@@ -125,6 +125,89 @@ class SparseBeamRecord:
         raise IndexError("SparseBeamRecord supports integer indexing only")
 
 
+class ProbeRecorder:
+    """Virtual probes, as OPAL's PROBE element: vertical half-planes from the machine axis at
+    fixed azimuths [deg, atan2(y, x), counter-clockwise from +x], between ``r_min`` and ``r_max``
+    [m]. Every crossing of every particle is kept: position, velocity and clock time, linearly
+    interpolated inside the step (at ~1000 steps per turn the chord error is ~1 um at r 0.3 m),
+    with the particle's index and its PASS number at that probe.
+
+    Pass p is the crossing made during revolution p from the particle's own start: a particle
+    that starts already past a probe (a probe just downstream of the hand-off plane cuts the
+    bunch) begins at pass 1, so the passes of one turn line up across the bunch. The sense of
+    rotation is taken from the beam's angular momentum at the first record; a crossing against
+    it is kept with ``direction`` -1.
+
+    Attach to ``AcceleratedOrbitFinder.probes``; ``track_with_rf`` resets it and calls ``record``
+    every step with the real particles only. ``data()`` returns one dict of arrays per probe."""
+
+    def __init__(self, angles_deg, r_min: float = 0.0, r_max: float = np.inf):
+        self.angles_deg = [float(a) for a in angles_deg]
+        th = np.deg2rad(self.angles_deg)
+        self._normal = np.column_stack([-np.sin(th), np.cos(th)])   # > 0: counter-clockwise side
+        self._along = np.column_stack([np.cos(th), np.sin(th)])
+        self.r_min, self.r_max = float(r_min), float(r_max)
+        self.reset()
+
+    def reset(self):
+        self._r0 = self._v0 = self._a0 = self._s0 = None
+        self._t0 = 0.0
+        self._seen = None
+        self._passes = None
+        self.sense = 0.0
+        self._rows = [[] for _ in self.angles_deg]
+
+    def record(self, step: int, r: np.ndarray, v: np.ndarray, active: np.ndarray, t: float):
+        r = np.asarray(r, dtype=float)
+        v = np.asarray(v, dtype=float)
+        active = np.asarray(active, dtype=bool)
+        s1 = r[:, :2] @ self._normal.T                               # (n, n_probes) signed distances
+        if self._seen is None:
+            self._seen = np.zeros(len(r), dtype=bool)
+            self._passes = np.zeros((len(self.angles_deg), len(r)), dtype=np.int32)
+        if not self.sense and np.any(active):
+            lz = r[active, 0] * v[active, 1] - r[active, 1] * v[active, 0]
+            self.sense = 1.0 if np.sum(lz) >= 0.0 else -1.0
+        new = active & ~self._seen
+        if np.any(new) and self.sense:
+            # azimuth of each new particle relative to each probe, wrapped to (-pi, pi]: ahead of
+            # the probe (in the direction of motion) means pass 0 is already behind it
+            ph = np.arctan2(r[new, 1], r[new, 0])[:, None] - np.deg2rad(self.angles_deg)[None, :]
+            ahead = self.sense * np.angle(np.exp(1j * ph)) > 0.0
+            self._passes[:, new] = ahead.T.astype(np.int32)
+            self._seen |= new
+        if self._r0 is not None and len(self._r0) == len(r):
+            both = active & self._a0
+            for k in range(len(self.angles_deg)):
+                a, b = self._s0[:, k], s1[:, k]
+                idx = np.nonzero(both & ((a < 0.0) != (b < 0.0)))[0]
+                if not len(idx):
+                    continue
+                f = a[idx] / (a[idx] - b[idx])
+                rc = self._r0[idx] + f[:, None] * (r[idx] - self._r0[idx])
+                along = rc[:, :2] @ self._along[k]
+                keep = (along >= self.r_min) & (along <= self.r_max)
+                if not np.any(keep):
+                    continue
+                idx, f, rc = idx[keep], f[keep], rc[keep]
+                vc = self._v0[idx] + f[:, None] * (v[idx] - self._v0[idx])
+                direction = np.where(self.sense * b[idx] >= 0.0, 1, -1).astype(np.int8)
+                self._rows[k].append((idx.astype(np.int32), self._passes[k, idx].copy(), direction,
+                                      rc, vc, self._t0 + f * (t - self._t0), np.full(len(idx), int(step), np.int32)))
+                self._passes[k, idx] += 1
+        self._r0, self._v0, self._a0, self._s0, self._t0 = r.copy(), v.copy(), active.copy(), s1, float(t)
+
+    def data(self) -> List[Dict[str, np.ndarray]]:
+        out = []
+        for k, ang in enumerate(self.angles_deg):
+            rows = self._rows[k]
+            cat = (lambda j, w: np.concatenate([x[j] for x in rows]) if rows else np.zeros((0, w) if w else 0))
+            xyz, vxyz = cat(3, 3), cat(4, 3)
+            out.append({'angle_deg': ang, 'id': cat(0, 0), 'pass': cat(1, 0), 'direction': cat(2, 0),
+                        'xyz': xyz, 'vxyz': vxyz, 't': cat(5, 0), 'step': cat(6, 0), 'sense': self.sense})
+        return out
+
+
 # ============================================================================
 # Initial-beam construction helpers (spiral-inflector hand-off)
 # ============================================================================
@@ -485,6 +568,26 @@ class AcceleratedOrbitFinder:
         # its solve count, timings and mean |E_sc| land in the result metadata
         # under 'space_charge'. Disables the single-particle fast path.
         self.space_charge = None
+        # Multiparticle objective options (MiniDAR 2026-10-20, Daniel: "optimize for transmission, mean
+        # energy, and centeredness, only using turns 3 and beyond"):
+        #   center_source  'reference' (default): the 'center' block measures the reference particle's
+        #                  orbit centre; 'bunch': the orbit centre of the BUNCH CENTROID (mean of the
+        #                  live real particles, recorded every step, see record_centroid).
+        #   window_rel     half-width of the energy window of the 'window' block, relative: a particle
+        #                  counts as transmitted when it is alive at the last turn crossing with
+        #                  |E - E_c| <= window_rel * E_c, E_c from window_center ('median' of the
+        #                  survivors' energies, or 'target': the energy ramp at the last turn).
+        #                  Off unless ls_weights['window'] > 0.
+        #   skip_all       also exempt the first skip_turns turns from the 'energy' and 'survival'
+        #                  blocks (survival is cumulative, so earlier losses still count from turn 3 on).
+        self.center_source = 'reference'
+        self.record_centroid = False
+        self.window_rel = 0.05
+        self.window_center = 'median'
+        self.skip_all = False
+        self.last_centroid_traj = None
+        self.last_turn_v = None
+        self.last_window = None
 
         self.engine = TrackingEngine(
             design, algorithm=algorithm, dimensionality=dimensionality, use_rf=True,
@@ -944,6 +1047,9 @@ class AcceleratedOrbitFinder:
 
         rf_crossings = []
         trajectory_storage = []
+        centroid_storage = []          # bunch centroid per step (record_centroid / center_source='bunch')
+        last_turn_v = [None]           # velocities of the live real particles at the latest turn crossing
+        rec_centroid = bool(self.record_centroid or self.center_source == 'bunch')
         std_r_storage = []
         turn_ids = []
         turn_counter = [0]
@@ -995,6 +1101,9 @@ class AcceleratedOrbitFinder:
         else:
             full_beam = (np.full((n_steps, self.n_particles, 6), np.nan)
                          if save_full_beam else None)
+        probes = getattr(self, 'probes', None)      # ProbeRecorder: every crossing of every real particle
+        if probes is not None:
+            probes.reset()
 
         def callback(step, r_array, v_array, active, t):
             if not np.any(active):
@@ -1019,6 +1128,10 @@ class AcceleratedOrbitFinder:
                 trajectory_storage.append(r_array[0].copy())
             else:
                 trajectory_storage.append(np.mean(r_array[real], axis=0))
+            if rec_centroid:
+                # same indexing as trajectory_storage, so the reference turn_ids apply to it
+                centroid_storage.append(np.mean(r_array[real], axis=0) if np.any(real)
+                                        else np.full(3, np.nan))
 
             if self.is_multiparticle:
                 radii = np.hypot(r_array[real, 0], r_array[real, 1])
@@ -1031,6 +1144,8 @@ class AcceleratedOrbitFinder:
             elif full_beam is not None:
                 full_beam[step, :, :3] = r_array[n_ref:]
                 full_beam[step, :, 3:] = v_array[n_ref:]
+            if probes is not None:
+                probes.record(step, r_array[n_ref:], v_array[n_ref:], active[n_ref:], t)
             n_recorded[0] = step + 1
 
             if active[0]:
@@ -1059,6 +1174,8 @@ class AcceleratedOrbitFinder:
                     )
                     beam_stats_collector.record(step, r_array[real], v_array[real], t)
                     beam_stats_collector.increment_turn()
+                    if self.is_multiparticle:
+                        last_turn_v[0] = np.array(v_array[real], dtype=float, copy=True)
                     turn_counter[0] += 1
 
                     if poincare.crossings[-1].energy_mev >= self.target_energy_mev:
@@ -1106,14 +1223,17 @@ class AcceleratedOrbitFinder:
                 if result is None:
                     # kernel and callback disagreed on the stop: redo the
                     # run on the general path (diagnostics restart clean)
-                    for lst in (trajectory_storage, std_r_storage, turn_ids):
+                    for lst in (trajectory_storage, std_r_storage, turn_ids, centroid_storage):
                         lst.clear()
+                    last_turn_v[0] = None
                     turn_counter[0] = 0
                     energy_reached[0] = False
                     poincare.crossings.clear()
                     poincare._armed = poincare.arm_angle <= 0.0
                     poincare._azimuth_travelled = 0.0
                     beam_stats_collector.__init__(self.design.species, save_frequency=1)
+                    if probes is not None:
+                        probes.reset()
                     if hasattr(callback, 'r_prev'):
                         del callback.r_prev
             if result is None:
@@ -1147,6 +1267,8 @@ class AcceleratedOrbitFinder:
                   f"TURN_BUDGET_MARGIN or check isochronism")
 
         trajectory_ref = np.array(trajectory_storage) if trajectory_storage else np.array([])
+        self.last_centroid_traj = np.array(centroid_storage) if (rec_centroid and centroid_storage) else None
+        self.last_turn_v = last_turn_v[0]
         std_r_per_step = np.array(std_r_storage)
         turn_statistics = beam_stats_collector.get_statistics()
         poincare_all = [list(poincare.crossings)]
@@ -1307,7 +1429,10 @@ class AcceleratedOrbitFinder:
         wp = np.sqrt(ls_weights.get('phase', DEFAULT_LS_WEIGHTS['phase']))
         w_spread = float(ls_weights.get('spread', DEFAULT_LS_WEIGHTS['spread']))
         wsp = np.sqrt(w_spread)
+        w_window = float(ls_weights.get('window', 0.0))
         C_SCALE, ENV_SCALE, PHASE_SCALE = 0.02, 0.005, 15.0
+        frac_window_out = 1.0                    # failure value: nothing transmitted
+        self.last_window = None
         skip = max(0, min(int(skip_turns), max_turns))
         n_s = max(max_turns - 1 - skip, 0)       # kept turn separations
         n_c = max(n_s - 2, 0)                    # their second differences
@@ -1372,6 +1497,13 @@ class AcceleratedOrbitFinder:
                 # metric is contaminated by ~dr/2pi per turn for accelerated
                 # orbits, which the optimizer cannot drive to zero.
                 rc = metrics['r_center_h1']
+                # center_source 'bunch': the same metric on the BUNCH CENTROID's path (recorded
+                # every step alongside the reference, so the reference turn_ids index it too)
+                cen = self.last_centroid_traj
+                use_bunch = (self.center_source == 'bunch' and is_multi and cen is not None
+                             and len(turn_ids) > 0 and len(cen) == len(traj_ref))
+                if use_bunch and np.all(np.isfinite(cen[turn_ids[0]:])):
+                    rc = calculate_turn_metrics(cen, turn_ids)['r_center_h1']
                 if len(rc) > 0:
                     c_turns[:min(len(rc), max_turns)] = rc[:max_turns]
                     if len(rc) < max_turns:
@@ -1423,6 +1555,20 @@ class AcceleratedOrbitFinder:
                     spread_turns[:min(n_turns, max_turns)] = rel[:max_turns]
                     if n_turns < max_turns:
                         spread_turns[n_turns:] = rel[-1]
+                    # energy-window transmission at the LAST turn crossing: live real particles
+                    # within +-window_rel of E_c, against everything launched (post-collimator)
+                    vlt = self.last_turn_v
+                    if vlt is not None and len(vlt):
+                        c2 = 299792458.0 ** 2
+                        gam = 1.0 / np.sqrt(1.0 - np.minimum(np.sum(vlt * vlt, axis=1) / c2, 1.0 - 1e-15))
+                        e_last = (gam - 1.0) * float(self.design.species.mass_mev)
+                        e_c = (float(np.median(e_last)) if self.window_center == 'median'
+                               else float(ramp[min(n_turns, max_turns) - 1]))
+                        n_in = int(np.sum(np.abs(e_last - e_c) <= self.window_rel * e_c))
+                        frac_window_out = float(np.clip(1.0 - n_in / n_eff, 0.0, 1.0))
+                        self.last_window = {'n_in': n_in, 'n_launched': int(n_eff), 'e_c_mev': e_c,
+                                            'fraction': n_in / n_eff, 'window_rel': self.window_rel,
+                                            'center': self.window_center, 'turn': int(n_turns)}
 
                 self.last_energy_mev = float(energies[-1])
                 self.last_n_turns = n_turns
@@ -1435,17 +1581,20 @@ class AcceleratedOrbitFinder:
         # Insertion order IS the residual layout; the dict additionally gives a
         # per-block cost decomposition (see self.last_resid_blocks), which is
         # what the weights should be tuned against.
+        sk_e = skip if self.skip_all else 0       # skip_all: energy / survival from turn skip+1 too
         blocks = {
-            'energy': we * (ramp - e_turns) / self.target_energy_mev,
+            'energy': we * ((ramp - e_turns) / self.target_energy_mev)[sk_e:],
             'center': wc * c_turns[skip:] / C_SCALE,
             'smooth': ws * _soft_clip(curv_kept / U_SCALE),
             'phase': wp * p_kept / PHASE_SCALE,
         }
         if is_multi:
             blocks['envelope'] = wv * env_turns[skip:] / ENV_SCALE
-            blocks['survival'] = wu * surv_turns
+            blocks['survival'] = wu * surv_turns[sk_e:]
             if w_spread > 0:
                 blocks['spread'] = wsp * spread_turns[skip:] / SPREAD_SCALE
+            if w_window > 0:
+                blocks['window'] = np.array([np.sqrt(w_window) * frac_window_out])
             if coll is not None:
                 wk = np.sqrt(ls_weights.get(
                     'collimated', DEFAULT_LS_WEIGHTS['collimated']))

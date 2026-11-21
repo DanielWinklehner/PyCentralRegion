@@ -2182,8 +2182,14 @@ def _dense_matrix(discrete_op) -> Optional[np.ndarray]:
     return None
 
 
-def _gpu_fits(n: int, restart: int, safety: float = 1.25) -> Tuple[bool, str]:
-    """Whether an n x n float64 matrix plus GMRES workspace fits in free GPU memory."""
+def _gpu_fits(n: int, restart: int, safety: Optional[float] = None) -> Tuple[bool, str]:
+    """Whether an n x n float64 matrix plus GMRES workspace fits in free GPU memory.
+
+    ``safety`` multiplies the matrix bytes; default 1.25, or PCR_GPU_FIT_SAFETY. The matrix goes to the device as one
+    contiguous float64 copy, so the real need is ~1.0 x 8 N^2 plus the Krylov basis; 1.25 rejects meshes that do fit
+    (2026-10-26: 40.5k elements need 13.8 GB against 15.5 GB free, but 17.1 GB at 1.25)."""
+    if safety is None:
+        safety = float(os.environ.get('PCR_GPU_FIT_SAFETY', '1.25'))
     try:
         import cupy as cp
         free, total = cp.cuda.Device().mem_info
