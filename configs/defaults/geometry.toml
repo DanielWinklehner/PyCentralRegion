@@ -36,7 +36,8 @@
 #   windows: 0 < half_height_mm and |z_center_mm| + half_height_mm <= the owner's channel half height at the window's
 #   middle. Posts, window blocks and hole plates run post_overhang_mm past the channel's highest point over them.
 # Refused as well, instead of being ignored: r_max_mm beyond [machine] r_max_cavity_m, gap0_face_mm without the star
-# ground, dee0_trim_mm together with dee0_clearance_mm.
+# ground, dee0_trim_mm together with dee0_clearance_mm, si_rotation_offset_deg without si_rotation = "corner",
+# gap0_leave_mm without connected gap lines.
 #
 # HARDWARE on a gap edge is placed by arclength along that edge from its inner end [mm]; gap 2j is dee j's
 # low-azimuth edge, gap 2j+1 its high-azimuth edge, side "dummy" the other side of the same gap. Arrays of tables:
@@ -57,8 +58,9 @@
 # them), at [machine] dee_opening_deg. In the gap's own frame (x along its ray, y across it): P2 = (r2_mm, 0),
 # P1 = (r1_mm, y1), P0 = (gap_line_r0_mm, y0); f1 and f0 are y1 and y0 as fractions in [-1, 1] of what the limits allow
 # (P0 and P1 within gap_line_d_max_deg of the ray, the bends at P1 and P2 <= bend_max_deg), so every fraction gives a
-# buildable line and all 0 is the radial line. Gap 0 starts where the turned exit-plate line meets its ray (needs
-# gap0_on_plate; its bend there is free) and has no f0. One [[geometry.gap_line]] per gap, gaps 0 .. n in order:
+# buildable line and all 0 is the radial line. Gap 0 starts on the turned exit-plate line and leaves it at its home point,
+# where that line meets its ray (needs gap0_on_plate; its bend there is free), or gap0_leave_mm along the plate from
+# there (docs/si_rotation_gap0.md); it has no f0. One [[geometry.gap_line]] per gap, gaps 0 .. n in order:
 #     [[geometry.gap_line]]   # gap, r1_mm, r2_mm (0 < r1 < r2) or dr_mm (> 0, instead of r2_mm: r2 = r1 + dr),
 #                             # f0 (= 0), f1 (= 0)
 # snap_nodes must be false and junctions empty (both move the seed's nodes).
@@ -86,7 +88,11 @@ si_rotation = "fixed"        # "fixed": the electrodes are built around the infl
                              # (a campaign that varies the rotation uses this); "corner": gap 0's ray minus the exit
                              # spec's gap azimuth. The model records the angle (params si_rotation_deg) and the tracker
                              # refuses an inflector.rotation_deg that differs from it
+si_rotation_offset_deg = 0.0 # "corner": the inflector assembly (housing, field, hand-off) turned this far off the corner
+                             # rule [deg, + ccw]; gap 0's home point on the plate turns with it. docs/si_rotation_gap0.md
 gap0_on_plate = false        # re-fit gap 0's variable segment onto the turned exit-plate line (reads the exit spec)
+gap0_leave_mm = 0.0          # "connected": gap 0 leaves the exit plate this far outward (+) of its home point (the
+                             # corner rule's plate / ray meeting point, turned by the offset; "fixed": the turned plate's)
 exit_plane_spec_file = ""    # exit_plane_spec.json; "" = the export folder above the housing outline's
 emitting_plane_file = ""     # hand-off file whose particle cloud is the emitting plane of the beam channel; "" = the
                              # export's own (handoff_sc_all_level.h5 beside the outline's folder), else paths.handoff

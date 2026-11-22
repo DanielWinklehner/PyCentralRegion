@@ -283,7 +283,8 @@ def check_si_rotation(model3d, rotation_deg, where=''):
 
 def follow_model_si_rotation(cfg, model3d):
     """With geometry.si_rotation = 'corner' the electrode build turns the inflector with gap 0's ray, so with the dee
-    opening; the run then turns it by the angle its model was built around (params['si_rotation_deg']), whatever
+    opening, plus geometry.si_rotation_offset_deg; the run then turns it - field, housing and hand-off bunch - by the
+    angle its model was built around (params['si_rotation_deg']), whatever
     inflector.rotation_deg says: that key is set in cfg (in place: the inflector, the reference particle, the bunch and
     the resolved configuration all read it). Other modes and models without the record leave cfg as it is."""
     built = model3d.params.get('si_rotation_deg')

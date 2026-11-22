@@ -191,7 +191,9 @@ def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
         print("  (the seed gives only its reference orbit: its gap lines and opening are not used)")
         lines = B.lay_connected_gap_lines(dees, verbose=True)
         V.print_gap_lines(dees, result)
-        return _layout_rest(cfg, s, g, inp, dees, geom, result, trj, si_rot, dees_png, lines)
+        lay = _layout_rest(cfg, s, g, inp, dees, geom, result, trj, si_rot, dees_png, lines)
+        B.gap0_leave_report(lines, lay['outline'])
+        return lay
     if g.snap_nodes and len(trj) > 2:
         V._banner("SEGMENT NODES: DROP THE INERT ONES, THEN SNAP MIDWAY BETWEEN TURNS")
         B.match_gaps_to_orbit(dees, trj, verbose=True)
@@ -416,7 +418,7 @@ def _lines_record(lines) -> list:
     if lines is None:
         return None
     keep = ('gap', 'ray_deg', 'P0', 'P1', 'P2', 'd0_deg', 'd1_deg', 'bends_deg', 'y1_max', 'y0_range',
-            'corner_bend_deg')
+            'corner_bend_deg', 'leave')
     return [{k: (list(map(float, ln[k])) if isinstance(ln[k], tuple) else ln[k]) for k in keep if k in ln}
             for ln in lines]
 

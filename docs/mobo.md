@@ -146,7 +146,9 @@ Useful targets:
 | first-harmonic trim | `btrim.amplitude_cos_t`, `btrim.amplitude_sin_t` (its Cartesian components) | cheap |
 | collimating slit | `slit.half_width_mm`, `slit.azimuth_deg`, `slit.offset_mm`, `slit.pass_index` (`integer = true`) | cheap |
 | magnet level | `magnet.scale` | cheap |
-| spiral-inflector rotation | `inflector.rotation_deg` (with `geometry.si_rotation = "fixed"`) | geometry |
+| spiral-inflector rotation | `inflector.rotation_deg` (with `geometry.si_rotation = "fixed"`; gap 0 then leaves the plate where the turned plate meets its ray, which runs along the plate as it turns) | geometry |
+| spiral-inflector rotation, gap 0 held on its plate point | `geometry.si_rotation_offset_deg` (with `geometry.si_rotation = "corner"`: off the corner rule; `docs/si_rotation_gap0.md`) | geometry |
+| gap 0's leave point on the exit plate | `geometry.gap0_leave_mm` (connected gap lines; along the plate from its home point) | geometry |
 | dee opening | `machine.dee_opening_deg` (with `geometry.si_rotation = "corner"` the inflector turns with it) | geometry |
 | dee vertical aperture | `geometry.aperture_inner_mm`, `aperture_outer_mm`, `aperture_taper_center_mm` or `aperture_taper_start_mm` (a box that keeps the taper outside a radius), `aperture_taper_length_mm` | geometry |
 | a connected gap line | `geometry.gap_line.<i>.r1_mm`, `dr_mm` (P2 at r1 + dr: no ordering constraint), `f0`, `f1` | geometry |
