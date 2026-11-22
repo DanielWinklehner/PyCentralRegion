@@ -41,6 +41,7 @@ This module needs only the standard library, so a run file can be checked withou
 """
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 from PyCentralRegion.config import ConfigError, toml_value
@@ -196,7 +197,12 @@ class GeometryConfig:
     junction_tol_deg: float = 1.0        # close a variable -> fixed junction whose net angular step is below this
     # --- spiral inflector ----------------------------------------------------------------------------------------
     si_rotation: str = 'fixed'           # 'fixed': [inflector] rotation_deg; 'corner': gap-0 ray - the spec's azimuth
+    si_rotation_offset_deg: float = 0.0  # 'corner': the inflector assembly turned this far off the corner rule [deg, +
+                                         # ccw]; gap 0's home point on the plate turns with it (docs/si_rotation_gap0.md)
     gap0_on_plate: bool = False          # re-fit gap 0's variable segment onto the turned exit-plate line
+    gap0_leave_mm: float = 0.0           # 'connected': gap 0 leaves the exit plate this far outward of its home point
+    gap0_tilt_deg: float = 0.0           # 'connected', star: gap 0's first segment turned clockwise off the plate about
+                                         # that point (>= 0); a grounded nose fills the wedge, the exit opening cut through
     exit_plane_spec_file: str = ''       # exit_plane_spec.json; '' = the export folder above the housing outline's
     emitting_plane_file: str = ''        # hand-off file whose particle cloud is the emitting plane; '' = the export's
                                          # own (handoff_sc_all_level.h5 beside the outline's folder), else paths.handoff
@@ -368,11 +374,41 @@ class GeometryConfig:
                                   "< 45 and gap_line_r0_mm > 0")
         elif self.gap_line:
             raise ConfigError("geometry.gap_line items are read only with gap_lines = 'connected'")
+        self._check_si_gap0()
         if self.gap0_hole_r_mm < 0.0:
             raise ConfigError(f"geometry.gap0_hole_r_mm must be >= 0, got {self.gap0_hole_r_mm!r}")
         if self.gap0_hole_r_mm > 0.0 and any(h.gap == 0 and h.side == 'dee' for h in self.holes):
             raise ConfigError("geometry.gap0_hole_r_mm places dee0's gap-0 hole at every build, and geometry.holes "
                               "has one there too: keep one of them")
+
+    def _check_si_gap0(self):
+        """The spiral-inflector offset and gap 0's leave point and tilt (docs/si_rotation_gap0.md): config errors only,
+        so that a campaign's preflight refuses a box that sets them where they cannot act."""
+        for name in ('si_rotation_offset_deg', 'gap0_leave_mm', 'gap0_tilt_deg'):
+            if not math.isfinite(float(getattr(self, name))):
+                raise ConfigError(f"geometry.{name} must be a finite number, got {getattr(self, name)!r}")
+        if self.si_rotation_offset_deg != 0.0 and self.si_rotation != 'corner':
+            raise ConfigError(f"geometry.si_rotation_offset_deg = {self.si_rotation_offset_deg:g} turns the spiral "
+                              f"inflector off the corner rule; with si_rotation = {self.si_rotation!r} the turn is "
+                              f"[inflector] rotation_deg alone (set si_rotation = 'corner', or the offset to 0)")
+        moved = [f"{name} = {getattr(self, name):g}" for name in ('gap0_leave_mm', 'gap0_tilt_deg')
+                 if getattr(self, name) != 0.0]
+        if moved and self.gap_lines != 'connected':
+            raise ConfigError(f"geometry.{' / '.join(moved)} place gap 0's connected line; the seed's gap 0 "
+                              f"(gap_lines = {self.gap_lines!r}) is re-fitted on the plate by gap0_on_plate and has no "
+                              f"leave point or tilt (set gap_lines = 'connected', or them to 0)")
+        if not 0.0 <= self.gap0_tilt_deg < 45.0:
+            raise ConfigError(f"geometry.gap0_tilt_deg = {self.gap0_tilt_deg:g}: 0 <= tilt < 45 deg (a negative tilt "
+                              f"turns gap 0's first segment into the housing; + is clockwise, into dee 0)")
+        if self.gap0_tilt_deg > 0.0 and self.ground != 'star':
+            raise ConfigError(f"geometry.gap0_tilt_deg = {self.gap0_tilt_deg:g} needs ground = 'star': the grounded "
+                              f"nose a tilted gap 0 needs between the exit plate and its dummy edge is built into the "
+                              f"star ground; ground = {self.ground!r} has none (set ground = 'star', or the tilt to 0)")
+
+    def gap0_moved(self) -> bool:
+        """Whether gap 0's leave point or first segment differs from the original treatment (any of the three keys of
+        docs/si_rotation_gap0.md non-zero): the leave-point build checks run only then."""
+        return bool(self.si_rotation_offset_deg or self.gap0_leave_mm or self.gap0_tilt_deg)
 
     # the channel, as the builder reads it
     def aperture_heights(self) -> tuple:

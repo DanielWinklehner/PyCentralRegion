@@ -47,6 +47,8 @@ _EXIT_SPEC = {}
 STAR_R_EXT_MM = 20.0        # star keep-outs run this far past r_max, so no edge of theirs lies on the r_max circle
 STAR_SEAM_MM = 0.5          # gap / tip bands reach this far INTO the dee: overlaps, never shared edges
 GAP0_FACE_OVERLAP_MM = 2.0  # the gap-0 ground face reaches this far into the housing
+GAP0_LEAVE_BEND_MAX_DEG = 75.0   # a moved / tilted gap 0 may bend at most this much where it leaves the exit plate
+GAP0_NOSE_MARGIN_MM = 5.0   # the gap-0 nose fills where the housing lies within the tilt's wedge depth + this
 PLATE_CORNER_SNAP_MM = 0.25
 POST_WALL_SINK_MM = 0.5     # a post joined to an end wall sits this deep in it everywhere (>> the fuzzy tolerance)
 
@@ -613,19 +615,27 @@ def move_junctions(dees: DeeSystem, moves, verbose: bool = True):
 # =====================================================================================================================
 # 5. the spiral inflector turned about the machine axis
 # =====================================================================================================================
+def corner_rotation_deg(dees: DeeSystem) -> float:
+    """The corner rule's rotation [deg, +ccw]: gap 0's base angle minus the exit spec's gap azimuth."""
+    return float(dees.gaps[0].base_angle) - float(exit_spec()['gap_azimuth_deg'])
+
+
 def si_rotation_deg(dees: DeeSystem) -> float:
     """The spiral inflector's rotation about the machine axis [deg, +ccw] the electrodes are built with.
 
-    'fixed': [inflector] rotation_deg, the angle the tracker turns the inflector field, housing and bunch by (a
-    campaign that varies the rotation uses this mode). 'corner': gap 0's base angle minus the exit spec's gap azimuth.
-    The export placed the inflector for its own dee opening by a rule (the exit plate's outer corner a fixed distance
-    off gap 0's ray); another opening moves gap 0's ray, and turning the whole inflector by this angle keeps the rule
-    exactly, since it is rotation-equivariant. Either way the model records the angle (params['si_rotation_deg']);
-    with 'fixed' the tracker refuses an inflector.rotation_deg that differs from it, with 'corner' it follows it
-    (simulate3d.follow_model_si_rotation), so a campaign may vary the dee opening alone.
+    'fixed': [inflector] rotation_deg, the angle the tracker turns the inflector field, housing and bunch by.
+    'corner': gap 0's base angle minus the exit spec's gap azimuth (``corner_rotation_deg``), plus
+    geometry.si_rotation_offset_deg. The export placed the inflector for its own dee opening by a rule (the exit plate's
+    outer corner a fixed distance off gap 0's ray); another opening moves gap 0's ray, and turning the whole inflector
+    by this angle keeps the rule exactly, since it is rotation-equivariant; the offset turns the assembly off the rule,
+    gap 0's home point on the plate with it (``gap0_leave_point``, docs/si_rotation_gap0.md). Either way the model
+    records the angle (params['si_rotation_deg']); with 'fixed' the tracker refuses an inflector.rotation_deg that
+    differs from it, with 'corner' it follows it (simulate3d.follow_model_si_rotation), so a campaign may vary the
+    dee opening and the offset alone.
     """
     if OPT.si_rotation == 'corner':
-        return float(dees.gaps[0].base_angle) - float(exit_spec()['gap_azimuth_deg'])
+        rot = corner_rotation_deg(dees)
+        return rot + float(OPT.si_rotation_offset_deg) if OPT.si_rotation_offset_deg else rot
     return float(INFLECTOR.rotation_deg)
 
 
@@ -748,20 +758,22 @@ def _to_machine(theta_deg: float, xy) -> np.ndarray:
 
 
 def connected_line(r1: float, f1: float, r2: float, f0: float = 0.0, x0: float = None, r0: float = None,
-                   d_max_deg: float = None, bend_max_deg: float = None) -> dict:
+                   d_max_deg: float = None, bend_max_deg: float = None, y0: float = None) -> dict:
     """One connected gap line in its gap's own frame [mm] (x along the ray, y across it, + counterclockwise): P0, P1
     and P2 = (r2, 0), from the fractions of an options.GapLine item.
 
-    P0 is (r0, y0) with y0 from f0 (r0: geometry.gap_line_r0_mm); with ``x0`` (gap 0) it is the fixed point (x0, 0)
-    where the exit-plate line meets the ray, the bend there free and f0 unused. y1 = f1 x the largest |y1| with
-    |y1| <= r1 tan(d_max), the bend at P2 <= bend_max and some P0 within the limits (with x0: the bend at P1
-    <= bend_max); y0 = f0 mapped linearly from [-1, 1] onto the y0 with |y0| <= r0 tan(d_max) and the bend at P1
-    <= bend_max. Returns {'P0', 'P1', 'P2' ((x, y) mm), 'bends_deg' (at P1, at P2), 'd0_deg', 'd1_deg' (P0's and P1's
-    azimuths off the ray), 'y1_max', 'y0_range'}."""
+    P0 is (r0, y0) with y0 from f0 (r0: geometry.gap_line_r0_mm); with ``x0`` (gap 0) it is the fixed point (x0, y0)
+    where gap 0 leaves the exit plate (``gap0_leave_point``; y0 = 0, on the ray, unless the assembly or the leave point
+    moved it), the bend there free and f0 unused. y1 = f1 x the largest |y1| with |y1| <= r1 tan(d_max), the bend at
+    P2 <= bend_max and some P0 within the limits (with x0: the bend at P1 <= bend_max for +|y1| and -|y1| both);
+    y0 = f0 mapped linearly from [-1, 1] onto the y0 with |y0| <= r0 tan(d_max) and the bend at P1 <= bend_max.
+    Returns {'P0', 'P1', 'P2' ((x, y) mm), 'bends_deg' (at P1, at P2), 'd0_deg', 'd1_deg' (P0's and P1's azimuths off
+    the ray), 'y1_max', 'y0_range'}."""
     d_max = np.radians(OPT.gap_line_d_max_deg if d_max_deg is None else d_max_deg)
     lim = float(OPT.bend_max_deg if bend_max_deg is None else bend_max_deg)
     fixed0 = x0 is not None
     x0 = float(x0) if fixed0 else float(OPT.gap_line_r0_mm if r0 is None else r0)
+    y0_fixed = 0.0 if y0 is None else float(y0)
     r1, r2 = float(r1), float(r2)
     if not x0 < r1 < r2:
         raise ConfigError(f"a connected gap line needs P0 < r1 < r2 along its ray, got {x0:.3f} / {r1:.3f} / "
@@ -776,15 +788,20 @@ def connected_line(r1: float, f1: float, r2: float, f0: float = 0.0, x0: float =
         return (max(y1 - run * np.tan(min(a_b + np.radians(lim), cap)), -x0 * np.tan(d_max)),
                 min(y1 - run * np.tan(max(a_b - np.radians(lim), -cap)), x0 * np.tan(d_max)))
 
-    def within(y):                     # each limit, once broken, stays broken as |y1| grows; all are even in y1
-        b1, b2 = bends(0.0, y)
+    def within(y):                     # each limit, once broken, stays broken as |y1| grows; all are even in y1, but a
+        b1, b2 = bends(y0_fixed, y)    # fixed P0 off the ray makes the bend at P1 uneven: then both signs must hold
         if b2 > lim:
             return False
         if fixed0:
-            return b1 <= lim
+            return b1 <= lim and (y0_fixed == 0.0 or bends(y0_fixed, -y)[0] <= lim)
         lo0, hi0 = p0_range(y)
         return lo0 <= hi0
 
+    if fixed0 and y0_fixed != 0.0 and not within(0.0):
+        raise ConfigError(f"gap 0: from its leave point ({x0:.3f}, {y0_fixed:+.3f}) mm in its own frame (along, across "
+                          f"the ray) no P1 at r1 = {r1:.3f} mm keeps the bend at P1 within bend_max_deg = {lim:g}: "
+                          f"{bends(y0_fixed, 0.0)[0]:.2f} deg already on the ray (si_rotation_offset_deg / "
+                          f"gap0_leave_mm move the leave point too far off gap 0's ray for this r1)")
     lo, hi = 0.0, r1 * np.tan(d_max)
     if within(hi):
         lo = hi
@@ -795,7 +812,7 @@ def connected_line(r1: float, f1: float, r2: float, f0: float = 0.0, x0: float =
     y1_max = lo
     y1 = float(f1) * y1_max
     if fixed0:
-        y0, y0_range = 0.0, (0.0, 0.0)
+        y0, y0_range = y0_fixed, (y0_fixed, y0_fixed)
     else:
         lo, hi = p0_range(y1)
         if lo > hi:
@@ -809,15 +826,23 @@ def connected_line(r1: float, f1: float, r2: float, f0: float = 0.0, x0: float =
             'y1_max': float(y1_max), 'y0_range': y0_range}
 
 
-def plate_ray_point(dees: DeeSystem) -> dict:
-    """Where gap 0's exit-plate line (the plate face shifted by half the local gap, turned with the inflector) meets
-    gap 0's ray [mm]: {'point', 'r' (its radius), 'direction' (the plate line's, outward), 'corner' (the plate's outer
-    corner, turned), 'corner_off_ray_mm'}."""
+def _turned_plate(dees: DeeSystem, rotation_deg: float):
+    """Gap 0's exit-plate line turned by rotation_deg [mm]: (a point on it, its unit direction (outward), the plate's
+    outer corner)."""
     sp = exit_spec()
     cav = dees.gaps[0]
-    R = rotation_z(si_rotation_deg(dees), 2)
+    R = rotation_z(rotation_deg, 2)
     point, d, _ = plate_line(sp, half_gap_m=0.5 * float(cav.gap_width_at(float(sp['baseline']['r_mm']) * 1e-3)))
-    p, d = R @ point * MM, R @ d
+    return R @ point * MM, R @ d, R @ np.asarray(sp['corner']['rotated_mm'][:2], dtype=float)
+
+
+def plate_ray_point(dees: DeeSystem, rotation_deg: float = None) -> dict:
+    """Where gap 0's exit-plate line (the plate face shifted by half the local gap, turned with the inflector, or by
+    ``rotation_deg``) meets gap 0's ray [mm]: {'point', 'r' (its radius), 's' (its arclength along the plate line from
+    the turned plate_line point), 'direction' (the plate line's, outward), 'corner' (the plate's outer corner, turned),
+    'corner_off_ray_mm'}."""
+    cav = dees.gaps[0]
+    p, d, corner = _turned_plate(dees, si_rotation_deg(dees) if rotation_deg is None else rotation_deg)
     b = np.radians(float(cav.base_angle))
     e = np.array([np.cos(b), np.sin(b)])
     det = d[0] * (-e[1]) - d[1] * (-e[0])
@@ -828,9 +853,46 @@ def plate_ray_point(dees: DeeSystem) -> dict:
     t = float(x @ e)
     if t <= 0.0:
         raise ConfigError(f"gap 0: the exit-plate line meets the gap's ray behind the machine axis (t = {t:.2f} mm)")
-    corner = R @ np.asarray(sp['corner']['rotated_mm'][:2], dtype=float)
-    return {'point': x, 'r': t, 'direction': d, 'corner': corner,
+    return {'point': x, 'r': t, 's': float(s), 'direction': d, 'corner': corner,
             'corner_off_ray_mm': float(e[0] * corner[1] - e[1] * corner[0])}
+
+
+def gap0_leave_point(dees: DeeSystem) -> dict:
+    """Where gap 0 leaves the exit plate, and its first segment's direction (docs/si_rotation_gap0.md) [mm].
+
+    The HOME point H: with si_rotation = 'corner', where the plate line turned by the corner rule's angle meets gap 0's
+    ray, carried with the assembly by geometry.si_rotation_offset_deg (the same place on the plate for every offset);
+    with 'fixed', where the plate line turned by [inflector] rotation_deg meets the ray (the original treatment). The
+    LEAVE point L = H + gap0_leave_mm d (d the turned plate line's outward direction); the first segment runs along
+    d1 = d turned clockwise by gap0_tilt_deg. Returns {'point' (L), 'r' and 'y' (L along and across gap 0's ray),
+    'direction' (d), 'first' (d1), 'home' (H), 'corner', 'corner_off_ray_mm', 'rotation_deg', 'offset_deg',
+    'leave_mm', 'tilt_deg', 'reference'}; all three 0, it is ``plate_ray_point`` to the bit."""
+    rot = si_rotation_deg(dees)
+    offset = float(OPT.si_rotation_offset_deg) if OPT.si_rotation == 'corner' else 0.0
+    if offset:
+        ref = 'the corner rule\'s plate / ray point, turned with the assembly by si_rotation_offset_deg'
+        home = plate_ray_point(dees, rotation_deg=corner_rotation_deg(dees))
+        p, d, corner = _turned_plate(dees, rot)
+        H = p + home['s'] * d                  # the same arclength along the plate, on the plate turned by rot
+    else:
+        ref = ('the corner rule\'s plate / ray point' if OPT.si_rotation == 'corner'
+               else 'the plate turned by inflector.rotation_deg meets the ray')
+        home = plate_ray_point(dees)
+        H, d, corner = home['point'], home['direction'], home['corner']
+    leave, tilt = float(OPT.gap0_leave_mm), float(OPT.gap0_tilt_deg)
+    b = np.radians(float(dees.gaps[0].base_angle))
+    e = np.array([np.cos(b), np.sin(b)])
+    if offset or leave:
+        L = H + leave * d if leave else H
+        x_L, y_L = float(L @ e), float(e[0] * L[1] - e[1] * L[0])
+        if x_L <= 0.0:
+            raise ConfigError(f"gap 0 would leave the exit plate behind the machine axis ({x_L:.2f} mm along its ray)")
+    else:
+        L, x_L, y_L = H, home['r'], 0.0
+    d1 = rotation_z(-tilt, 2) @ d if tilt else d
+    return {'point': L, 'r': x_L, 'y': y_L, 'direction': d, 'first': d1, 'home': H, 'corner': corner,
+            'corner_off_ray_mm': float(e[0] * corner[1] - e[1] * corner[0]), 'rotation_deg': rot,
+            'offset_deg': offset, 'leave_mm': leave, 'tilt_deg': tilt, 'reference': ref}
 
 
 def connected_dee_system() -> DeeSystem:
@@ -856,11 +918,16 @@ def lay_connected_gap_lines(dees: DeeSystem, verbose: bool = True) -> list:
     for g, (cav, item) in enumerate(zip(dees.gaps, OPT.gap_line)):
         th = float(cav.base_angle)
         if g == 0:
-            pl = plate_ray_point(dees)
-            ln = connected_line(item.r1_mm, item.f1, item.r2_mm, x0=pl['r'])
+            pl = gap0_leave_point(dees)
+            ln = connected_line(item.r1_mm, item.f1, item.r2_mm, x0=pl['r'], y0=pl['y'])
             P1, P2 = _to_machine(th, ln['P1']), _to_machine(th, ln['P2'])
-            pts = [pl['point'] - pl['r'] * pl['direction'], pl['point'], P1, P2]
+            pts = [pl['point'] - pl['r'] * pl['first'], pl['point'], P1, P2]
             ln.update(plate=pl, corner_bend_deg=_bend_deg(pts[0], pts[1], P1))
+            if OPT.gap0_moved() and ln['corner_bend_deg'] > GAP0_LEAVE_BEND_MAX_DEG:
+                raise ConfigError(f"gap 0 bends by {ln['corner_bend_deg']:.2f} deg where it leaves the exit plate "
+                                  f"(> {GAP0_LEAVE_BEND_MAX_DEG:g}: its first segment, tilted {pl['tilt_deg']:g} deg "
+                                  f"off the plate, and the line on to P1 at r1 = {item.r1_mm:g} mm nearly fold back; "
+                                  f"si_rotation_offset_deg {pl['offset_deg']:g}, gap0_leave_mm {pl['leave_mm']:g})")
         else:
             ln = connected_line(item.r1_mm, item.f1, item.r2_mm, f0=item.f0)
             P0, P1, P2 = (_to_machine(th, ln[k]) for k in ('P0', 'P1', 'P2'))
@@ -876,8 +943,17 @@ def lay_connected_gap_lines(dees: DeeSystem, verbose: bool = True) -> list:
         print(f"  bends at P1 and P2 <= {OPT.bend_max_deg:g} deg, P0 and P1 within {OPT.gap_line_d_max_deg:g} deg of the "
               f"ray; P0 of gaps 1 .. {len(dees.gaps) - 1} at {OPT.gap_line_r0_mm:g} mm along it")
         pl = out[0]['plate']
-        print(f"  gap 0 leaves the exit plate where its line meets the ray, r = {pl['r']:.3f} mm (the plate corner "
-              f"{pl['corner_off_ray_mm']:+.3f} mm off the ray), with a free bend of {out[0]['corner_bend_deg']:.2f} deg")
+        if not OPT.gap0_moved():
+            print(f"  gap 0 leaves the exit plate where its line meets the ray, r = {pl['r']:.3f} mm (the plate corner "
+                  f"{pl['corner_off_ray_mm']:+.3f} mm off the ray), with a free bend of {out[0]['corner_bend_deg']:.2f} "
+                  f"deg")
+        else:
+            L, H = pl['point'], pl['home']
+            print(f"  gap 0 leaves the exit plate at ({L[0]:.3f}, {L[1]:.3f}) mm, {pl['leave_mm']:+g} mm along the plate "
+                  f"from its home point ({H[0]:.3f}, {H[1]:.3f}) ({pl['reference']}; si_rotation_offset_deg "
+                  f"{pl['offset_deg']:+g}): {pl['r']:.3f} mm along gap 0's ray, {pl['y']:+.3f} mm across it; the plate "
+                  f"corner {pl['corner_off_ray_mm']:+.3f} mm off the ray; first segment tilted {pl['tilt_deg']:g} deg "
+                  f"clockwise off the plate; free bend {out[0]['corner_bend_deg']:.2f} deg")
         print()
         print(f"  {'gap':>4} {'ray':>8} {'f0':>6} {'P0 r':>7} {'d0':>7} {'f1':>6} {'P1 r':>7} {'d1':>7} {'P2 r':>7} "
               f"{'bend P1':>8} {'bend P2':>8} {'|y1| max':>9}")
@@ -1631,14 +1707,15 @@ def star_ground_layout(occ, foot, dees: DeeSystem, z: float, r_max: float, verbo
 
 
 def gap0_face_polygon(d0: dict, cav0, wall: np.ndarray, g_max: float, overlap: float = GAP0_FACE_OVERLAP_MM,
-                      ds: float = 2.0, verbose: bool = True):
+                      ds: float = 2.0, verbose: bool = True, until=None):
     """The gap-0 ground face's outline [mm] (closed polygon), or None when the housing is nowhere within g_max.
 
     The beam channel is cut through every ground plate from r = 0, so inside it the only ground on gap 0's dummy side
     can be the inflector housing face, some mm behind the design edge: the median plane then sees gap 0 wider than
     designed. The face fills, full height, the strip between gap 0's dummy edge (dee0's gap-0 edge offset by the local
     gap-law width, the star keep-out's own edge) and the housing wherever the housing is within g_max of that edge,
-    reaching `overlap` into the housing."""
+    reaching `overlap` into the housing. ``until`` = (L, d1): only the part of the edge inward of L along d1 (the
+    tilted first segment's nose, ``gap0_nose_polygon``)."""
     from matplotlib.path import Path as MPath
     from PyCentralRegion.gap_fields import offset_polyline
     lo = _densify(_dedupe(np.asarray(d0['lo'], dtype=float)), ds)[0]   # straight runs stay on their line
@@ -1652,6 +1729,8 @@ def gap0_face_polygon(d0: dict, cav0, wall: np.ndarray, g_max: float, overlap: f
     hit = inside((edge[:, None, :] + t[None, :, None] * nrm[:, None, :]).reshape(-1, 2)).reshape(len(edge), len(t))
     dist = np.where(hit.any(axis=1), t[np.argmax(hit, axis=1)], np.inf)
     keep = np.isfinite(dist)
+    if until is not None:
+        keep &= (lo - np.asarray(until[0], dtype=float)) @ np.asarray(until[1], dtype=float) <= 0.0
     if not keep.any():
         return None
     runs = np.split(np.flatnonzero(keep), np.flatnonzero(np.diff(np.flatnonzero(keep)) > 1) + 1)
@@ -1663,11 +1742,74 @@ def gap0_face_polygon(d0: dict, cav0, wall: np.ndarray, g_max: float, overlap: f
         raise RuntimeError("gap-0 face: an inner point is not inside the housing")
     if verbose:
         r = np.hypot(*edge[run].T)
-        print(f"[gap0 face] ground fills gap 0's dummy side down to the housing (gap0_face_mm {g_max:g}): r "
+        what = (f"[gap0 nose] ground fills the tilted first segment's gap 0 dummy side down to the housing (within "
+                f"{g_max:.2f} mm)" if until is not None else
+                f"[gap0 face] ground fills gap 0's dummy side down to the housing (gap0_face_mm {g_max:g})")
+        print(f"{what}: r "
               f"{r.min():.1f} .. {r.max():.1f} mm along the edge ({len(run)} points every {ds:g} mm), housing "
               f"{dist[run].min():.2f} .. {dist[run].max():.2f} mm behind the design edge (mean "
               f"{dist[run].mean():.2f}), design gap {w[run].min():.2f} .. {w[run].max():.2f} mm")
     return np.vstack([edge[run], inner[::-1]])
+
+
+def gap0_leave_report(lines: list, outline: dict, verbose: bool = True) -> dict:
+    """Gap 0's leave point against the turned housing (connected gap lines): the exit aperture's and the plate corner's
+    arclengths from it along the plate [mm], recorded as lines[0]['leave'] (for <prefix>_build.json). With any of
+    docs/si_rotation_gap0.md's three keys set, a leave point inside or inward of the exit aperture is refused: the beam
+    would leave the housing beside gap 0 instead of into it."""
+    pl = lines[0]['plate']
+    L, d = np.asarray(pl['point'], dtype=float), np.asarray(pl['direction'], dtype=float)
+    ap = np.asarray(outline['aperture'], dtype=float)[:, :2]
+    s_ap = (ap - L) @ d
+    s_corner = float((np.asarray(pl['corner'], dtype=float) - L) @ d)
+    rec = {'reference': pl['reference'], 'home_mm': [float(v) for v in pl['home']],
+           'point_mm': [float(v) for v in L], 'along_ray_mm': float(pl['r']), 'across_ray_mm': float(pl['y']),
+           'si_rotation_offset_deg': float(pl['offset_deg']), 'gap0_leave_mm': float(pl['leave_mm']),
+           'gap0_tilt_deg': float(pl['tilt_deg']), 'corner_s_mm': s_corner,
+           'aperture_s_mm': [float(s_ap.min()), float(s_ap.max())]}
+    lines[0]['leave'] = rec
+    if OPT.gap0_moved() and s_ap.max() >= 0.0:
+        raise ConfigError(f"gap 0 would leave the exit plate {s_ap.max():.2f} mm inward of the exit aperture's outer end "
+                          f"(the aperture spans {s_ap.min():+.2f} .. {s_ap.max():+.2f} mm along the plate from the leave "
+                          f"point; si_rotation_offset_deg {pl['offset_deg']:g}, gap0_leave_mm {pl['leave_mm']:g}): the "
+                          f"beam would leave the housing beside gap 0 - move the leave point out by at least that much")
+    if verbose:
+        print(f"  gap 0's leave point: the exit aperture {s_ap.min():+.2f} .. {s_ap.max():+.2f} mm and the plate corner "
+              f"{s_corner:+.2f} mm along the plate from it")
+    return rec
+
+
+def gap0_nose_polygon(foot, dees: DeeSystem, wall: np.ndarray, pl: dict, verbose: bool = True):
+    """The ground nose a tilted gap 0 needs [mm] (closed polygon), or None without a tilt: gap0_face_polygon along the
+    first segment, inward of the leave point, reaching the housing wherever it lies within the tilt's wedge depth +
+    GAP0_NOSE_MARGIN_MM. Refuses (ConfigError) a tilt that finds no housing to fill to."""
+    tilt = float(pl['tilt_deg'])
+    if not tilt > 0.0:
+        return None
+    d0 = next(d for d in foot if d['label'] == 'dee0')
+    L, d1 = np.asarray(pl['point'], dtype=float), np.asarray(pl['first'], dtype=float)
+    u = -(np.asarray(d0['lo'], dtype=float) - L) @ d1
+    if not u.max() > 0.0:
+        raise ConfigError(f"geometry.gap0_tilt_deg = {tilt:g}: dee 0's gap-0 edge has no part inward of gap 0's leave "
+                          f"point, so there is no first segment to tilt")
+    g_max = float(u.max()) * float(np.tan(np.radians(tilt))) + GAP0_NOSE_MARGIN_MM
+    poly = gap0_face_polygon(d0, dees.gaps[d0['gaps'][0]], wall, g_max, verbose=verbose, until=(L, d1))
+    if poly is None:
+        raise ConfigError(f"geometry.gap0_tilt_deg = {tilt:g}: the housing is nowhere within {g_max:.1f} mm of gap 0's "
+                          f"tilted first segment, so no ground nose can close its dummy side")
+    return poly
+
+
+def _nearest_dee_mm(poly: np.ndarray, foot) -> list:
+    """[(label, the smallest distance [mm] from the closed polygon's outline to that dee's footprint)]."""
+    from scipy.spatial import cKDTree
+    pq = _densify(np.vstack([poly, poly[:1]]), 0.25)[0]
+    out = []
+    for d in foot:
+        fp = footprint_polygon(d)
+        dd, _ = cKDTree(_densify(np.vstack([fp, fp[:1]]), 0.25)[0]).query(pq)
+        out.append((d['label'], float(dd.min())))
+    return out
 
 
 # =====================================================================================================================
@@ -2340,10 +2482,11 @@ def build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: b
 def _build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: bool = True, half: float = None,
                  wall_t: float = None, r_cut: float = None, lc: float = None, aperture=None, dummy_aperture=None,
                  lc_posts: float = None, lc_outer: float = None, r_fine: float = None, r_coarse: float = None,
-                 fuse_tol: dict = None):
+                 fuse_tol: dict = None, nose=None):
     """The whole central region as OCC solids, hollowed and fused, with the mesh size fields set. Leaves gmsh
     initialised; returns (gmsh, groups {label: volume tags}, aperture-tool radii, footprints). ``fuse_tol``: per owner,
-    the boolean tolerance of its hardware's fuse where it is not the default (see build_model).
+    the boolean tolerance of its hardware's fuse where it is not the default (see build_model). ``nose``: a tilted gap
+    0's ground nose (``gap0_nose_polygon``; star ground), fused in full height before the exit opening is cut.
 
     Ground 'star': built from its 2D layout (star_ground_layout) - extruded, hollowed by the channel outside the
     housing, the inflector housing merged in, its exit opening cut (a cylinder when it is round); the dummy footprints
@@ -2387,6 +2530,8 @@ def _build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: 
             print(f"[build] {m}  ({time.time() - t0:.1f} s)")
 
     star = OPT.ground == 'star'
+    if nose is not None and not star:
+        raise ConfigError("a gap-0 nose (geometry.gap0_tilt_deg) is built into the star ground only")
     # ---- 1. the housing: its outline extruded, the beam channel cut out ---------------------------------------------
     hs = _occ_loop(occ, housing_edges(sim), -half)
     house = [t for d, t in occ.extrude([(2, hs)], 0, 0, 2.0 * half) if d == 3][0]
@@ -2503,6 +2648,18 @@ def _build_model(foot, dummy, sim, brick, dees: DeeSystem, posts=None, verbose: 
                 out, _ = occ.fuse(gnd, fv, removeObject=True, removeTool=True)
                 gnd = [e for e in out if e[0] == 3]
                 say(f"gap-0 face fused into the ground (full height) -> {len(gnd)} solid(s)")
+        if nose is not None:                      # a tilted gap 0's ground nose, before the exit opening is cut through it
+            w0 = _star_gap_floor_mm()
+            near = _nearest_dee_mm(nose, foot)
+            bad = [f"{lab} {dmin:.2f} mm" for lab, dmin in near if dmin < w0 - 0.3]
+            if bad:
+                raise ConfigError(f"the gap-0 nose comes within less than the gap floor {w0:.2f} mm of " + ", ".join(bad)
+                                  + " (geometry.gap0_tilt_deg)")
+            fv = [e for e in occ.extrude([(2, _occ_polygon(occ, nose, -half))], 0, 0, 2.0 * half) if e[0] == 3]
+            out, _ = occ.fuse(gnd, fv, removeObject=True, removeTool=True)
+            gnd = [e for e in out if e[0] == 3]
+            say(f"gap-0 nose (gap0_tilt_deg {OPT.gap0_tilt_deg:g}) fused into the ground (full height; nearest dee0 "
+                f"metal {dict(near)['dee0']:.2f} mm) -> {len(gnd)} solid(s)")
         how = "no exit opening"
         if brick is not None:
             d = (brick['extend'] + brick['back']) * brick['sweep']

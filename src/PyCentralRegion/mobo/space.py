@@ -39,6 +39,9 @@ SAMPLERS = ('tpe', 'gp')
 GEOMETRY_SECTIONS = ('geometry', 'machine', 'inflector', 'fields')
 GEOMETRY_PATHS = ('seed', 'handoff', 'housing_outline', 'housing_step')
 POST_RULE_PATHS = ('bfield_3d', 'inflector_efield')
+# [geometry] keys whose 0 builds exactly what their absence builds (docs/si_rotation_gap0.md): left out of the key at 0,
+# so a design that writes them at 0, or varies them and lands on 0, keys like one from before they existed
+NEUTRAL_AT_ZERO = ('si_rotation_offset_deg', 'gap0_leave_mm', 'gap0_tilt_deg')
 # config keys the driver and the evaluator own: no variable may set them
 RESERVED_TARGETS = ('paths.model3d', 'paths.fields', 'run.out_dir')
 
@@ -248,11 +251,17 @@ def geometry_parts(base, cfg, params):
     finds idle (the taper's place of a flat channel, which changes no electrode), which 'idle' then lists: the
     designs that differ only in those share one key. Nothing is dropped while a cheap variable sets a [geometry]
     key (``MoboConfig.validate`` warns of it): the channel a geometry is built with then depends on more than these
-    parts. A design that loses no key has the parts it always had."""
+    parts. A design that loses no key has the parts it always had. The NEUTRAL_AT_ZERO keys are left out, without a
+    record, wherever they are 0."""
     paths = base.get('paths', {})
     parts = {'sections': {s: base.get(s, {}) for s in GEOMETRY_SECTIONS},
              'paths': {p: paths.get(p, '') for p in GEOMETRY_PATHS},
              'variables': {v.target: params[v.name] for v in cfg.geometry_variables}}
+    geometry = parts['sections']['geometry']
+    if any(_neutral(k, x) for k, x in geometry.items()):
+        parts['sections']['geometry'] = {k: x for k, x in geometry.items() if not _neutral(k, x)}
+    parts['variables'] = {t: x for t, x in parts['variables'].items()
+                          if not (t.startswith('geometry.') and _neutral(t.partition('.')[2], x))}
     if base.get('post_rule', {}).get('enabled'):         # the posts come from a run of the bare electrodes: what it reads
         parts['sections']['post_rule'] = base['post_rule']
         parts['paths'].update({p: paths.get(p, '') for p in POST_RULE_PATHS})
@@ -266,6 +275,11 @@ def geometry_parts(base, cfg, params):
     if dropped:
         parts['sections']['geometry'], parts['variables'], parts['idle'] = geometry, variables, sorted(dropped)
     return parts
+
+
+def _neutral(key, x):
+    """A NEUTRAL_AT_ZERO [geometry] key at 0."""
+    return key in NEUTRAL_AT_ZERO and isinstance(x, (int, float)) and not isinstance(x, bool) and x == 0
 
 
 def idle_geometry_keys(parts):
