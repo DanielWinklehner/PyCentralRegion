@@ -1,4 +1,4 @@
-"""The spiral-inflector offset, gap 0's leave point and its tilt (docs/si_rotation_gap0.md), on a synthetic export: an
+"""The spiral-inflector offset and gap 0's leave point (docs/si_rotation_gap0.md), on a synthetic export: an
 exit plate 15 deg clockwise of gap 0's ray, its outer corner half a gap off the ray (the corner rule's placement at the
 test machine's 42 deg opening, gap 0's ray at 24 deg), a housing round the axis with that plate as its exit face and a
 4 x 22 mm exit aperture on it."""
@@ -98,41 +98,37 @@ def _gap0(lay):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-def test_the_three_keys_are_checked_with_the_config():
+def test_the_two_keys_are_checked_with_the_config():
     g = GeometryConfig()
-    assert (g.si_rotation_offset_deg, g.gap0_leave_mm, g.gap0_tilt_deg) == (0.0, 0.0, 0.0) and not g.gap0_moved()
+    assert (g.si_rotation_offset_deg, g.gap0_leave_mm) == (0.0, 0.0) and not g.gap0_moved()
+    assert not hasattr(g, 'gap0_tilt_deg')                            # held: docs/si_rotation_gap0.md
     lines = (GapLine(0, 104.5, 159.5), GapLine(1, 110.0, 150.0))
     connected = dict(gap_lines='connected', snap_nodes=False, gap0_on_plate=True, gap_line=lines)
     assert GeometryConfig(si_rotation='corner', si_rotation_offset_deg=-3.0).gap0_moved()
+    assert GeometryConfig(gap0_leave_mm=-5.0, **connected).gap0_moved()  # 'fixed' mode: from its own home point
     with pytest.raises(ConfigError, match="si_rotation_offset_deg = 2 turns the spiral inflector off the corner rule"):
         GeometryConfig(si_rotation_offset_deg=2.0)
-    for key in ('gap0_leave_mm', 'gap0_tilt_deg'):
-        with pytest.raises(ConfigError, match=f"{key} = 5 place gap 0's connected line"):
-            GeometryConfig(ground='star', **{key: 5.0})
-    GeometryConfig(gap0_leave_mm=-5.0, **connected)                   # 'fixed' mode: from its own home point
-    for bad in (-1.0, 45.0):
-        with pytest.raises(ConfigError, match="0 <= tilt < 45 deg"):
-            GeometryConfig(ground='star', gap0_tilt_deg=bad, **connected)
-    with pytest.raises(ConfigError, match="gap0_tilt_deg = 10 needs ground = 'star'"):
-        GeometryConfig(gap0_tilt_deg=10.0, **connected)
-    with pytest.raises(ConfigError, match="must be a finite number"):
-        GeometryConfig(si_rotation='corner', si_rotation_offset_deg=float('nan'))
+    with pytest.raises(ConfigError, match="gap0_leave_mm = 5 places gap 0's connected line"):
+        GeometryConfig(gap0_leave_mm=5.0)
+    for key in ('si_rotation_offset_deg', 'gap0_leave_mm'):
+        with pytest.raises(ConfigError, match="must be a finite number"):
+            GeometryConfig(si_rotation='corner', **connected, **{key: float('nan')})
 
 
 def test_at_zero_the_leave_point_is_the_plate_ray_point(tmp_path):
-    """All three 0: gap 0 leaves the plate where the corner rule's plate line meets its ray, as before - the same
-    numbers, to the bit - and the build record says where the aperture and the corner lie along the plate."""
+    """Both 0: gap 0 leaves the plate where the corner rule's plate line meets its ray, as before - the same numbers,
+    to the bit - and the build record says where the aperture and the corner lie along the plate."""
     B = pytest.importorskip('PyCentralRegion.geometry.builder')
     lay = _layout(tmp_path)
     ln = lay['gap_lines'][0]
     pr = B.plate_ray_point(lay['dees'])
-    assert lay['si_rotation_deg'] == 0.0 and lay['gap0_nose'] is None
+    assert lay['si_rotation_deg'] == 0.0
     assert ln['P0'] == (pr['r'], 0.0) and ln['y0_range'] == (0.0, 0.0)
     pts = _gap0(lay)
     assert np.allclose(pts[1], pr['point'], rtol=0.0, atol=1e-9)
     assert np.allclose(pts[0], pr['point'] - pr['r'] * pr['direction'], rtol=0.0, atol=1e-9)
     rec = ln['leave']
-    assert rec['gap0_leave_mm'] == rec['gap0_tilt_deg'] == rec['si_rotation_offset_deg'] == 0.0
+    assert rec['gap0_leave_mm'] == rec['si_rotation_offset_deg'] == 0.0
     assert rec['corner_s_mm'] == pytest.approx(0.0, abs=1.0)          # the corner rule: the corner is next to L
     lo, hi = rec['aperture_s_mm']
     assert lo < hi < 0.0 and hi - lo == pytest.approx(APERTURE_S[1] - APERTURE_S[0])
@@ -181,7 +177,7 @@ def test_the_leave_point_moves_gap_0_along_the_plate_without_turning_anything(tm
         assert lay['si_rotation_deg'] == 0.0
         assert np.array_equal(lay['outline']['outer'], lay0['outline']['outer'])
         assert np.allclose(pl['point'], pl0['point'] + leave * pl0['direction'], atol=1e-12)
-        assert np.array_equal(pl['home'], pl0['point']) and np.array_equal(pl['first'], pl0['direction'])
+        assert np.array_equal(pl['home'], pl0['point']) and np.array_equal(pl['direction'], pl0['direction'])
         assert rec['corner_s_mm'] == pytest.approx(lay0['gap_lines'][0]['leave']['corner_s_mm'] - leave, abs=1e-9)
         pts = _gap0(lay)
         assert np.allclose(pts[1], pl['point'], atol=1e-9)
@@ -192,93 +188,35 @@ def test_the_leave_point_moves_gap_0_along_the_plate_without_turning_anything(tm
         _layout(tmp_path / 'in', gap0_leave_mm=hi - 0.5)
 
 
-def test_the_tilt_turns_the_first_segment_and_builds_a_nose(tmp_path):
-    """gap0_tilt_deg turns gap 0's first segment clockwise about the leave point, which stays; the ground nose fills
-    the wedge between the plate face and gap 0's dummy edge, reaches into the housing and keeps a gap off dee 0."""
-    B = pytest.importorskip('PyCentralRegion.geometry.builder')
-    MPath = pytest.importorskip('matplotlib.path').Path
-    lay0 = _layout(tmp_path / 'ref')
-    pl0 = lay0['gap_lines'][0]['plate']
-    tilt = 12.0
-    lay = _layout(tmp_path / 't', gap0_tilt_deg=tilt)
-    pl = lay['gap_lines'][0]['plate']
-    pts = _gap0(lay)
-    assert np.array_equal(pl['point'], pl0['point']) and np.allclose(pts[1], pl0['point'], atol=1e-9)
-    u = (pts[1] - pts[0]) / np.hypot(*(pts[1] - pts[0]))
-    assert np.degrees(np.arctan2(u[0] * pl0['direction'][1] - u[1] * pl0['direction'][0],
-                                 u @ pl0['direction'])) == pytest.approx(tilt, abs=1e-9)   # clockwise of the plate
-    assert lay['gap_lines'][0]['corner_bend_deg'] == pytest.approx(lay0['gap_lines'][0]['corner_bend_deg'] + tilt,
-                                                                   abs=1e-9)
-    nose = lay['gap0_nose']
-    assert nose is not None
-    wall = MPath(np.asarray(lay['sim']['curve'], dtype=float))
-    half = len(nose) // 2                          # the dummy edge, then its points carried into the housing
-    assert wall.contains_points(nose[half:]).all()
-    housed = nose[:half][wall.contains_points(nose[:half])]   # the dummy edge meets the plate face at the leave point
-    w_half = B._half_width_mm(lay['dees'].gaps[0], pl['point'][None, :], 1.0)[0]   # (L is on the centre line)
-    assert len(housed) < half and np.all(np.hypot(*(housed - pl['point']).T) < abs(w_half) + 1.0)
-    near = dict(B._nearest_dee_mm(nose, lay['foot']))
-    w0 = B._star_gap_floor_mm()
-    assert min(near.values()) >= w0 - 0.3 and near['dee0'] == pytest.approx(
-        2.0 * B._half_width_mm(lay['dees'].gaps[0], nose[:1], 1.0)[0], abs=0.05)
-    # the wedge: about u tan(tilt) wide at u inward of the leave point (the edge's points are on the dummy edge)
-    edge = nose[:half]
-    u_in = -(edge - pl['point']) @ pl['first']
-    assert u_in.min() > -abs(w_half) - 1e-6        # the offset's vertex at the bend lies on its bisector, past L
-    depth = (edge - pl['point']) @ np.array([-pl['direction'][1], pl['direction'][0]])  # off the plate line, + to dee 0
-    assert np.all(np.diff(depth[np.argsort(u_in)]) > -1e-6)                    # wider inward
-    assert depth.max() == pytest.approx(u_in.max() * np.tan(np.radians(tilt)), abs=6.0)
+def test_offset_and_leave_point_together(tmp_path):
+    """Both at once: the leave point is the home point turned with the assembly, then moved along the turned plate."""
+    ref = _layout(tmp_path / 'ref')
+    L0, d0 = ref['gap_lines'][0]['plate']['point'], ref['gap_lines'][0]['plate']['direction']
+    offset, leave = 2.0, -6.0
+    lay = _layout(tmp_path / 'both', si_rotation_offset_deg=offset, gap0_leave_mm=leave)
+    pl, rec = lay['gap_lines'][0]['plate'], lay['gap_lines'][0]['leave']
+    R = _rot(offset)
+    assert np.allclose(pl['home'], R @ L0, atol=1e-9)
+    assert np.allclose(pl['point'], R @ L0 + leave * (R @ d0), atol=1e-9)
+    assert rec['corner_s_mm'] == pytest.approx(ref['gap_lines'][0]['leave']['corner_s_mm'] - leave, abs=1e-9)
+    assert np.allclose(_gap0(lay)[1], pl['point'], atol=1e-9)
 
 
-def test_the_nose_is_metal_with_the_exit_opening_through_it(tmp_path):
-    """3D (gmsh): the star ground with the nose fused in full height and the exit opening (the aperture swept along
-    the emitting plane's normal) cut through it. Outside the housing, on the median plane, the ground's channel leaves
-    no ground but the nose: a point of the nose beside the opening is ground, one in the opening is not."""
-    gmsh = pytest.importorskip('gmsh')
-    B = pytest.importorskip('PyCentralRegion.geometry.builder')
-    from matplotlib.path import Path as MPath
-    _, face, d, n = _frame()
-    lay = _layout(tmp_path, gap0_tilt_deg=12.0)
-    nose = lay['gap0_nose']
-    ap = np.asarray(lay['outline']['aperture'], dtype=float)
-    n3 = np.array([*n, 0.0])
-    brick = B.beam_channel(ap, {'point': ap.mean(axis=0) - 1.5 * n3, 'normal': n3})
-    g = np.stack(np.meshgrid(np.linspace(nose[:, 0].min(), nose[:, 0].max(), 200),
-                             np.linspace(nose[:, 1].min(), nose[:, 1].max(), 200)), -1).reshape(-1, 2)
-    g = g[MPath(nose).contains_points(g) & ~MPath(np.asarray(lay['sim']['curve'], dtype=float)).contains_points(g)]
-    s = (g - face(0.0)) @ d
-    in_band = g[(s > APERTURE_S[0] + 1.5) & (s < APERTURE_S[1] - 1.5)]
-    beside = g[(s > APERTURE_S[1] + 2.0) | (s < APERTURE_S[0] - 2.0)]
-    assert len(in_band) and len(beside)
-    try:
-        _, groups, _, _ = B.build_model(lay['foot'], lay['dummy'], lay['sim'], brick, lay['dees'], verbose=False,
-                                        nose=nose)
-        gmsh.model.occ.synchronize()
-
-        def metal(p):
-            return any(gmsh.model.isInside(3, t, [float(p[0]), float(p[1]), 0.0]) > 0 for t in groups['ground'])
-        assert all(metal(p) for p in beside[::max(1, len(beside) // 12)])
-        assert not any(metal(p) for p in in_band[::max(1, len(in_band) // 12)])
-    finally:
-        if gmsh.isInitialized():
-            gmsh.finalize()
-
-
-def test_the_geometry_key_drops_the_three_keys_at_zero():
-    """A MOBO geometry key: the three keys at 0 key like their absence (existing stores keep their keys); not at 0
+def test_the_geometry_key_drops_the_two_keys_at_zero():
+    """A MOBO geometry key: the two keys at 0 key like their absence (existing stores keep their keys); not at 0
     they are part of it."""
     from PyCentralRegion.mobo import space
     cfg = space.MoboConfig(campaign_dir='c', base_config_file='b.toml', objectives=(space.Objective('I_final'),),
                            variables=(space.Variable('phi', 'machine.dee_opening_deg', 34.0, 45.0, kind='geometry'),
-                                      space.Variable('tilt', 'geometry.gap0_tilt_deg', 0.0, 10.0, kind='geometry')))
+                                      space.Variable('leave', 'geometry.gap0_leave_mm', -10.0, 10.0, kind='geometry')))
     bare = {'geometry': {'gap_lines': 'connected'}, 'machine': {'dee_opening_deg': 38.0}}
     zero = {'geometry': {'gap_lines': 'connected', 'si_rotation_offset_deg': 0.0, 'gap0_leave_mm': 0},
             'machine': {'dee_opening_deg': 38.0}}
     only_phi = dataclasses.replace(cfg, variables=cfg.variables[:1])
     key = space.geometry_key(bare, only_phi, {'phi': 38.0})
     assert space.geometry_key(zero, only_phi, {'phi': 38.0}) == key
-    assert space.geometry_key(bare, cfg, {'phi': 38.0, 'tilt': 0.0}) == key
-    assert space.geometry_key(bare, cfg, {'phi': 38.0, 'tilt': 4.0}) != key
+    assert space.geometry_key(bare, cfg, {'phi': 38.0, 'leave': 0.0}) == key
+    assert space.geometry_key(bare, cfg, {'phi': 38.0, 'leave': 4.0}) != key
     moved = {'geometry': {'gap_lines': 'connected', 'si_rotation_offset_deg': 1.5}, 'machine': {'dee_opening_deg': 38.0}}
     assert space.geometry_key(moved, only_phi, {'phi': 38.0}) != key
     assert 'idle' not in space.geometry_parts(zero, only_phi, {'phi': 38.0})

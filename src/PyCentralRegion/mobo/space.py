@@ -41,7 +41,7 @@ GEOMETRY_PATHS = ('seed', 'handoff', 'housing_outline', 'housing_step')
 POST_RULE_PATHS = ('bfield_3d', 'inflector_efield')
 # [geometry] keys whose 0 builds exactly what their absence builds (docs/si_rotation_gap0.md): left out of the key at 0,
 # so a design that writes them at 0, or varies them and lands on 0, keys like one from before they existed
-NEUTRAL_AT_ZERO = ('si_rotation_offset_deg', 'gap0_leave_mm', 'gap0_tilt_deg')
+NEUTRAL_AT_ZERO = ('si_rotation_offset_deg', 'gap0_leave_mm')
 # config keys the driver and the evaluator own: no variable may set them
 RESERVED_TARGETS = ('paths.model3d', 'paths.fields', 'run.out_dir')
 

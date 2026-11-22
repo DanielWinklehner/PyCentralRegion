@@ -199,8 +199,8 @@ otherwise decide a cut at a face's own height (the `sections` views at 16 mm, a 
 
 A model built around a turned inflector records the turn (`params['si_rotation_deg']`). Tracking it with a different
 `inflector.rotation_deg` is refused; with `geometry.si_rotation = "corner"` (the turn follows the dee opening, plus
-`geometry.si_rotation_offset_deg`) the run adopts the model's turn instead. Gap 0's leave point on the exit plate and
-its tilt are `geometry.gap0_leave_mm` and `gap0_tilt_deg` (`docs/si_rotation_gap0.md`).
+`geometry.si_rotation_offset_deg`) the run adopts the model's turn instead. Gap 0's leave point on the exit plate is
+`geometry.gap0_leave_mm` (`docs/si_rotation_gap0.md`).
 
 Then `track_stage`:
 1. tracks the reference particle at every phase of `track.phases_deg` (empty: the seed's phase and ±10 deg);

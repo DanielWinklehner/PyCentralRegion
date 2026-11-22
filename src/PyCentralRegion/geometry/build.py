@@ -193,8 +193,6 @@ def layout(cfg, verbose: bool = True, inp: dict = None, dees_png=None) -> dict:
         V.print_gap_lines(dees, result)
         lay = _layout_rest(cfg, s, g, inp, dees, geom, result, trj, si_rot, dees_png, lines)
         B.gap0_leave_report(lines, lay['outline'])
-        lay['gap0_nose'] = B.gap0_nose_polygon(lay['foot'], dees, np.asarray(lay['sim']['curve'], dtype=float),
-                                               lines[0]['plate'])
         return lay
     if g.snap_nodes and len(trj) > 2:
         V._banner("SEGMENT NODES: DROP THE INERT ONES, THEN SNAP MIDWAY BETWEEN TURNS")
@@ -241,7 +239,7 @@ def _layout_rest(cfg, s, g, inp, dees, geom, result, trj, si_rot, dees_png, line
     V.print_dummies(dummy)
     return {'sections': s, 'inputs': inp, 'dees': dees, 'geom': geom, 'result': result, 'trajectory': trj,
             'si_rotation_deg': float(si_rot), 'outline': ol, 'sim': sim, 'exit_half_height_mm': exit_half,
-            'bounds': bounds, 'foot': foot, 'dummy': dummy, 'orbit': orbit, 'gap_lines': lines, 'gap0_nose': None}
+            'bounds': bounds, 'foot': foot, 'dummy': dummy, 'orbit': orbit, 'gap_lines': lines}
 
 
 def bounds(cfg) -> dict:
@@ -354,12 +352,8 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
 
     import gmsh
     model, upper_share, mirror_refused = None, None, ''
-    # a tilted gap 0's ground nose (docs/si_rotation_gap0.md); passed only when there is one, so that a build without
-    # it calls the builder exactly as before
-    nose = {} if lay.get('gap0_nose') is None else {'nose': lay['gap0_nose']}
     try:
-        gm, groups, r_tool, _ = B.build_model(lay['foot'], lay['dummy'], lay['sim'], brick, dees, posts=posts or None,
-                                              **nose)
+        gm, groups, r_tool, _ = B.build_model(lay['foot'], lay['dummy'], lay['sim'], brick, dees, posts=posts or None)
         r0, r1 = g.aperture_radii()
         print()
         print(f"  beam channel {g.aperture_inner_mm:g} mm to r = {r0:g} mm, {g.aperture_outer_mm:g} mm from "
@@ -388,7 +382,7 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
                 if getattr(gmsh, 'isInitialized', lambda: True)():
                     gmsh.finalize()
                 gm, groups, r_tool, _ = B.build_model(lay['foot'], lay['dummy'], lay['sim'], brick, dees,
-                                                      posts=posts or None, **nose)
+                                                      posts=posts or None)
         if model is None:
             B.mesh_and_report(gm, groups, prefix=prefix, step=not g.mirror_mesh)
             model = B.to_electrode_model(gm, groups, B.dee_potential(dees), si_rotation_deg=si_rot)
@@ -407,7 +401,6 @@ def _build_parts(cfg, s: dict, inp: dict, model3d: Path, part: dict, t0: float) 
               'bounds': lay['bounds'], 'hardware': [q['name'] for q in posts],
               'gap0_hole': dataclasses.asdict(hole) if hole else None,
               'gap_lines': _lines_record(lay['gap_lines']),
-              **({} if lay.get('gap0_nose') is None else {'gap0_nose': _nose_record(lay['gap0_nose'])}),
               'exit_opening': ({**ol['aperture_centred'], 'sweep_tilt_removed_deg': plane.get('tilt_deg')}
                                if 'aperture_centred' in ol else None),
               'mesh': {'nodes': int(len(model.vertices)), 'triangles': int(len(model.triangles)), 'solids': solids,
@@ -428,15 +421,6 @@ def _lines_record(lines) -> list:
             'corner_bend_deg', 'leave')
     return [{k: (list(map(float, ln[k])) if isinstance(ln[k], tuple) else ln[k]) for k in keep if k in ln}
             for ln in lines]
-
-
-def _nose_record(poly) -> dict:
-    """A tilted gap 0's ground nose for <prefix>_build.json: its plan-view area [mm^2], radii and outline [mm]."""
-    p = np.asarray(poly, dtype=float)
-    q = np.roll(p, -1, axis=0)
-    r = np.hypot(p[:, 0], p[:, 1])
-    return {'area_mm2': float(0.5 * abs(np.sum(p[:, 0] * q[:, 1] - q[:, 0] * p[:, 1]))),
-            'r_mm': [float(r.min()), float(r.max())], 'outline_mm': p.round(4).tolist()}
 
 
 # ---------------------------------------------------------------------------------------------------------------------

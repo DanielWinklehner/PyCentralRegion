@@ -1,20 +1,19 @@
 # Changelog
 
-## 2026-11-22: spiral-inflector rotation, gap-0 leave point and tilt as variables of their own
+## 2026-11-22: spiral-inflector rotation and gap-0 leave point as variables of their own
 
-Three `[geometry]` keys, each 0 by default, which builds what the code built before (`docs/si_rotation_gap0.md`):
+Two `[geometry]` keys, each 0 by default, which builds what the code built before (`docs/si_rotation_gap0.md`):
 
-- `si_rotation_offset_deg` (with `si_rotation = "corner"`): the spiral-inflector assembly (housing, exit aperture,
-  beam channel, inflector field, hand-off bunch) turned off the corner rule's angle. Gap 0's home point on the exit
-  plate turns with it, so gap 0 leaves the plate at the same place on the plate for every offset.
+- `si_rotation_offset_deg` (with `si_rotation = "corner"`): the spiral-inflector assembly turned off the corner rule's
+  angle. That is the housing, exit aperture, beam channel, inflector field and hand-off bunch. Gap 0's home point on
+  the exit plate turns with it, so gap 0 leaves the plate at the same place on the plate for every offset.
 - `gap0_leave_mm` (connected gap lines): where gap 0 leaves the exit plate, along the plate from its home point.
-- `gap0_tilt_deg` (connected gap lines, star ground): gap 0's first segment turned clockwise off the plate about that
-  point; a grounded nose fills the wedge between the plate and gap 0's dummy edge, the exit opening cut through it.
 
-Unbuildable values are refused with a `ConfigError` (a failed evaluation in a campaign), the config-only ones at load
-and at a campaign's preflight. `si_rotation = "fixed"` is unchanged. A MOBO geometry key leaves the three keys out
-while they are 0, so existing stores keep their keys. `<prefix>_build.json` records gap 0's leave point (`gap_lines[0]
-.leave`) and, with a tilt, the nose (`gap0_nose`). `connected_line` takes the fixed P0 off the ray (`y0`).
+Unbuildable values are refused with a `ConfigError`, which is a failed evaluation in a campaign. The config-only
+checks run at load and at a campaign's preflight. `si_rotation = "fixed"` is unchanged. A MOBO geometry key leaves the
+two keys out while they are 0, so existing stores keep their keys. `<prefix>_build.json` records gap 0's leave point
+(`gap_lines[0].leave`). `connected_line` takes the fixed P0 off the ray (`y0`). Gap 0's orientation (a tilt off the
+plate with a grounded nose) is held; the doc describes it.
 
 ## 2026-11-22: main becomes the current code, machine-neutral
 
